@@ -1,0 +1,9 @@
+{$DOMAIN} {
+    handle /api/* {
+        reverse_proxy api:3000
+    }
+
+    handle /* {
+        reverse_proxy worker:6080
+    }
+}

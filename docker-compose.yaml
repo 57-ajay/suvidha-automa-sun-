@@ -1,0 +1,39 @@
+services:
+  redis:
+    image: redis:7-alpine
+
+  api:
+    build: ./api
+    environment:
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - redis
+
+  worker:
+    build: ./worker
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - API_URL=http://api:3000
+      - DOMAIN=${DOMAIN}
+      - MAX_SLOTS=${MAX_SLOTS:-10}
+    depends_on:
+      - redis
+      - api
+    shm_size: "4gb"
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+    environment:
+      - DOMAIN=${DOMAIN}
+    depends_on:
+      - api
+      - worker
+
+volumes:
+  caddy_data:

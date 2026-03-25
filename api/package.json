@@ -1,0 +1,16 @@
+{
+  "name": "api",
+  "module": "src/index.ts",
+  "type": "module",
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "firebase-admin": "^13.7.0",
+    "ioredis": "^5.10.1"
+  }
+}
