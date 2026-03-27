@@ -88,43 +88,64 @@ Step 2a — Navigate:
 - On the next page, click "Challan/Vehicle No." tab
 - Enter vehicle number: ${p.vehicleNumber}
 
-Step 2b — CAPTCHA (READ THIS CAREFULLY):
-There is a CAPTCHA image on this page. Follow this EXACT decision tree:
+Step 2b — CAPTCHA & Records:
 
-  1. FIRST, check: is there ALREADY a table or list of records visible on the page?
-     Look for text like "no of records", a table with offence codes, challan numbers, or amounts.
-     → If YES: CAPTCHA is already solved. SKIP to Step 2c. Do NOT attempt to solve it again.
-     → If NO: continue to step 2.
+╔══════════════════════════════════════════════════════════════════╗
+║  MANDATORY CHECK - RUN THIS *BEFORE* TOUCHING THE CAPTCHA        ║
+║                                                                  ║
+║  Look at the page RIGHT NOW. Is there a table or list of         ║
+║  records already visible? Look for ANY of these signs:           ║
+║    - A table with rows of data (challan numbers, amounts, etc)   ║
+║    - Text like "no of records", "Offence Details", etc           ║
+║    - Offence codes, fine amounts, or challan IDs on screen       ║
+║                                                                  ║
+║  -> If YES: Records are loaded. CAPTCHA is already solved.       ║
+║    SKIP ALL CAPTCHA steps. Go DIRECTLY to Step 2c.               ║
+║    DO NOT type anything in the CAPTCHA field.                    ║
+║    DO NOT click any submit/search button related to CAPTCHA.     ║
+║                                                                  ║
+║  -> If NO: Proceed to attempt CAPTCHA below.                     ║
+╚══════════════════════════════════════════════════════════════════╝
 
-  2. Try to read the CAPTCHA image and type the answer. Submit the form.
-     - captcha_attempt_count = 1
+CAPTCHA attempts (ONLY if no records are visible yet):
+  1. Try to read the CAPTCHA image and type the answer. Submit the form.
+     captcha_attempt_count = 1
 
-  3. After submitting, wait for the page to update, then check AGAIN:
-     Is there a table/list of records visible? (offence codes, challan numbers, amounts, "no of records")
-     → If YES: CAPTCHA is solved. SKIP to Step 2c immediately. Do NOT touch the CAPTCHA again.
-     → If NO and captcha_attempt_count < 2: Go back to step 2 (try again). Increment captcha_attempt_count.
-     → If NO and captcha_attempt_count >= 2: Call wait_for_human with reason:
-       "CAPTCHA needs solving on Virtual Courts. Please solve it in the browser and click submit, then send 'done' via intervene API."
-       After human responds, continue to Step 2c.
+  2. After submitting, wait for the page to update. Then IMMEDIATELY run
+     the MANDATORY CHECK above again:
+     → Records visible? → CAPTCHA is done. Go to Step 2c. STOP all CAPTCHA work.
+     → No records AND captcha_attempt_count < 2? → Try again, increment count.
+     → No records AND captcha_attempt_count >= 2? → Call wait_for_human:
+       "CAPTCHA needs solving on Virtual Courts. Please solve it in the browser
+        and click submit, then send 'done' via intervene API."
+       After human responds, go to Step 2c.
 
-CRITICAL: Once records are visible on screen, the CAPTCHA is DONE. Do not re-solve it.
-The CAPTCHA input field may still be visible on the page even after records load — IGNORE IT.
+ABSOLUTE RULE: Once records/data rows appear on the page, you are FINISHED
+with CAPTCHA forever. The CAPTCHA input field will still be visible on the
+page — this is normal website behavior. IGNORE IT. Never interact with the
+CAPTCHA field or submit button again after records appear. Your ONLY job now
+is to extract the data from the records table.
 
 Step 2c — Extract discount data:
-Look at the records table. For each record/row, extract:
+
+THIS IS THE MOST IMPORTANT STEP. Do not skip it. Do not re-solve CAPTCHA instead of doing this.
+
+Look at the records table on screen. For each record/row, extract:
 - The challan number (look for columns like "Challan No", "Notice No", or similar)
 - The compounding/settlement/payable amount (this is the discounted amount to pay)
 - The original fine amount if shown
 
+Read EVERY row. Scroll down if needed. Check for pagination.
+
 If the table shows records but no discount/settlement amounts are visible for any row,
 that means there are no discounts available. Skip the save_discounts call.
 
-If discount amounts ARE found, call "save_discounts" with a JSON array.
+If discount amounts ARE found, you MUST call "save_discounts" with a JSON array.
 Each object must have: challanId, discountAmount (the settlement/compounding amount), originalAmount.
 Example: [{"challanId":"DL123456","discountAmount":250,"originalAmount":500}]
 
-IMPORTANT: You MUST call save_discounts if any discount amounts are visible. Do not skip it
-based on assumptions — extract and save whatever data is on screen.
+DO NOT proceed to completion without calling save_discounts if any discount data exists.
+DO NOT go back to the CAPTCHA. DO NOT refresh the page. Extract what is on screen and save it.
 
 ========================================
 COMPLETION
