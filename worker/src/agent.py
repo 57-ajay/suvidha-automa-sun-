@@ -67,24 +67,22 @@ def _register_dynamic_tool(
     if param_help:
         full_desc += f"\n\nParameters:\n{param_help}"
 
-    async def handler(data: str, _endpoint=endpoint, _method=method, _name=name) -> str:
+    async def handler(data: list, _endpoint=endpoint, _method=method, _name=name) -> str:
         print(f"[{job_id}] Tool call: {_name}")
-        try:
-            parsed = json.loads(data)
-        except json.JSONDecodeError as e:
-            return json.dumps({"error": f"Invalid JSON: {e}"})
 
         payload = {
             "jobId": job_id,
             "params": job_params,
-            "data": parsed,
+            "data": data,
         }
 
         async with httpx.AsyncClient(timeout=30) as client:
             if _method == "POST":
                 resp = await client.post(f"{API_URL}{_endpoint}", json=payload)
             else:
-                resp = await client.get(f"{API_URL}{_endpoint}", params={"payload": json.dumps(payload)})
+                resp = await client.get(f"{API_URL}{_endpoint}",
+                                        params={"payload": json.dumps(payload)}
+                                        )
 
         print(f"[{job_id}] Tool {_name} response: {resp.status_code}")
         return resp.text
@@ -116,5 +114,5 @@ async def run_agent(prompt: str, job_id: str, job_params: dict, tool_defs: list,
         tools=tools,
     )
 
-    result = await agent.run()
+    result = await agent.run(max_steps=50)
     return result.final_result() or "No result returned"

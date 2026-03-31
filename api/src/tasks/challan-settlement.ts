@@ -13,9 +13,9 @@ export const challanSettlement: Task = {
                 "Pass a JSON array of challan objects as the data parameter.",
             parameters: {
                 data: {
-                    type: "string",
+                    type: "array",
                     description:
-                        'JSON array of objects, each with: challanId (string), offence (string), amount (number in Rs), date (string YYYY-MM-DD). ' +
+                        'array of objects, each with: challanId (string), offence (string), amount (number in Rs), date (string YYYY-MM-DD). ' +
                         'Example: [{"challanId":"DL123456","offence":"Red Light Violation","amount":500,"date":"2024-06-15"}]',
                 },
             },
@@ -29,9 +29,9 @@ export const challanSettlement: Task = {
                 "Pass a JSON array of discount objects as the data parameter.",
             parameters: {
                 data: {
-                    type: "string",
+                    type: "array",
                     description:
-                        'JSON array of objects, each with: challanId (string), discountAmount (number in Rs), originalAmount (number in Rs). ' +
+                        'array of discount objects, each with: challanId (string), discountAmount (number in Rs), originalAmount (number in Rs). ' +
                         'Example: [{"challanId":"DL123456","discountAmount":250,"originalAmount":500}]',
                 },
             },
@@ -120,95 +120,49 @@ PHASE 2: VIRTUAL COURTS — Extract Discounts
 ========================================
 Open a NEW TAB and go to: https://vcourts.gov.in/virtualcourt/index.php
 
-Step 2a — Navigate:
-- Click the "Select Department" dropdown
-- Select the appropriate department for ${p.vehicleNumber} region
-  (Delhi/NCR vehicles like DL, HR, UP → select "Delhi Notice department")
-- Click "Proceed Now"
-- On the next page, click "Challan/Vehicle No." tab
-- Enter vehicle number: ${p.vehicleNumber}
+Step 1 — Select department:
+- You will see a "Select Department" dropdown and a "Proceed Now" button.
+- Open the dropdown and select the appropiate department for vehicle: ${p.vehicleNumber}.
+ - Example:
+  - DL vehicles --> "Delhi(Notice Department)"
+  - HR vehicles --> "Haryana(Traffic Department)"
+  - UP vehicles --> look for the matching UP department
+- Click "Proceed Now".
 
-Step 2b — CAPTCHA & Records:
+Step 2 — Navigate to vehicle search:
+- You will land on a page with 4 tab buttons on the LEFT side arranged in a 2x2 grid:
+  "Mobile Number", "CNR Number", "Party Name", "Challan/Vehicle No."
+- Click the "Challan/Vehicle No." tab button (bottom-right of the grid).
+- The right side will now show a form with: Challan Number field, Vehicle Number field, a CAPTCHA image, an "Enter Captcha" field, and a "Submit" button.
 
-╔══════════════════════════════════════════════════════════════════╗
-║  MANDATORY CHECK - RUN THIS *BEFORE* TOUCHING THE CAPTCHA        ║
-║                                                                  ║
-║  Look at the page RIGHT NOW. Is there a table or list of         ║
-║  records already visible? Look for ANY of these signs:           ║
-║    - A table with rows of data (challan numbers, amounts, etc)   ║
-║    - Text like "no of records", "Offence Details", etc           ║
-║    - Offence codes, fine amounts, or challan IDs on screen       ║
-║                                                                  ║
-║  -> If YES: Records are loaded. CAPTCHA is already solved.       ║
-║    SKIP ALL CAPTCHA steps. Go DIRECTLY to Step 2c.               ║
-║    DO NOT type anything in the CAPTCHA field.                    ║
-║    DO NOT click any submit/search button related to CAPTCHA.     ║
-║                                                                  ║
-║  -> If NO: Proceed to attempt CAPTCHA below.                     ║
-╚══════════════════════════════════════════════════════════════════╝
+Step 3 — Fill form and submit:
+- Type ${p.vehicleNumber} in the "Vehicle Number" field.
+- Read the CAPTCHA image and type it in the "Enter Captcha" field.
+- Click "Submit".
+- If CAPTCHA was wrong, the page reloads with a new CAPTCHA. Try again (up to 5 attempts).
+- If you cannot solve it after 5 attempts, call 'wait_for_human' with reason:
+  "CAPTCHA needs solving on Virtual Courts. Please solve it and click submit, then send 'done'."
 
-CAPTCHA attempts (ONLY if no records are visible yet):
-  1. Try to read the CAPTCHA image and type the answer. Submit the form.
-     captcha_attempt_count = 1
-
-  2. After submitting, wait for the page to update. Then IMMEDIATELY run
-     the MANDATORY CHECK above again:
-     → Records visible? → CAPTCHA is done. Go to Step 2c. STOP all CAPTCHA work.
-     → No records AND captcha_attempt_count < 2? → Try again, increment count.
-     → No records AND captcha_attempt_count >= 2? → Call wait_for_human:
-       "CAPTCHA needs solving on Virtual Courts. Please solve it in the browser
-        and click submit, then send 'done' via intervene API."
-       After human responds, go to Step 2c.
-
-ABSOLUTE RULE: Once records/data rows appear on the page, you are FINISHED
-with CAPTCHA forever. The CAPTCHA input field will still be visible on the
-page — this is normal website behavior. IGNORE IT. Never interact with the
-CAPTCHA field or submit button again after records appear. Your ONLY job now
-is to extract the data from the records table.
-
-Step 2c — Extract data from Virtual Courts records:
-
-THIS IS THE MOST IMPORTANT STEP. Do not skip it. Do not re-solve CAPTCHA instead of doing this.
-
-The Virtual Courts page shows records in this structure:
-- A summary row per record showing: Case No., Challan No., Party Name, Mobile No., and a "View" link
-- When you click "View" or if details are already expanded, you see:
-  - Offence Code, Offence description, Act/Section
-  - "Fine" column — this is the ORIGINAL fine amount
-  - "Proposed Fine" row at the bottom — this is the SETTLEMENT/DISCOUNT amount to pay
-
-IMPORTANT: The page does NOT label anything as "discount". The discount is implied:
-  - "Fine" = original amount
-  - "Proposed Fine" = settlement amount (what the person actually pays)
-  - Even if Fine == Proposed Fine (no reduction), you MUST still extract and save it.
-
-For EVERY record on the page:
-1. Extract the Challan No. (e.g., "67940444" from "Challan No. : 67940444")
-2. Extract the "Fine" value — this is the originalAmount
-3. Extract the "Proposed Fine" value — this is the discountAmount (settlement amount)
-4. If details are collapsed, click "View" to expand them first
-
-Read EVERY row. Scroll down if needed. Check for pagination ("No. of Records" text).
-
-╔══════════════════════════════════════════════════════════════════╗
-║  RULE: If ANY records exist on Virtual Courts, you MUST call     ║
-║  save_discounts. NEVER skip it when records are visible.         ║
-║  Even if Proposed Fine == Fine (no reduction), STILL save it.    ║
-╚══════════════════════════════════════════════════════════════════╝
-
-Call "save_discounts" with a JSON array. Each object must have:
-- challanId: the challan number from the record
-- discountAmount: the "Proposed Fine" value (settlement amount)
-- originalAmount: the "Fine" value
-
-Example: [{"challanId":"67940444","discountAmount":1000,"originalAmount":1000}]
-
-DO NOT proceed to completion without calling save_discounts if ANY records exist.
-DO NOT go back to the CAPTCHA. DO NOT refresh the page. Extract what is on screen and save it.
+Step 4 — Extract records:
+- After successful submit, you will see "No. of Records :- N" (N is number of records) and a table below.
+- If records are already visible, do NOT touch the CAPTCHA again — ignore it.
+- Each record has a summary row with Case No., Challan No., Party Name, and a "View" link.
+- For EVERY record, extract:
+  - challanId: the Challan No. from the summary row (e.g. "57113282")
+  - originalAmount: the Fine value from the inner table
+  - discountAmount: the Proposed Fine value
+- Scroll down to check ALL records.
+Example:
+[{"challanId":"DL123456","discountAmount":250,"originalAmount":500}, ...]
+Step 5 — Save:
+- Call "save_discounts" with ALL extracted records as an array.
+- Even if Fine == Proposed Fine (no discount), still include that record.
+- If there are zero records, skip this step.
 
 ========================================
 COMPLETION
 ========================================
+
 Only NOW use the "done" action. Report:
 ${hasMobileChange ? "- Whether the mobile number was changed successfully" : ""}
 - How many challans were found on Delhi Traffic Police
