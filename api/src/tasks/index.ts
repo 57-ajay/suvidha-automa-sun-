@@ -1,5 +1,5 @@
 import type { Task } from "./types";
-import { challanSettlement } from "./challan-settlement";
+import { challanSettlement } from "./challanSettlement";
 import { testHuman } from "./test-human";
 
 const tasks = new Map<string, Task>();

@@ -48,6 +48,33 @@ def make_tools(job_id: str, job_params: dict, tool_defs: list, r: redis.Redis) -
     return tools
 
 
+def _normalize_data(data) -> list:
+    """
+    Ensure tool data is a proper list, handling cases where the LLM
+    passes a JSON string instead of a parsed list.
+    """
+    if isinstance(data, list):
+        return data
+
+    if isinstance(data, str):
+        data = data.strip()
+        # Try parsing as JSON string
+        try:
+            parsed = json.loads(data)
+            if isinstance(parsed, list):
+                return parsed
+            # Single object wrapped in a string
+            if isinstance(parsed, dict):
+                return [parsed]
+        except json.JSONDecodeError:
+            pass
+
+    if isinstance(data, dict):
+        return [data]
+
+    return []
+
+
 def _register_dynamic_tool(
     tools: Tools,
     tool_def: dict,
@@ -67,27 +94,49 @@ def _register_dynamic_tool(
     if param_help:
         full_desc += f"\n\nParameters:\n{param_help}"
 
-    async def handler(data: str, _endpoint=endpoint, _method=method, _name=name) -> str:
+    async def handler(data, _endpoint=endpoint, _method=method, _name=name) -> str:
         print(f"[{job_id}] Tool call: {_name}")
-        try:
-            parsed = json.loads(data)
-        except json.JSONDecodeError as e:
-            return json.dumps({"error": f"Invalid JSON: {e}"})
+        print(f"[{job_id}]   raw data type: {type(data).__name__}")
+        print(f"[{job_id}]   raw data preview: {str(data)[:500]}")
+
+        # Normalize: ensure data is always a list
+        normalized = _normalize_data(data)
+        print(f"[{job_id}]   normalized: {len(normalized)} items")
+
+        if not normalized:
+            msg = f"Tool {_name}: no valid data after normalization (raw type={
+                type(data).__name__})"
+            print(f"[{job_id}]   ERROR: {msg}")
+            return json.dumps({"ok": False, "error": msg})
+
+        # Log each item for debugging
+        for i, item in enumerate(normalized):
+            print(f"[{job_id}]   item[{i}]: {json.dumps(item)
+                  if isinstance(item, dict) else str(item)}")
 
         payload = {
             "jobId": job_id,
             "params": job_params,
-            "data": parsed,
+            "data": normalized,
         }
 
-        async with httpx.AsyncClient(timeout=30) as client:
-            if _method == "POST":
-                resp = await client.post(f"{API_URL}{_endpoint}", json=payload)
-            else:
-                resp = await client.get(f"{API_URL}{_endpoint}", params={"payload": json.dumps(payload)})
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                if _method == "POST":
+                    resp = await client.post(f"{API_URL}{_endpoint}", json=payload)
+                else:
+                    resp = await client.get(f"{API_URL}{_endpoint}",
+                                            params={
+                                                "payload": json.dumps(payload)}
+                                            )
 
-        print(f"[{job_id}] Tool {_name} response: {resp.status_code}")
-        return resp.text
+            print(f"[{job_id}] Tool {_name} response: {resp.status_code}")
+            print(f"[{job_id}]   body: {resp.text[:500]}")
+            return resp.text
+        except Exception as e:
+            error_msg = f"Tool {_name} HTTP error: {str(e)}"
+            print(f"[{job_id}]   ERROR: {error_msg}")
+            return json.dumps({"ok": False, "error": error_msg})
 
     handler.__name__ = name
     handler.__qualname__ = name
@@ -116,5 +165,5 @@ async def run_agent(prompt: str, job_id: str, job_params: dict, tool_defs: list,
         tools=tools,
     )
 
-    result = await agent.run()
+    result = await agent.run(max_steps=50)
     return result.final_result() or "No result returned"
