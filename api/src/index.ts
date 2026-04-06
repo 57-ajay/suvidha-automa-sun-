@@ -2,6 +2,7 @@ import Redis from "ioredis";
 import { getTask, listTasks } from "./tasks";
 import { handleSaveChallans, type InternalRequest } from "./internal/challanSettlement/challans";
 import { handleSaveDiscounts } from "./internal/challanSettlement/discounts";
+import { releaseAgentSlot } from "./internal/agentConfig";
 import { DASHBOARD_HTML } from "./dashboard";
 
 import "./firebase";
@@ -206,6 +207,30 @@ const server = Bun.serve({
                     return Response.json(result, { status });
                 } catch (e: any) {
                     console.error("[API] ERROR save_discounts:", e);
+                    return Response.json({ ok: false, error: e.message }, { status: 500 });
+                }
+            }
+
+            // POST /api/internal/job-completed - worker calls this fire-and-forget when a job finishes
+            if (req.method === "POST" && url.pathname === "/api/internal/job-completed") {
+                try {
+                    const body = await req.json() as { jobId: string; requestId?: string };
+                    const { jobId, requestId } = body;
+
+                    console.log(`[API] POST /api/internal/job-completed | jobId=${jobId} requestId=${requestId}`);
+
+                    if (!requestId) {
+                        console.log(`[API]   no requestId, skipping agent config release`);
+                        return Response.json({ ok: true, skipped: true });
+                    }
+
+                    releaseAgentSlot(jobId).catch((e) => {
+                        console.error(`[API] background releaseAgentSlot failed for requestId=${requestId}:`, e);
+                    });
+
+                    return Response.json({ ok: true });
+                } catch (e: any) {
+                    console.error("[API] ERROR job-completed:", e);
                     return Response.json({ ok: false, error: e.message }, { status: 500 });
                 }
             }

@@ -23,11 +23,6 @@ Do NOT enter OTP yet. Follow these steps in order:
    - "Last Four digit of Chasis Number" → ${p.chassisLastFour}
    - "Last Four digit of Engine Number" → ${p.engineLastFour}
 3. Click the green "Submit" button.
-4. A new OTP is now sent to ${p.mobileNumber}.
-5. Call wait_for_human with reason: "OTP sent to ${p.mobileNumber}. Please enter it in the browser and click submit, then reply done."
-6. After human responds, the challan results should now be visible. Continue to PHASE 1 extraction.
-
-Note: If the old OTP dialog reappears after mobile change, a fresh OTP was sent to ${p.mobileNumber}. Enter that OTP and submit.
 `
         : "";
 
