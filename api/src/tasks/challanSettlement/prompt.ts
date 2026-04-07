@@ -23,14 +23,19 @@ Do NOT enter OTP yet. Follow these steps in order:
    - "Last Four digit of Chasis Number" → ${p.chassisLastFour}
    - "Last Four digit of Engine Number" → ${p.engineLastFour}
 3. Click the green "Submit" button.
+4. After submitting, the page redirects back to the home/search page. You MUST now:
+   a. Re-enter "${p.vehicleNumber}" in the "Vehicle Number" field.
+   b. Click "Search Details" again.
+   c. A NEW OTP will be sent to the changed number (${p.mobileNumber}).
+   d. Call wait_for_human with reason: "OTP sent to ${p.mobileNumber}. Please enter it and click submit, then reply done."
+   e. After human responds, continue extracting results.
 `
         : "";
 
     const otpBlock = hasMobileChange
         ? `When the site asks for OTP:
 - If you have NOT yet changed the mobile number → follow PHASE 0 first.
-- If you ALREADY changed the mobile number → call wait_for_human with reason: "OTP sent to ${p.mobileNumber}. Please enter it and click submit, then reply done."
-- After human responds, continue extracting results.`
+- If you ALREADY changed the mobile number → the OTP flow is handled at the end of PHASE 0 step 4. Continue extracting results.`
         : `When the site asks for OTP:
 - Call wait_for_human with reason: "OTP required on Delhi Traffic Police. Please enter the OTP, click submit, then reply done."
 - After human responds, continue extracting results.`;
@@ -147,10 +152,17 @@ STEP A — Select department:
 STEP B — Search:
 1. On the next page, click the tab button labeled "Challan/Vehicle No."
 2. Type "${p.vehicleNumber}" in the "Vehicle Number" field.
-3. Read the CAPTCHA image and type the answer in "Enter Captcha".
+3. Read the CAPTCHA image carefully and type the answer in "Enter Captcha".
 4. Click "Submit".
-5. If CAPTCHA fails, re-read and retry (up to 5 attempts).
-6. After 5 failures, call wait_for_human: "CAPTCHA on Virtual Courts (department: [current department name]) needs solving. Please solve it, click submit, then reply done."
+5. CAPTCHA RETRY RULES (CRITICAL — follow exactly):
+   If a popup appears saying "Invalid Captcha..." or anything else:
+   a. Close the popup.
+   b. The CAPTCHA image on the page will have CHANGED to a new image.
+   c. You MUST read the NEW CAPTCHA image that is now visible on the page. Do NOT re-use any previously read CAPTCHA text.
+   d. Clear the "Enter Captcha" field completely, then type the NEW CAPTCHA text you just read.
+   e. Click "Submit" again.
+   f. Repeat up to 5 times. Each time, ALWAYS re-read the CAPTCHA image fresh — it changes after every failed attempt.
+6. After 5 consecutive failures, call wait_for_human: "CAPTCHA on Virtual Courts (department: [current department name]) needs solving. Please solve it, click submit, then reply done."
 
 STEP C — Extract results:
 

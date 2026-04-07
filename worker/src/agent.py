@@ -165,5 +165,5 @@ async def run_agent(prompt: str, job_id: str, job_params: dict, tool_defs: list,
         tools=tools,
     )
 
-    result = await agent.run(max_steps=50)
+    result = await agent.run(max_steps=100)
     return result.final_result() or "No result returned"

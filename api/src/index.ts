@@ -254,10 +254,12 @@ const server = Bun.serve({
                 }
 
                 if (current === "queued") {
+                    await releaseAgentSlot(jobId);
                     await redis.lrem("job:queue", 0, jobId);
                 }
 
                 await redis.hset(`job:${jobId}`, "status", "cancelled");
+                await releaseAgentSlot(jobId);
 
                 return Response.json({ ok: true, message: "Cancellation requested" });
             }
