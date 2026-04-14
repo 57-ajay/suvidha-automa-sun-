@@ -154,7 +154,8 @@ def _register_dynamic_tool(
     tools.action(description=full_desc)(handler)
 
 
-async def run_agent(prompt: str, job_id: str, job_params: dict, tool_defs: list, r: redis.Redis) -> str:
+async def run_agent(prompt: str, job_id: str, job_params: dict, tool_defs: list, r: redis.Redis):
+    """Returns the raw AgentHistoryList result object (caller extracts final_result and cost)."""
     browser = Browser(
         headless=False,
         chromium_sandbox=False,
@@ -181,4 +182,4 @@ async def run_agent(prompt: str, job_id: str, job_params: dict, tool_defs: list,
     print(f"Token usage: {result.usage}")
     usage_summary = await agent.token_cost_service.get_usage_summary()
     print(f"Usage summary: {usage_summary}")
-    return result.final_result() or "No result returned"
+    return result

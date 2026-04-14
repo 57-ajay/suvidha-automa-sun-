@@ -1,5 +1,5 @@
 import { FieldValue } from "firebase-admin/firestore";
-import { db } from "../firebase";
+import { db, challanRequestsRef } from "../firebase";
 
 const agentConfigRef = db.collection("settings").doc("automationAgentConfig");
 
@@ -70,6 +70,45 @@ export async function releaseAgentSlot(jobId: string): Promise<{ ok: boolean; er
         return { ok: true };
     } catch (e) {
         console.error(`[agentConfig] ERROR releasing jobId=${jobId}:`, e);
+        return { ok: false, error: (e as Error).message };
+    }
+}
+
+/**
+ * Save agent cost/usage data to the challanRequest document.
+ */
+export async function saveAgentCost(
+    requestId: string,
+    jobId: string,
+    costData: Record<string, any>
+): Promise<{ ok: boolean; error?: string }> {
+    if (!requestId || !costData) {
+        return { ok: false, error: "requestId and costData required" };
+    }
+
+    try {
+        const docRef = challanRequestsRef.doc(requestId);
+        const docSnap = await docRef.get();
+
+        if (!docSnap.exists) {
+            console.log(`[saveAgentCost] challanRequest doc not found for requestId=${requestId}`);
+            return { ok: false, error: "challanRequest not found" };
+        }
+
+        await docRef.update({
+            agentCost: {
+                jobId,
+                ...costData,
+                savedAt: FieldValue.serverTimestamp(),
+            },
+        });
+
+        console.log(
+            `[saveAgentCost] saved cost for requestId=${requestId} jobId=${jobId} totalCost=${costData.totalCost}`
+        );
+        return { ok: true };
+    } catch (e) {
+        console.error(`[saveAgentCost] ERROR:`, e);
         return { ok: false, error: (e as Error).message };
     }
 }

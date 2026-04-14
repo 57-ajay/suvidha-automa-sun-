@@ -3,7 +3,7 @@ import { getTask, listTasks } from "./tasks";
 import { handleSaveChallans, type InternalRequest } from "./internal/challanSettlement/challans";
 import { handleSaveDiscounts } from "./internal/challanSettlement/discounts";
 import { handleSaveReceipt } from "./internal/borderTax/receipt";
-import { releaseAgentSlot } from "./internal/agentConfig";
+import { releaseAgentSlot, saveAgentCost } from "./internal/agentConfig";
 import { DASHBOARD_HTML } from "./dashboard";
 
 import "./firebase";
@@ -242,19 +242,31 @@ const server = Bun.serve({
             // POST /api/internal/job-completed - worker calls this fire-and-forget when a job finishes
             if (req.method === "POST" && url.pathname === "/api/internal/job-completed") {
                 try {
-                    const body = await req.json() as { jobId: string; requestId?: string };
-                    const { jobId, requestId } = body;
+                    const body = await req.json() as {
+                        jobId: string;
+                        requestId?: string;
+                        costData?: Record<string, any>;
+                    };
+                    const { jobId, requestId, costData } = body;
 
-                    console.log(`[API] POST /api/internal/job-completed | jobId=${jobId} requestId=${requestId}`);
+                    console.log(`[API] POST /api/internal/job-completed | jobId=${jobId} requestId=${requestId} hasCost=${!!costData}`);
 
                     if (!requestId) {
                         console.log(`[API]   no requestId, skipping agent config release`);
                         return Response.json({ ok: true, skipped: true });
                     }
 
+                    // Release agent slot (fire-and-forget)
                     releaseAgentSlot(jobId).catch((e) => {
                         console.error(`[API] background releaseAgentSlot failed for requestId=${requestId}:`, e);
                     });
+
+                    // Save cost data to challanRequest (fire-and-forget)
+                    if (costData) {
+                        saveAgentCost(requestId, jobId, costData).catch((e) => {
+                            console.error(`[API] background saveAgentCost failed for requestId=${requestId}:`, e);
+                        });
+                    }
 
                     return Response.json({ ok: true });
                 } catch (e: any) {
