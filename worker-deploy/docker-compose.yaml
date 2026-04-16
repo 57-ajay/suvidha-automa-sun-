@@ -1,12 +1,11 @@
 services:
   worker:
-    build: ../worker
+    image: asia-south1-docker.pkg.dev/cabswale-ai/automation-agent-images/worker:v1
     environment:
       - REDIS_URL=${REDIS_URL}
       - API_URL=http://automation-agent-edge:3000
       - DOMAIN=${DOMAIN}
       - MAX_SLOTS=${MAX_SLOTS:-8}
-      # WORKER_HOSTNAME omitted -> code auto-detects from GCE metadata
     shm_size: "4gb"
     network_mode: "host"
     restart: unless-stopped
