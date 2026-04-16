@@ -6,8 +6,8 @@ export const buildPrompt = async (p: Record<string, string>) => {
     const entryDistrict = p.entryDistrict || "GHAZIABAD";
     const entryCheckpoint = p.entryCheckpoint || "GHAZIABAD";
     const serviceType = p.serviceType || "Air Conditioned Service";
-    const sbiUserId = p.sbiUserId || "XYZ";
-    const sbiPassword = p.sbiPassword || "123456789";
+    const sbiUserId = /*p.sbiUserId || */"89Rahulxyz";
+    const sbiPassword = /*p.sbiPassword ||*/ "rahul@70007";
     const paymentMethod = (p.paymentMethod || "net_banking").toLowerCase();
     const isUPI = paymentMethod === "upi";
 

@@ -1,6 +1,6 @@
 import { FieldValue } from "firebase-admin/firestore";
 import { getStorage } from "firebase-admin/storage";
-import { db } from "../../firebase";
+import { db, borderTaxRequestsRef } from "../../firebase";
 import * as fs from "fs";
 
 interface ReceiptData {
@@ -124,6 +124,15 @@ export async function handleSaveReceipt(body: InternalRequest) {
         status: "paid",
         createdAt: FieldValue.serverTimestamp(),
     };
+
+    try {
+        await borderTaxRequestsRef.doc(requestId).update({
+            borderTaxUpdatedBy: "agent",
+        });
+        console.log(`[save_receipt] marked borderTaxRequests/${requestId} as agent-updated`);
+    } catch (e) {
+        console.error(`[save_receipt] failed to mark borderTaxRequests/${requestId}:`, e);
+    }
 
     const docRef = await borderTaxRef.add(docData);
 
