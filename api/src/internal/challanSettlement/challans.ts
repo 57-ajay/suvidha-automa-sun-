@@ -135,7 +135,7 @@ export async function handleSaveChallans(body: InternalRequest) {
             challanDate: parseDate(c.date),
             challanNo: c.challanId,
             id: c.challanId,
-            isSelected: true,
+            // isSelected: true,
             offence: c.offence || null,
             ...(existing?.quotation ? { quotation: existing.quotation } : {}),
         };

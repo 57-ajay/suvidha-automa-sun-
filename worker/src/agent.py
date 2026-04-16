@@ -53,8 +53,9 @@ def _normalize_data(data) -> list:
     Ensure tool data is a proper list, handling cases where the LLM
     passes a JSON string instead of a parsed list.
     """
+    parsedList = []
     if isinstance(data, list):
-        return data
+        parsedList = data
 
     if isinstance(data, str):
         data = data.strip()
@@ -62,17 +63,27 @@ def _normalize_data(data) -> list:
         try:
             parsed = json.loads(data)
             if isinstance(parsed, list):
-                return parsed
+                parsedList = parsed
             # Single object wrapped in a string
             if isinstance(parsed, dict):
-                return [parsed]
+                parsedList = [parsed]
         except json.JSONDecodeError:
             pass
 
     if isinstance(data, dict):
-        return [data]
+        parsedList = [data]
 
-    return []
+    seen = set()
+    deduped = []
+
+    for item in parsedList:
+        key = item.get("challanId") if isinstance(item, dict) else None
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        deduped.append(item)
+    return deduped
 
 
 def _register_dynamic_tool(
@@ -143,7 +154,8 @@ def _register_dynamic_tool(
     tools.action(description=full_desc)(handler)
 
 
-async def run_agent(prompt: str, job_id: str, job_params: dict, tool_defs: list, r: redis.Redis) -> str:
+async def run_agent(prompt: str, job_id: str, job_params: dict, tool_defs: list, r: redis.Redis):
+    """Returns the raw AgentHistoryList result object (caller extracts final_result and cost)."""
     browser = Browser(
         headless=False,
         chromium_sandbox=False,
@@ -163,7 +175,11 @@ async def run_agent(prompt: str, job_id: str, job_params: dict, tool_defs: list,
         llm=llm,
         browser=browser,
         tools=tools,
+        calculate_cost=True,
     )
 
     result = await agent.run(max_steps=100)
-    return result.final_result() or "No result returned"
+    print(f"Token usage: {result.usage}")
+    usage_summary = await agent.token_cost_service.get_usage_summary()
+    print(f"Usage summary: {usage_summary}")
+    return result

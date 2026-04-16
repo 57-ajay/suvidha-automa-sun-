@@ -195,7 +195,7 @@ export async function handleSaveDiscounts(body: InternalRequest) {
                     challanDate: Timestamp.fromDate(now),
                     challanNo: d.challanId,
                     id: d.challanId,
-                    isSelected: true,
+                    // isSelected: true,
                     offence: null,
                     quotation: {
                         amount: d.discountAmount,

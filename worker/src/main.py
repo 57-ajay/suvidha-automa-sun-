@@ -15,6 +15,7 @@ from slots import SlotPool
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 MAX_SLOTS = int(os.environ.get("MAX_SLOTS", "10"))
 DOMAIN = os.environ.get("DOMAIN", "localhost")
+JOB_TTL = 60 * 60 * 24
 
 pool: SlotPool
 
@@ -107,6 +108,7 @@ async def worker_loop(r: redis.Redis):
             "liveUrl": live_url,
             "slotIndex": str(slot.index),
         })
+        r.expire(f"job:{job_id}", JOB_TTL)
 
         print(f"[{job_id}] → slot {
               slot.index} (display :{slot.display}) | {live_url}")
