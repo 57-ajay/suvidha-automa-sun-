@@ -1,9 +1,11 @@
 import Redis from "ioredis";
 import { getTask, listTasks } from "./tasks";
+import type { JobSource } from "./tasks/types";
 import { handleSaveChallans, type InternalRequest } from "./internal/challanSettlement/challans";
 import { handleSaveDiscounts } from "./internal/challanSettlement/discounts";
 import { handleSaveReceipt } from "./internal/borderTax/receipt";
 import { releaseAgentSlot, saveAgentCost } from "./internal/agentConfig";
+import { saveAgentWorkSummary } from "./internal/agentWorkSummary";
 import { DASHBOARD_HTML } from "./dashboard";
 
 import "./firebase";
@@ -65,7 +67,8 @@ const server = Bun.serve({
                     );
                 }
 
-                const prompt = await task.buildPrompt(params);
+                const resolvedSource: JobSource = (source as JobSource) || "web";
+                const prompt = await task.buildPrompt(params, resolvedSource);
                 const jobId = crypto.randomUUID();
                 const now = new Date();
                 const createdAt = now.toISOString();
@@ -82,7 +85,7 @@ const server = Bun.serve({
                     tools: JSON.stringify(task.tools ?? []),
                     status: "queued",
                     createdAt,
-                    source: source || "web",
+                    source: resolvedSource,
                 });
 
                 // Set 24H TTL
@@ -330,18 +333,24 @@ const server = Bun.serve({
                     const body = await req.json() as {
                         jobId: string;
                         requestId?: string;
+                        status?: "done" | "failed";
+                        summary?: string;
+                        error?: string;
                         costData?: Record<string, any>;
                         source?: string;
                     };
-                    const { jobId, requestId, costData, source } = body;
+                    const { jobId, requestId, status, summary, error, costData, source } = body;
 
-                    console.log(`[API] POST /api/internal/job-completed | jobId=${jobId} requestId=${requestId} hasCost=${!!costData}`);
+                    console.log(
+                        `[API] POST /api/internal/job-completed | jobId=${jobId} requestId=${requestId} ` +
+                        `status=${status} hasSummary=${!!summary} hasError=${!!error} hasCost=${!!costData}`
+                    );
 
                     // Refresh TTL on completion so job stays visible for 24H from now
                     await redis.expire(`job:${jobId}`, JOB_TTL);
 
                     if (!requestId) {
-                        console.log(`[API]   no requestId, skipping agent config release`);
+                        console.log(`[API]   no requestId, skipping persisted writes (slot release + summary)`);
                         return Response.json({ ok: true, skipped: true });
                     }
 
@@ -356,6 +365,37 @@ const server = Bun.serve({
                             console.error(`[API] background saveAgentCost failed for requestId=${requestId}:`, e);
                         });
                     }
+
+                    // Persist agent work summary to Firestore (fire-and-forget).
+                    // Pull taskId / vehicleNumber / params from the Redis job hash so the
+                    // worker doesn't need to resend them.
+                    (async () => {
+                        try {
+                            const job = await redis.hgetall(`job:${jobId}`);
+                            let params: Record<string, any> = {};
+                            try { params = JSON.parse(job?.params || "{}"); } catch { /* ignore */ }
+
+                            const resolvedStatus: "done" | "failed" =
+                                status === "done" || status === "failed"
+                                    ? status
+                                    : (error ? "failed" : "done");
+
+                            await saveAgentWorkSummary({
+                                jobId,
+                                requestId,
+                                taskId: job?.taskId,
+                                vehicleNumber: typeof params.vehicleNumber === "string" ? params.vehicleNumber : undefined,
+                                status: resolvedStatus,
+                                summary,
+                                error,
+                                source: source || job?.source || "web",
+                                params,
+                                costData,
+                            });
+                        } catch (e) {
+                            console.error(`[API] background saveAgentWorkSummary failed for requestId=${requestId}:`, e);
+                        }
+                    })();
 
                     return Response.json({ ok: true });
                 } catch (e: any) {

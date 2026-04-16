@@ -11,11 +11,13 @@ export interface TaskTool {
     method: "POST" | "GET";
 }
 
+export type JobSource = "web" | "app";
+
 export interface Task {
     id: string;
     name: string;
     requiredParams: string[];
     optionalParams?: string[];
     tools?: TaskTool[];
-    buildPrompt: (params: Record<string, string>) => Promise<string>;
+    buildPrompt: (params: Record<string, string>, source?: JobSource) => Promise<string>;
 }
