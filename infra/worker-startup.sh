@@ -18,14 +18,20 @@ apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
 gcloud auth configure-docker asia-south1-docker.pkg.dev --quiet
 
 # Fetch config from instance metadata (passed by the MIG template)
-REDIS_URL=$(curl -s -H "Metadata-Flavor: Google" \
-  http://metadata.google.internal/computeMetadata/v1/instance/attributes/redis-url)
+REDIS_HOST=$(curl -s -H "Metadata-Flavor: Google" \
+  http://metadata.google.internal/computeMetadata/v1/instance/attributes/redis-host)
+REDIS_AUTH=$(curl -s -H "Metadata-Flavor: Google" \
+  http://metadata.google.internal/computeMetadata/v1/instance/attributes/redis-auth)
 DOMAIN=$(curl -s -H "Metadata-Flavor: Google" \
   http://metadata.google.internal/computeMetadata/v1/instance/attributes/domain)
 API_URL=$(curl -s -H "Metadata-Flavor: Google" \
   http://metadata.google.internal/computeMetadata/v1/instance/attributes/api-url)
 MAX_SLOTS=$(curl -s -H "Metadata-Flavor: Google" \
   http://metadata.google.internal/computeMetadata/v1/instance/attributes/max-slots)
+
+
+REDIS_AUTH_ENC=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$REDIS_AUTH")
+REDIS_URL="redis://default:${REDIS_AUTH_ENC}@${REDIS_HOST}:6379"
 
 # Write compose + env
 mkdir -p /opt/worker

@@ -149,6 +149,9 @@ async def main():
     r = redis.from_url(REDIS_URL)
     pool = SlotPool(max_slots=MAX_SLOTS)
 
+    from metrics import publish_loop
+    asyncio.create_task(publish_loop(pool, WORKER_HOSTNAME))
+
     # Graceful shutdown
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
