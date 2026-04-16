@@ -38,7 +38,7 @@ mkdir -p /opt/worker
 cat > /opt/worker/docker-compose.yaml <<EOF
 services:
   worker:
-    image: asia-south1-docker.pkg.dev/cabswale-ai/automation-agent-images/worker:v2
+    image: asia-south1-docker.pkg.dev/cabswale-ai/automation-agent-images/worker:v3
     environment:
       - REDIS_URL=\${REDIS_URL}
       - API_URL=\${API_URL}
@@ -46,6 +46,7 @@ services:
       - MAX_SLOTS=\${MAX_SLOTS}
     shm_size: "4gb"
     network_mode: "host"
+    stop_grace_period: 600s
     restart: unless-stopped
 EOF
 
