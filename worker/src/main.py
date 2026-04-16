@@ -124,6 +124,7 @@ async def worker_loop(r: redis.Redis):
             "status": "running",
             "liveUrl": live_url,
             "slotIndex": str(slot.index),
+            "vmHostname": WORKER_HOSTNAME,
         })
         r.expire(f"job:{job_id}", JOB_TTL)
 
