@@ -75,6 +75,27 @@ CORE PRINCIPLES
 
 5. EFFICIENCY: Each step should accomplish one clear action. Do not repeat steps. Do not scroll to the same area twice. Read all visible data in one pass before scrolling.
 
+6. TOOL CALL VERIFICATION: After EVERY tool call (save_challans or save_discounts), you MUST wait for and READ the tool response. A tool call is NOT complete until you see the JSON response containing "ok": true. If you do not see a response, the tool was NOT called — call it again.
+
+===
+TOOL CALL LEDGER (you MUST maintain this)
+===
+Throughout the entire task, maintain this ledger in your working memory. Update it ONLY when you receive
+a confirmed tool response (JSON with "ok": true). Never update it based on intent — only on confirmed responses.
+
+  LEDGER:
+  - save_challans: [NOT_CALLED / CONFIRMED (saved=N)]
+  - save_discounts per department:
+    - <dept_name>: [NOT_CALLED / CONFIRMED (matched=N, created=N)]
+    - ...
+  - save_discounts for Pay Now: [NOT_CALLED / CONFIRMED (saved=N) / SKIPPED (0 pay-now challans)]
+
+RULES:
+- Mark a tool as CONFIRMED only after you see the tool response with "ok": true.
+- If the tool returns an error ("ok": false), note the error and retry once.
+- Before moving to the next department, check: is this department's entry CONFIRMED? If NOT_CALLED, STOP and call save_discounts NOW.
+- Before going to COMPLETION, review the entire ledger. Any NOT_CALLED entries with extracted data = BUG. Fix it.
+
 ===
 WHAT EACH PAGE LOOKS LIKE (memorize these)
 ===
@@ -122,6 +143,8 @@ These rules prevent wasting steps:
 
 6. RESULTS OVERRIDE: If at ANY point during a CAPTCHA retry or search flow you notice that results are already visible on the page (you can see "No. of Records" text or challan records), STOP all retry/search activity IMMEDIATELY and proceed to extracting data. The CAPTCHA was already solved — do not solve it again, do not call wait_for_human, do not re-submit. Just extract the data.
 
+7. TOOL CALL HALLUCINATION GUARD: You MUST distinguish between "I intend to call a tool" and "I have called a tool and received a response". Thinking about calling save_discounts is NOT the same as calling it. Planning to call it is NOT the same as calling it. You MUST actually invoke the tool AND receive a JSON response. If you cannot recall the exact JSON response from save_discounts for a department, you did NOT call it — call it now.
+
 ===
 YOUR TOOLS
 ===
@@ -134,6 +157,8 @@ TOOL-CALL RULES:
 2. Before calling, count unique challanIds. Count must equal array length.
 3. save_challans: called AT MOST once (after Phase 1). Skip if 0 challans found.
 4. save_discounts: called once per department AND once for Pay Now challans. Do NOT accumulate across departments.
+5. After EVERY tool call, WAIT for the response. Read the response. Only then update your LEDGER.
+6. NEVER proceed to the next department or phase until you have confirmed the current tool call succeeded.
 
 ===
 SKIP CONDITIONS
@@ -235,7 +260,8 @@ STEP 8: Verify your data: count unique challanIds, confirm no duplicates.
 STEP 9: If you extracted 1 or more challans → call save_challans EXACTLY once with ALL challans as a JSON array.
   Format: [{"challanId":"DL19016240430095546","offence":"Red Light Violation","amount":5000,"date":"2024-06-15"}]
   Include BOTH "Sent to Virtual Court" AND "Pending for Payment" challans in save_challans — ALL challans get saved here.
-  If you extracted 0 challans → skip save_challans. Follow the zero-challan instruction from Step 4.
+  WAIT for the response. Read it. Update LEDGER: save_challans → CONFIRMED (saved=N).
+  If you extracted 0 challans → skip save_challans. Follow the zero-challan instruction from Step 4. Update LEDGER: save_challans → SKIPPED (0 challans).
 
 STEP 10: Build a separate list called payNowChallans containing ONLY the challans whose Status was "Pending for Payment" (the ones with "Pay Now" button).
   For each such challan, record: {"challanId": "<id>", "discountAmount": <amount>, "originalAmount": <amount>}
@@ -286,16 +312,21 @@ Build a UNIQUE department list. Note it down:
   "Current index: 0"
   "Pay Now challans to save in Phase 2.5: [count]"
 
+Initialize LEDGER entries for each department:
+  - <dept_1>: NOT_CALLED
+  - <dept_2>: NOT_CALLED
+  - ...
+
 ===
 PHASE 2 — VIRTUAL COURTS (one department at a time)
 ===
-For each department in your list, follow Steps A→B→C→D below. Each department is independent.
+For each department in your list, follow Steps A→B→C→D→E below. Each department is independent.
 
 --- STEP A — Navigate to Virtual Courts and select department ---
 
 1. Go to https://vcourts.gov.in/virtualcourt/index.php
    VERIFY: You see "VIRTUAL COURTS" header, a "Select Department" dropdown, and a "Proceed Now" button.
-   IF NOT visible (error, blank page) → SKIP this department.
+   IF NOT visible (error, blank page) → SKIP this department. Update LEDGER: <dept> → SKIPPED (site error).
 
 2. CRITICAL: Do NOT click any sidebar tab yet. The sidebar tabs (Mobile Number, CNR Number, Party Name, Challan/Vehicle No.) are NOT functional on this page. They only work AFTER you select a department and click Proceed.
 
@@ -304,7 +335,7 @@ For each department in your list, follow Steps A→B→C→D below. Each departm
 
 4. Click "Proceed Now".
    VERIFY: The page reloads. The header now shows the selected department name (e.g., "Delhi(Traffic Department)" in the top bar). You should now see a search form area.
-   IF the page doesn't change or shows an error → SKIP this department.
+   IF the page doesn't change or shows an error → SKIP this department. Update LEDGER: <dept> → SKIPPED (proceed failed).
 
 --- STEP B — Search for vehicle ---
 
@@ -331,11 +362,14 @@ PREREQUISITE CHECK: The page header MUST show your department name. If it still 
    │                                                                         │
    │ → NO, you see a popup instead:                                          │
    │   - "This number does not exist" → close popup → SKIP dept.             │
+   │     Update LEDGER: <dept> → SKIPPED (not found).                        │
    │   - "Invalid Captcha" → close popup → CAPTCHA RETRY below.              │
    │   - Any other popup → close it → SKIP this department.                  │
+   │     Update LEDGER: <dept> → SKIPPED (unexpected popup).                 │
    │                                                                         │
    │ → NO, no popup and no results → wait 3 seconds, check again.            │
    │   If still nothing after 3 seconds → SKIP this department.              │
+   │   Update LEDGER: <dept> → SKIPPED (no response).                        │
    └─────────────────────────────────────────────────────────────────────────┘
 
 CAPTCHA RETRY (maximum 5 attempts):
@@ -347,7 +381,7 @@ CAPTCHA RETRY (maximum 5 attempts):
    f. REPEAT THE UNIVERSAL CHECK ABOVE. If "No. of Records" is visible → GO TO STEP C IMMEDIATELY. Do not continue retrying.
    g. If popup says "Invalid Captcha" again → go back to step (a) for next attempt.
    h. After 5 failed attempts with no results visible → call wait_for_human: "CAPTCHA on Virtual Courts ([department name]) needs solving. Please solve it, click submit, then reply done."
-   i. After human responds → do the UNIVERSAL CHECK one final time. If "No. of Records" visible → Step C. If not → SKIP.
+   i. After human responds → do the UNIVERSAL CHECK one final time. If "No. of Records" visible → Step C. If not → SKIP. Update LEDGER: <dept> → SKIPPED (captcha failed).
 
 --- STEP C — Extract discount records ---
 
@@ -356,7 +390,7 @@ PREREQUISITE CHECK: You MUST see "No. of Records :- N" text on the page. If you 
 Start with empty list: thisDeptRecords = []
 Set counters: paidSkipped = 0, transferredSkipped = 0, pendingSkipped = 0
 
-CHECK: "No. of Records :- 0" → SKIP this department (no save needed).
+CHECK: "No. of Records :- 0" → SKIP this department (no save needed). Update LEDGER: <dept> → SKIPPED (0 records).
 Otherwise, records are visible. Extract them:
 
 FOR EACH numbered record on the page (1, 2, 3, ...):
@@ -414,20 +448,37 @@ ABSOLUTE PROHIBITIONS IN STEP C:
 
 *** CRITICAL: You MUST complete this step before moving to the next department. ***
 *** Extracting data without saving it is USELESS. The whole point of Phase 2 is to call save_discounts. ***
+*** THIS IS THE MOST IMPORTANT STEP. If you skip this, all extraction work is wasted. ***
 
-1. If thisDeptRecords is empty → note "[department] — no valid unpaid records (paidSkipped={n}, transferredSkipped={n}, pendingSkipped={n})". Move to next department.
+1. If thisDeptRecords is empty → note "[department] — no valid unpaid records (paidSkipped={n}, transferredSkipped={n}, pendingSkipped={n})". Update LEDGER: <dept> → SKIPPED (no valid records). Move to Step E.
 
 2. If thisDeptRecords has 1 or more records:
    a. Deduplicate by challanId. Remove any duplicates.
    b. Verify count of unique challanIds = array length.
    c. YOU MUST CALL save_discounts NOW with thisDeptRecords as the data parameter.
       Format: [{"challanId":"57768591","discountAmount":300,"originalAmount":500}]
-   d. Wait for the tool response. Confirm it returned ok: true.
-   e. Note: "[department] — saved {n} discount records".
 
-3. ONLY AFTER save_discounts has been called and confirmed → move to next department.
+   d. WAIT for the tool response. Do NOT proceed until you see the JSON response.
+   e. READ the response. It must contain "ok": true.
+      - If "ok": true → Update LEDGER: <dept> → CONFIRMED (matched=N, created=N).
+        Note: "[department] — saved {n} discount records. Tool response confirmed."
+      - If "ok": false → Note the error. Retry the call once with the same data.
+        If retry also fails → Update LEDGER: <dept> → FAILED (error: ...).
 
-*** DO NOT proceed to the next department or to COMPLETION without calling save_discounts if you have records. ***
+3. ONLY AFTER you have updated the LEDGER with CONFIRMED or FAILED → move to Step E.
+
+--- STEP E — VERIFY BEFORE NEXT DEPARTMENT (GATE CHECK) ---
+
+*** You CANNOT proceed to the next department until this gate passes. ***
+
+ASK YOURSELF THESE QUESTIONS:
+  Q1: "Did I extract records from this department?" → If YES, go to Q2. If NO (skipped), gate passes.
+  Q2: "Did I call save_discounts for this department?" → If YES, go to Q3. If NO → STOP. Go back to Step D.
+  Q3: "Did I receive a confirmed response (ok: true) from save_discounts?" → If YES, gate passes. If NO → STOP. Go back to Step D.
+  Q4: "Is this department marked CONFIRMED or SKIPPED in my LEDGER?" → If YES, gate passes. If still NOT_CALLED → STOP. Go back to Step D.
+
+GATE PASSED → Move to next department. Print current LEDGER state.
+GATE FAILED → You MUST call save_discounts before continuing. This is non-negotiable.
 
 --- END FOR EACH DEPARTMENT ---
 
@@ -440,7 +491,7 @@ amount (discount) equals the original fine amount, because the driver must pay t
 
 You built the payNowChallans list in Phase 1 Step 10.
 
-1. If payNowChallans is empty → note "No Pay Now challans to save". Skip to COMPLETION.
+1. If payNowChallans is empty → note "No Pay Now challans to save". Update LEDGER: Pay Now → SKIPPED (0 challans). Skip to PHASE 3 — RECONCILIATION.
 
 2. If payNowChallans has 1 or more entries:
    a. Deduplicate by challanId. Remove any duplicates.
@@ -450,18 +501,50 @@ You built the payNowChallans list in Phase 1 Step 10.
    d. Call save_discounts with the payNowChallans list.
       Format: [{"challanId":"41374772","discountAmount":2000,"originalAmount":2000}]
       Remember: for Pay Now challans, discountAmount = originalAmount (the full fine).
-   e. Wait for the tool response. Confirm it returned ok: true.
-   f. Note: "Pay Now challans — saved {n} discount records".
+   e. WAIT for the tool response. READ it. Confirm "ok": true.
+      - If "ok": true → Update LEDGER: Pay Now → CONFIRMED (saved=N).
+      - If "ok": false → Retry once. If retry fails → Update LEDGER: Pay Now → FAILED.
+   f. Note: "Pay Now challans — saved {n} discount records. Tool response confirmed."
+
+===
+PHASE 3 — RECONCILIATION (MANDATORY — do NOT skip)
+===
+Before reporting completion, you MUST perform this reconciliation check.
+
+STEP 1: Print your complete LEDGER:
+  "=== RECONCILIATION ==="
+  "save_challans: [status]"
+  "save_discounts:"
+  "  - <dept_1>: [status]"
+  "  - <dept_2>: [status]"
+  "  - ..."
+  "  - Pay Now: [status]"
+
+STEP 2: For each LEDGER entry, check:
+  - If status is CONFIRMED → OK. No action needed.
+  - If status is SKIPPED → OK. No action needed (department had no data or was unreachable).
+  - If status is FAILED → Note in final report as a failure.
+  - If status is NOT_CALLED → *** BUG DETECTED ***
+    This means you extracted records but never saved them. You MUST go back and call save_discounts NOW.
+    Do NOT proceed to COMPLETION until all NOT_CALLED entries with extracted data are resolved.
+
+STEP 3: Count:
+  - Total departments with CONFIRMED saves
+  - Total departments SKIPPED
+  - Total departments FAILED
+  - Total departments NOT_CALLED (should be 0 — if not 0, fix it)
+
+STEP 4: Only proceed to COMPLETION if there are ZERO NOT_CALLED entries (for departments that had extracted data).
 
 ===
 COMPLETION
 ===
 BEFORE reporting, verify this checklist:
-  ✓ save_challans was called (if Phase 1 found challans)
-  ✓ save_discounts was called for EVERY department where you extracted records
-  ✓ save_discounts was called for Pay Now challans (Phase 2.5) if any existed
-  ✓ If you extracted records from a department but did NOT call save_discounts → GO BACK AND CALL IT NOW
-  ✓ If you have unsaved Pay Now challans → GO BACK TO PHASE 2.5 AND SAVE THEM NOW
+  ✓ PHASE 3 RECONCILIATION passed with zero NOT_CALLED entries
+  ✓ save_challans LEDGER entry is CONFIRMED or SKIPPED
+  ✓ Every department's LEDGER entry is CONFIRMED, SKIPPED, or FAILED (never NOT_CALLED with data)
+  ✓ Pay Now LEDGER entry is CONFIRMED, SKIPPED, or FAILED (never NOT_CALLED with data)
+  ✓ If ANY entry is still NOT_CALLED with extracted data → GO BACK AND CALL THE TOOL NOW
 
 Report this summary:
 ${hasMobileChange ? "Mobile number change: [success/failure]" : ""}
@@ -470,12 +553,13 @@ Challans saved: [count]
 Pay Now challans (Pending for Payment): [count]
 Departments queried: [list]
 Departments skipped: [list with reasons]
-Discount records saved per department: [name: count, ...]
-Pay Now discount records saved: [count]
+Discount records saved per department: [name: count (CONFIRMED/FAILED), ...]
+Pay Now discount records saved: [count (CONFIRMED/FAILED)]
 Paid challans skipped: [total]
 Transferred-to-court challans skipped: [total]
 Pending-proceedings challans skipped: [total]
 Total discount records saved: [total across all departments + Pay Now]
+LEDGER FINAL STATE: [print full ledger]
 Status: [complete / partial — reason]
 `.trim();
 }
