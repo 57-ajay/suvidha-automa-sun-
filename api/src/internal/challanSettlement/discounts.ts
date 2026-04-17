@@ -111,6 +111,7 @@ export async function handleSaveDiscounts(body: InternalRequest) {
     }
 
     const docData = docSnap.data()!;
+    const existingChallansArray: any[] = Array.isArray(docData.challans) ? docData.challans : [];
     const existingChallans: any[] = docData.challansDraft || [];
 
     console.log(`[save_discounts] doc=${docSnap.id} existing challans=${existingChallans.length}`);
@@ -232,19 +233,60 @@ export async function handleSaveDiscounts(body: InternalRequest) {
 
     await Promise.all(subDocPromises);
 
+    const getChallanKey = (item: any): string | null => {
+        if (typeof item?.id === "string" && item.id.trim() !== "") return item.id;
+        if (typeof item?.challanId === "string" && item.challanId.trim() !== "") return item.challanId;
+        if (typeof item?.challanNo === "string" && item.challanNo.trim() !== "") return item.challanNo;
+        return null;
+    };
+
+    const newUpdatedChallans = [...existingChallansArray];
+    const updatedMap = new Map<string, any>();
+
+    for (const item of updatedChallans) {
+        const key = getChallanKey(item);
+        if (key) updatedMap.set(key, item);
+    }
+
+    for (let i = 0; i < newUpdatedChallans.length; i++) {
+        const existing = newUpdatedChallans[i];
+        const key = getChallanKey(existing);
+        if (!key) continue;
+
+        const updated = updatedMap.get(key);
+        if (!updated) continue;
+
+        existing.quotation = updated.quotation;
+
+        if (existing.challanAmount == null || Number(existing.challanAmount) === 0) {
+            existing.challanAmount = updated.challanAmount;
+        }
+
+        updatedMap.delete(key);
+    }
+
+    for (const remaining of updatedMap.values()) {
+        newUpdatedChallans.push(remaining);
+    }
+
+    const settlementAmount = newUpdatedChallans.reduce((sum, challan) => {
+        return sum + (challan?.quotation?.amount || 0);
+    }, 0);
+
     // Update main request doc
     await docRef.update({
-        challansDraft: updatedChallans,
+        challans: newUpdatedChallans,
         challansUpdatedBy: "agent",
-        totalSettlementAmount,
+        totalSettlementAmount: settlementAmount,
         updatedAt: FieldValue.serverTimestamp(),
+        status: "amountAdded",
         paymentValidTill: Timestamp.fromDate(
             new Date(now.getTime() + 24 * 60 * 60 * 1000)
         ),
     });
 
     console.log(
-        `[save_discounts] SUCCESS job=${jobId} vehicle=${vehicleNumber} matched=${matched} created=${created} total=₹${totalSettlementAmount} doc=${docSnap.id}`
+        `[save_discounts] SUCCESS job=${jobId} vehicle=${vehicleNumber} matched=${matched} created=${created} total=₹${settlementAmount} doc=${docSnap.id}`
     );
 
     return {
@@ -252,7 +294,7 @@ export async function handleSaveDiscounts(body: InternalRequest) {
         matched,
         created,
         total: incoming.length,
-        totalSettlementAmount,
+        totalSettlementAmount: settlementAmount,
         vehicle: vehicleNumber,
         docId: docSnap.id,
     };
