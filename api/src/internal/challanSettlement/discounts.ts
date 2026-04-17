@@ -281,16 +281,16 @@ export async function handleSaveDiscounts(body: InternalRequest) {
   await docRef.update({
     challans: newUpdatedChallans,
     challansUpdatedBy: "agent",
-    totalSettlementAmount,
+    totalSettlementAmount: settlementAmount,
     updatedAt: FieldValue.serverTimestamp(),
-    status: "amountAdded"
-        paymentValidTill: Timestamp.fromDate(
+    status: "amountAdded",
+    paymentValidTill: Timestamp.fromDate(
       new Date(now.getTime() + 24 * 60 * 60 * 1000)
     ),
   });
 
   console.log(
-    `[save_discounts] SUCCESS job=${jobId} vehicle=${vehicleNumber} matched=${matched} created=${created} total=₹${totalSettlementAmount} doc=${docSnap.id}`
+    `[save_discounts] SUCCESS job=${jobId} vehicle=${vehicleNumber} matched=${matched} created=${created} total=₹${settlementAmount} doc=${docSnap.id}`
   );
 
   return {
@@ -298,7 +298,7 @@ export async function handleSaveDiscounts(body: InternalRequest) {
     matched,
     created,
     total: incoming.length,
-    totalSettlementAmount,
+    totalSettlementAmount: settlementAmount,
     vehicle: vehicleNumber,
     docId: docSnap.id,
   };
