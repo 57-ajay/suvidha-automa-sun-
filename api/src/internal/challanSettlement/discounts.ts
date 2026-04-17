@@ -111,12 +111,8 @@ export async function handleSaveDiscounts(body: InternalRequest) {
     }
 
     const docData = docSnap.data()!;
-    const existingChallansArray: any[] = Array.isArray(docData.challans)
-        ? docData.challans
-        : Array.isArray(docData.challansDraft)
-            ? docData.challansDraft
-            : [];
-    const existingChallans: any[] = existingChallansArray;
+    const existingChallansArray: any[] = Array.isArray(docData.challans) ? docData.challans : [];
+    const existingChallans: any[] = docData.challansDraft || [];
 
     console.log(`[save_discounts] doc=${docSnap.id} existing challans=${existingChallans.length}`);
 
