@@ -7,6 +7,8 @@ import { handleSaveReceipt } from "./internal/borderTax/receipt";
 import { releaseAgentSlot, saveAgentCost } from "./internal/agentConfig";
 import { saveAgentWorkSummary } from "./internal/agentWorkSummary";
 import { DASHBOARD_HTML } from "./dashboard";
+import { setAssignedPartner } from "./internal/assignedPartner";
+import { markChallansUpdatedByAgent } from "./internal/challanSettlement/markUpdated";
 
 import "./firebase";
 
@@ -99,6 +101,15 @@ const server = Bun.serve({
                 pipeline.lpush("job:queue", jobId);
 
                 await pipeline.exec();
+
+                if (resolvedSource === "app" && params?.requestId) {
+                    setAssignedPartner(params.requestId, taskId).catch((e) => {
+                        console.error(
+                            `[API] background setAssignedPartner failed for requestId=${params.requestId}:`,
+                            e,
+                        );
+                    });
+                }
 
                 return Response.json({ jobId });
             }
@@ -392,6 +403,16 @@ const server = Bun.serve({
                                 params,
                                 costData,
                             });
+
+                            if (job?.taskId === "challan-settlement" && resolvedStatus === "done") {
+                                markChallansUpdatedByAgent(requestId).catch((e) => {
+                                    console.error(
+                                        `[API] background markChallansUpdatedByAgent failed for requestId=${requestId}:`,
+                                        e,
+                                    );
+                                });
+                            }
+
                         } catch (e) {
                             console.error(`[API] background saveAgentWorkSummary failed for requestId=${requestId}:`, e);
                         }
