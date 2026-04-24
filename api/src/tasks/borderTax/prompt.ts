@@ -6,8 +6,8 @@ export const buildPrompt = async (p: Record<string, string>) => {
     const entryDistrict = p.entryDistrict || "GHAZIABAD";
     const entryCheckpoint = p.entryCheckpoint || "GHAZIABAD";
     const serviceType = p.serviceType || "Air Conditioned Service";
-    const sbiUserId = p.sbiUserId || "XYZ";
-    const sbiPassword = p.sbiPassword || "123456789";
+    const sbiUserId = /*p.sbiUserId || */"89Rahulxyz";
+    const sbiPassword = /*p.sbiPassword ||*/ "rahul@70007";
     const paymentMethod = (p.paymentMethod || "net_banking").toLowerCase();
     const isUPI = paymentMethod === "upi";
 
@@ -230,6 +230,7 @@ ABORT CONDITIONS
 - parivahan.gov.in does not load, shows error, maintenance page, or blank page → ABORT. Reason: "Parivahan site is down: [exact error]"
 - Checkpost portal does not load → ABORT. Reason: "Checkpost portal failed to load."
 - Vehicle number not found or "Get Details" returns error → ABORT. Reason: "Vehicle ${vehicleNumber} not found on checkpost portal."
+- "No valid insurance detected" popup appears on the Vehicle Information page (either on page load or after selecting Service Type) → ABORT. Reason: "Vehicle ${vehicleNumber} has no valid insurance. Please renew the vehicle's insurance policy before attempting border tax payment."
 - Payment fails after human intervention → ABORT. Reason: "Payment failed: [details]"
 ${paymentAbort}
 
@@ -255,8 +256,13 @@ VISUAL: "Entry District Name" and "Entry CheckPost Name" dropdowns. "Next" butto
 AVAILABLE ACTIONS: Select district, select checkpoint, click "Next".
 
 PAGE: CHECKPOST PORTAL — Vehicle Information (Step 2 of 4)
-VISUAL: "Service Type" dropdown. "Next" button.
-AVAILABLE ACTIONS: Select service type, click "Next".
+VISUAL: Vehicle info fields (Vehicle Type, Vehicle Category, Permit Type, Seating Capacity, Sleeper Capacity,
+  Service Type, Permit Validity, Permit No., Insurance Validity, Fitness Validity, PUCC Validity, Road Tax Validity).
+  "Service Type" is a dropdown the agent must set. "Previous" and "Next" buttons at the bottom.
+POSSIBLE POPUP: A red error popup reading "No valid insurance detected. Please renew your vehicle policy!..."
+  with an "OK" button may appear when the page loads or after the Service Type is selected. This is BLOCKING —
+  the user cannot proceed with the border tax payment. The agent must close the popup and ABORT the task.
+AVAILABLE ACTIONS: Select service type from dropdown, click "Next". If insurance popup appears → click "OK" → ABORT.
 
 PAGE: CHECKPOST PORTAL — Tax Information (Step 3 of 4)
 VISUAL: "Tax Mode" dropdown, "Tax From" and "Tax Upto" date fields. "Calculate Fee/Tax" button, then "Next" button.
@@ -300,9 +306,23 @@ PHASE 3 — FILL ENTRY DETAILS
 1. In the "Entry District Name" dropdown, select "${entryDistrict}".
 2. In the "Entry CheckPost Name" dropdown, select "${entryCheckpoint}".
 3. Click the "Next" button.
+
 4. On the Vehicle Information page (Step 2 of 4):
-   - In the "Service Type" dropdown, select "${serviceType}".
-   - Click "Next".
+
+   4a. INSURANCE CHECK (do this BEFORE selecting Service Type):
+       - As soon as the page loads, scan the page for a red error popup.
+       - If a popup is already visible with text matching "No valid insurance detected. Please renew your vehicle policy!..." (or any variation mentioning "insurance" being invalid/expired/missing):
+         → Click "OK" to close the popup.
+         → ABORT IMMEDIATELY. Reason: "Vehicle ${vehicleNumber} has no valid insurance. Please renew the vehicle's insurance policy before attempting border tax payment."
+         → Do NOT attempt to proceed further. Do NOT click Next.
+
+   4b. If no insurance popup is visible:
+       - In the "Service Type" dropdown, select "${serviceType}".
+       - IMMEDIATELY AFTER selecting the service type, wait ~2 seconds and scan the page again for a popup.
+       - If a popup appears saying "No valid insurance detected. Please renew your vehicle policy!..." (or similar insurance-related error):
+         → Click "OK" to close the popup.
+         → ABORT. Reason: "Vehicle ${vehicleNumber} has no valid insurance. Please renew the vehicle's insurance policy before attempting border tax payment."
+       - Otherwise, click the "Next" button to proceed to the Tax Information page.
 
 ===
 PHASE 4 — TAX CALCULATION

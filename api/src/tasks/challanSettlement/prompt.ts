@@ -1,12 +1,39 @@
 import { challanRequestsRef } from "../../firebase";
+import type { JobSource } from "../types";
 
-export const buildPrompt = async (p: Record<string, string>) => {
+export const buildPrompt = async (p: Record<string, string>, source: JobSource = "web") => {
     const existingDepartments = await challansFromDB(p);
 
     const hasMobileChange =
         p.mobileNumber && p.chassisLastFour && p.engineLastFour;
 
     const hasExtraDepts = existingDepartments.length > 0;
+
+    const isApp = source === "app";
+
+    const sourceContextBlock = isApp
+        ? `
+===
+EXECUTION CONTEXT — APP MODE
+===
+This task was initiated from the **mobile app**. The human user CANNOT see the browser and CANNOT solve CAPTCHAs manually via the live view.
+
+Consequences for your behavior:
+- For **CAPTCHAs**: you must solve them yourself. Do NOT call wait_for_human for CAPTCHA problems. If you cannot solve the CAPTCHA after the allotted retries, ABORT that department and move to the next one. See Phase 2 Step B for exact retry rules.
+- For **OTPs**: the user CAN still provide OTP text via the app. wait_for_human for OTP purposes is still valid and expected.
+- For **popups / modals**: close them immediately by clicking the close button or OK button. Do not wait for a human to dismiss them.
+`
+        : `
+===
+EXECUTION CONTEXT — WEB MODE
+===
+This task was initiated from the **web dashboard**. The human user CAN see the live browser view and CAN solve CAPTCHAs manually when requested.
+
+Consequences for your behavior:
+- For CAPTCHAs that you fail after the allotted retries, you may call wait_for_human so the human can solve it in the live view.
+- For OTPs, call wait_for_human as described in the steps.
+- For popups / modals, close them immediately.
+`;
 
     const mobileChangeBlock = hasMobileChange
         ? `
@@ -58,10 +85,46 @@ You MUST add these to your department list even if no challan ID from Phase 1 ma
 `
         : "";
 
+    // ---- CAPTCHA RETRY BLOCK — differs by source ----
+    const captchaRetryBlock = isApp
+        ? `CAPTCHA RETRY (maximum 7 attempts, APP MODE — no human help available):
+   a. Close any error popup on screen (click its close button / OK button / X). Do NOT call wait_for_human for popups.
+   b. BEFORE reading the new CAPTCHA, verify the "Vehicle Number" field:
+      - Look at the "Vehicle Number" input. If it is EMPTY, or if its current value is NOT "${p.vehicleNumber}" → click the field, clear it, and type "${p.vehicleNumber}".
+      - If the field already contains "${p.vehicleNumber}" → leave it as-is. Do not re-type.
+   c. The CAPTCHA image has REFRESHED after the failed attempt. Look at the NEW image now on screen.
+   d. Clear the "Enter Captcha" field completely.
+   e. Read the NEW CAPTCHA image carefully and type it in the "Enter Captcha" field.
+   f. Click "Submit".
+   g. REPEAT THE UNIVERSAL CHECK ABOVE. If "No. of Records" is visible → GO TO STEP C IMMEDIATELY. Do not continue retrying.
+   h. If popup says "Invalid Captcha" again → increment your attempt counter and go back to step (a) for the next attempt.
+   i. If popup says "This number does not exist" → close popup → SKIP this department. Update LEDGER: <dept> → SKIPPED (not found). Move to next department.
+   j. After 7 failed CAPTCHA attempts with no results visible → SKIP this department. Update LEDGER: <dept> → SKIPPED (captcha failed after 7 attempts, app mode). Do NOT call wait_for_human — human cannot solve CAPTCHAs in app mode. Move to the next department.
+   k. If the SKIP in (j) was on the LAST department in your list → do not retry further, do not call wait_for_human. Proceed directly to Phase 2.5 → Phase 3 → COMPLETION with whatever data you have already saved. The task ends gracefully as partial.`
+        : `CAPTCHA RETRY (maximum 5 attempts):
+   a. Close the error popup.
+   b. IMPORTANT: The CAPTCHA image has CHANGED after the failed attempt. Look at the NEW image now on screen.
+   c. BEFORE typing the new CAPTCHA, verify the "Vehicle Number" field:
+      - Look at the "Vehicle Number" input. If it is EMPTY, or if its current value is NOT "${p.vehicleNumber}" → click the field, clear it, and type "${p.vehicleNumber}".
+      - If the field already contains "${p.vehicleNumber}" → leave it as-is. Do not re-type.
+   d. Clear the "Enter Captcha" field completely.
+   e. Read the NEW CAPTCHA and type it.
+   f. Click "Submit".
+   g. REPEAT THE UNIVERSAL CHECK ABOVE. If "No. of Records" is visible → GO TO STEP C IMMEDIATELY. Do not continue retrying.
+   h. If popup says "Invalid Captcha" again → go back to step (a) for next attempt.
+   i. After 5 failed attempts with no results visible → call wait_for_human: "CAPTCHA on Virtual Courts ([department name]) needs solving. Please solve it, click submit, then reply done."
+   j. After human responds → do the UNIVERSAL CHECK one final time. If "No. of Records" visible → Step C. If not → SKIP. Update LEDGER: <dept> → SKIPPED (captcha failed).`;
+
+    // ---- Tool description — differs slightly by source ----
+    const waitForHumanDesc = isApp
+        ? `- wait_for_human → ONLY for OTP prompts (Phase 0 / Phase 1). NEVER for CAPTCHA in app mode — handle CAPTCHA per Phase 2 Step B retry rules, and abort the department if you cannot solve it.`
+        : `- wait_for_human → ONLY when explicitly told in steps below (OTP, CAPTCHA).`;
+
     return `
 You are a strict automation agent extracting challan data for vehicle ${p.vehicleNumber}.
 ${hasMobileChange ? `Target mobile for OTP: ${p.mobileNumber}` : ""}
-
+Source: ${source}
+${sourceContextBlock}
 ===
 CORE PRINCIPLES
 ===
@@ -102,7 +165,7 @@ WHAT EACH PAGE LOOKS LIKE (memorize these)
 
 PAGE: DELHI TRAFFIC POLICE — Home
 URL: https://traffic.delhipolice.gov.in/notice/pay-notice/
-VISUAL: A form with "Vehicle Number" input field and a "Search Details" button. Orange/brown header.
+VISUAL: A form with "Vehicle Number" input field and "Search Details" button. Orange/brown header.
 AVAILABLE ACTIONS: Type vehicle number, click "Search Details".
 
 PAGE: DELHI TRAFFIC POLICE — Results
@@ -148,7 +211,7 @@ These rules prevent wasting steps:
 ===
 YOUR TOOLS
 ===
-- wait_for_human → ONLY when explicitly told in steps below (OTP, CAPTCHA).
+${waitForHumanDesc}
 - save_challans → At most once, after Phase 1 (only if challans were found).
 - save_discounts → MANDATORY once PER DEPARTMENT in Phase 2 after extracting records. Also called once in Phase 2.5 for "Pay Now" challans from Delhi Traffic Police. If you extracted discount records from a department, you MUST call this tool before moving on. Failing to call save_discounts means the extracted data is lost.
 
@@ -173,7 +236,9 @@ PER-DEPARTMENT SKIP (skip department, continue to next):
 - Virtual Courts does not load or shows error → SKIP. Note: "[dept] — site error."
 - Popup "This number does not exist" → close popup, SKIP. Note: "[dept] — not found."
 - "No. of Records :- 0" → SKIP. Note: "[dept] — 0 records."
-- CAPTCHA fails 5 times AND wait_for_human also fails → SKIP.
+- ${isApp
+            ? `APP MODE: CAPTCHA fails 7 times → SKIP that department (no wait_for_human). If last department, proceed to COMPLETION with partial data.`
+            : `CAPTCHA fails 5 times AND wait_for_human also fails → SKIP.`}
 - Any unexpected popup → close it, SKIP.
 - Stuck for 3+ steps → SKIP.
 
@@ -372,16 +437,7 @@ PREREQUISITE CHECK: The page header MUST show your department name. If it still 
    │   Update LEDGER: <dept> → SKIPPED (no response).                        │
    └─────────────────────────────────────────────────────────────────────────┘
 
-CAPTCHA RETRY (maximum 5 attempts):
-   a. Close the error popup.
-   b. IMPORTANT: The CAPTCHA image has CHANGED after the failed attempt. Look at the NEW image now on screen.
-   c. Clear the "Enter Captcha" field completely.
-   d. Read the NEW CAPTCHA and type it.
-   e. Click "Submit".
-   f. REPEAT THE UNIVERSAL CHECK ABOVE. If "No. of Records" is visible → GO TO STEP C IMMEDIATELY. Do not continue retrying.
-   g. If popup says "Invalid Captcha" again → go back to step (a) for next attempt.
-   h. After 5 failed attempts with no results visible → call wait_for_human: "CAPTCHA on Virtual Courts ([department name]) needs solving. Please solve it, click submit, then reply done."
-   i. After human responds → do the UNIVERSAL CHECK one final time. If "No. of Records" visible → Step C. If not → SKIP. Update LEDGER: <dept> → SKIPPED (captcha failed).
+${captchaRetryBlock}
 
 --- STEP C — Extract discount records ---
 

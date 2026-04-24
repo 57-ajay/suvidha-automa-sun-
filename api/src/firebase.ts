@@ -17,4 +17,9 @@ export const challanRequestsRef = db
     .doc("data")
     .collection("challanRequests");
 
+export const borderTaxRequestsRef = db
+    .collection("driverUtilitiesRequests")
+    .doc("data")
+    .collection("borderTaxRequests");
+
 console.log("[FIREBASE] Initialized successfully (Firestore + Storage)");

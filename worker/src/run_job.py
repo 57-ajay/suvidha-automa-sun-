@@ -18,21 +18,42 @@ API_URL = os.environ.get("API_URL", "http://api:3000")
 JOB_TTL = 60 * 60 * 24
 
 
-async def notify_job_completed(job_id: str, request_id: str | None, cost_data: dict | None = None, source: str = "web"):
-    """Fire-and-forget: tell the API the job is done so it can release the agent config slot."""
+async def notify_job_completed(
+    job_id: str,
+    request_id: str | None,
+    status: str,
+    summary: str | None = None,
+    error: str | None = None,
+    cost_data: dict | None = None,
+    source: str = "web",
+):
+    """Fire-and-forget: tell the API the job is done so it can release the
+    agent config slot and persist the agent work summary."""
     try:
-        payload: dict = {"jobId": job_id, "requestId": request_id}
+        payload: dict = {
+            "jobId": job_id,
+            "requestId": request_id,
+            "status": status,
+            "source": source,
+        }
+        if summary is not None:
+            payload["summary"] = summary
+        if error is not None:
+            payload["error"] = error
         if cost_data:
             payload["costData"] = cost_data
-        if source:
-            payload["source"] = source
+
         async with httpx.AsyncClient(timeout=10) as client:
             await client.post(
                 f"{API_URL}/api/internal/job-completed",
                 json=payload,
             )
-        print(f"[{job_id}] Notified API of job completion (cost included: {
-              cost_data is not None})")
+        print(
+            f"[{job_id}] Notified API of job completion "
+            f"(status={status}, cost_included={cost_data is not None}, "
+            f"summary_len={len(summary) if summary else 0}, has_error={
+                error is not None})"
+        )
     except Exception as e:
         print(f"[{job_id}] Warning: failed to notify job completion: {e}")
 
@@ -97,7 +118,7 @@ async def main():
     source = job.get("source", "web")
 
     print(f"""[{job_id}] Agent starting on DISPLAY={display}, {
-          len(tool_defs)} tools, params={list(job_params.keys())}""")
+          len(tool_defs)} tools, params={list(job_params.keys())}, source={source}""")
 
     try:
         result = await run_agent(prompt, job_id, job_params, tool_defs, r)
@@ -110,14 +131,28 @@ async def main():
         r.expire(f"job:{job_id}", JOB_TTL)
         print(f"[{job_id}] Done")
 
-        await notify_job_completed(job_id, request_id, cost_data, source)
+        await notify_job_completed(
+            job_id=job_id,
+            request_id=request_id,
+            status="done",
+            summary=final_result,
+            cost_data=cost_data,
+            source=source,
+        )
 
     except Exception as e:
-        r.hset(f"job:{job_id}", mapping={"status": "failed", "error": str(e)})
+        err_msg = str(e)
+        r.hset(f"job:{job_id}", mapping={"status": "failed", "error": err_msg})
         r.expire(f"job:{job_id}", JOB_TTL)
-        print(f"[{job_id}] Failed: {e}")
+        print(f"[{job_id}] Failed: {err_msg}")
 
-        await notify_job_completed(job_id, request_id, source)
+        await notify_job_completed(
+            job_id=job_id,
+            request_id=request_id,
+            status="failed",
+            error=err_msg,
+            source=source,
+        )
 
         sys.exit(1)
 

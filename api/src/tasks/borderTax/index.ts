@@ -8,5 +8,5 @@ export const borderTax: Task = {
     requiredParams: ["vehicleNumber", "requestId", "taxFrom", "taxUpto"],
     optionalParams: ["taxMode", "entryDistrict", "entryCheckpoint", "serviceType", "sbiUserId", "sbiPassword"],
     tools: tools,
-    buildPrompt: async (p) => { return await buildPrompt(p) },
+    buildPrompt: async (p, _source) => { return await buildPrompt(p) },
 };

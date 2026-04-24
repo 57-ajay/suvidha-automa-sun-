@@ -8,5 +8,5 @@ export const challanSettlement: Task = {
     requiredParams: ["vehicleNumber", "requestId"],
     optionalParams: ["mobileNumber", "chassisLastFour", "engineLastFour"],
     tools: tools,
-    buildPrompt: async (p) => { return await buildPrompt(p) }
+    buildPrompt: async (p, source) => { return await buildPrompt(p, source) }
 };
