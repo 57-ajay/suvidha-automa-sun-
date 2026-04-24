@@ -7,6 +7,8 @@ export const buildPrompt = async (p: Record<string, string>, source: JobSource =
     const hasMobileChange =
         p.mobileNumber && p.chassisLastFour && p.engineLastFour;
 
+    const providedLastFour = p.mobileNumber ? p.mobileNumber.slice(-4) : "";
+
     const hasExtraDepts = existingDepartments.length > 0;
 
     const isApp = source === "app";
@@ -38,10 +40,25 @@ Consequences for your behavior:
     const mobileChangeBlock = hasMobileChange
         ? `
 ===
-PHASE 0 — CHANGE MOBILE NUMBER
+PHASE 0 — CHANGE MOBILE NUMBER (conditional)
 ===
 TRIGGER: You just clicked "Search Details" and an OTP dialog appeared.
 Do NOT enter OTP yet. Follow these steps in order:
+
+STEP 0 — DECIDE WHETHER TO CHANGE AT ALL:
+  The OTP dialog shows a masked mobile number like "******7763" (last 4 digits visible).
+  The provided mobile number is ${p.mobileNumber}, whose last 4 digits are "${providedLastFour}".
+
+  → READ the last 4 digits of the masked number on the dialog.
+  → COMPARE them to "${providedLastFour}".
+
+  DECISION:
+    - If they MATCH → the registered mobile is already the one we want. SKIP Phase 0 entirely.
+      Go directly to step 4 of Phase 1. Call wait_for_human for the OTP as described there.
+    - If they DO NOT MATCH → continue to step 1 below.
+    - If the dialog does NOT show a masked number, or you cannot read the last 4 digits
+      clearly (blurred, weird format, no digits visible) → proceed with the change
+      (continue to step 1 below). This is the safe default.
 
 1. VERIFY: You see an OTP dialog on screen with a "Change mobile Number" link.
    → Click "Change mobile Number".
@@ -66,8 +83,11 @@ Do NOT enter OTP yet. Follow these steps in order:
 
     const otpBlock = hasMobileChange
         ? `HANDLING OTP:
-- If you have NOT yet changed the mobile number → follow PHASE 0 above.
-- If you ALREADY changed the mobile number → OTP is handled at end of PHASE 0. Continue to step 4.`
+- FIRST do PHASE 0 → STEP 0 (decision check). The last-4-digits comparison determines your path.
+- If PHASE 0 Step 0 says SKIP (last 4 digits match) → call wait_for_human:
+  "OTP sent to registered mobile ending in ${providedLastFour}. Please enter the OTP, click submit, then reply done."
+  After human responds, continue to step 4.
+- If PHASE 0 Step 0 says CONTINUE → follow PHASE 0 steps 1-3. OTP is handled at the end of PHASE 0.`
         : `HANDLING OTP:
 - Call wait_for_human: "OTP required on Delhi Traffic Police. Please enter the OTP, click submit, then reply done."
 - After human responds, continue to step 4.`;
@@ -603,7 +623,7 @@ BEFORE reporting, verify this checklist:
   ✓ If ANY entry is still NOT_CALLED with extracted data → GO BACK AND CALL THE TOOL NOW
 
 Report this summary:
-${hasMobileChange ? "Mobile number change: [success/failure]" : ""}
+${hasMobileChange ? "Mobile number change: [success/failure/skipped — last 4 matched]" : ""}
 Challans found (Delhi Traffic Police): [count]
 Challans saved: [count]
 Pay Now challans (Pending for Payment): [count]
