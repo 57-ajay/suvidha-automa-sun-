@@ -1,0 +1,10 @@
+services:
+  worker:
+    build: ./worker
+    restart: unless-stopped
+    environment:
+      - REDIS_URL=${REDIS_URL}
+      - EDGE_DOMAIN=${EDGE_DOMAIN}
+      - MAX_SLOTS=${MAX_SLOTS:-8}
+      - API_URL=https://${EDGE_DOMAIN}
+    shm_size: "4gb"

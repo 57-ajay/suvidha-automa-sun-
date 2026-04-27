@@ -3,6 +3,10 @@ automation-agent.cabswale.in {
         reverse_proxy api:3000
     }
 
+    handle /vnc/* {
+        reverse_proxy api:3000
+    }
+
     handle {
         respond "edge ok" 200
     }

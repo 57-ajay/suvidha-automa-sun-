@@ -9,6 +9,7 @@ import { saveAgentWorkSummary } from "./internal/agentWorkSummary";
 import { DASHBOARD_HTML } from "./dashboard";
 import { setAssignedPartner } from "./internal/assignedPartner";
 import { markChallansUpdatedByAgent } from "./internal/challanSettlement/markUpdated";
+import { handleVncHttp, tryUpgradeVnc, vncWebSocketHandlers } from "./vncProxy";
 
 import "./firebase";
 
@@ -28,11 +29,38 @@ function corsHeaders(): Record<string, string> {
 
 const server = Bun.serve({
     port: 3000,
+    websocket: vncWebSocketHandlers,
     async fetch(req) {
         // CORS preflight
         if (req.method === "OPTIONS") {
             return new Response(null, { status: 204, headers: corsHeaders() });
         }
+
+         const url = new URL(req.url);
+         if (url.pathname.startsWith("/vnc/")) {
+            const upgradeInfo = await tryUpgradeVnc(req, redis);
+            if (upgradeInfo) {
+                // Open the upstream connection BEFORE upgrading the client side.
+                const upstream = new WebSocket(upgradeInfo.upstreamUrl);
+                const success = server.upgrade(req, {
+                    data: {
+                        workerId: upgradeInfo.ctx.workerId,
+                        upstream,
+                        upstreamReady: false,
+                        queued: [],
+                    },
+                });
+                if (success) return undefined as any;
+                try { upstream.close(); } catch {}
+                return new Response("upgrade failed", { status: 426 });
+            }
+            const httpRes = await handleVncHttp(req, redis);
+            for (const [k, v] of Object.entries(corsHeaders())) {
+                httpRes.headers.set(k, v);
+            }
+            return httpRes;
+        }
+
 
         const res = await (async (): Promise<Response> => {
             const url = new URL(req.url);

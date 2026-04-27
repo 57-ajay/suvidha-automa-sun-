@@ -3,9 +3,12 @@ import time
 import subprocess
 import asyncio
 
+import redis as redis_lib
+
 TOKEN_DIR = "/tmp/vnc-tokens"
 TOKEN_FILE = f"{TOKEN_DIR}/tokens.cfg"
 LOG_DIR = "/tmp/slot-logs"
+JOB_TTL = 60 * 60 * 24
 
 
 class Slot:
@@ -20,12 +23,22 @@ class Slot:
 
     def __repr__(self):
         status = f"job={self.job_id}" if self.job_id else "free"
-        return f"Slot({self.index}, :{self.display}, vnc={self.vnc_port}, {status})"
+        return (
+            f"Slot({self.index}, :{self.display}, "
+            f"vnc={self.vnc_port}, {status})"
+        )
 
 
 class SlotPool:
-    def __init__(self, max_slots: int = 10):
+    def __init__(
+        self,
+        max_slots: int,
+        redis_client: redis_lib.Redis,
+        worker_id: str,
+    ):
         self.max_slots = max_slots
+        self.r = redis_client
+        self.worker_id = worker_id
         self.slots: list[Slot] = []
         self.free: asyncio.Queue[int] = asyncio.Queue()
 
@@ -48,11 +61,28 @@ class SlotPool:
         slot.job_id = job_id
         ok = self._start_display(slot)
         if not ok:
-            print(f"[pool] Slot {slot.index}: display stack failed, releasing")
+            print(
+                f"[pool] Slot {slot.index}: display stack failed, releasing"
+            )
             slot.job_id = None
             self.free.put_nowait(slot.index)
             return None
         self._write_tokens()
+
+        # Register routing entry: edge reads this to find the worker
+        # for a live view request.
+        try:
+            self.r.set(
+                f"worker:job:{job_id}",
+                f"{self.worker_id}:{slot.vnc_port}",
+                ex=JOB_TTL,
+            )
+        except Exception as e:
+            print(
+                f"[pool] WARN: could not register routing for "
+                f"{job_id}: {e}"
+            )
+
         return slot
 
     def release(self, slot: Slot):
@@ -62,6 +92,16 @@ class SlotPool:
         slot.agent_proc = None
         self.free.put_nowait(slot.index)
         self._write_tokens()
+
+        if job_id:
+            try:
+                self.r.delete(f"worker:job:{job_id}")
+            except Exception as e:
+                print(
+                    f"[pool] WARN: could not delete routing for "
+                    f"{job_id}: {e}"
+                )
+
         print(f"[pool] Slot {slot.index} released (was job {job_id})")
 
     def get_by_job_id(self, job_id: str) -> Slot | None:
@@ -94,33 +134,34 @@ class SlotPool:
         xvfb_log = open(f"{LOG_DIR}/xvfb-{slot.index}.log", "w")
         vnc_log = open(f"{LOG_DIR}/vnc-{slot.index}.log", "w")
 
-        # Start Xvfb
         slot.xvfb_proc = subprocess.Popen(
             ["Xvfb", display, "-screen", "0", "1920x1080x24"],
             stdout=xvfb_log,
             stderr=xvfb_log,
         )
 
-        # Wait for Xvfb to create its socket
         socket_path = f"/tmp/.X11-unix/X{slot.display}"
-        for i in range(20):  # up to 2 seconds
+        for _ in range(20):
             if os.path.exists(socket_path):
                 break
             if slot.xvfb_proc.poll() is not None:
-                print(f"[pool] Slot {slot.index}: Xvfb died (exit={
-                      slot.xvfb_proc.returncode})")
+                print(
+                    f"[pool] Slot {slot.index}: Xvfb died "
+                    f"(exit={slot.xvfb_proc.returncode})"
+                )
                 return False
             time.sleep(0.1)
         else:
-            print(f"[pool] Slot {
-                  slot.index}: Xvfb socket never appeared at {socket_path}")
+            print(
+                f"[pool] Slot {slot.index}: Xvfb socket never "
+                f"appeared at {socket_path}"
+            )
             self._kill_proc(slot.xvfb_proc)
             slot.xvfb_proc = None
             return False
 
         print(f"[pool] Slot {slot.index}: Xvfb ready on {display}")
 
-        # Start x11vnc
         slot.vnc_proc = subprocess.Popen(
             [
                 "x11vnc",
@@ -132,11 +173,12 @@ class SlotPool:
             stderr=vnc_log,
         )
 
-        # Wait for x11vnc to bind the port
-        for i in range(30):  # up to 3 seconds
+        for _ in range(30):
             if slot.vnc_proc.poll() is not None:
-                print(f"[pool] Slot {slot.index}: x11vnc died (exit={
-                      slot.vnc_proc.returncode})")
+                print(
+                    f"[pool] Slot {slot.index}: x11vnc died "
+                    f"(exit={slot.vnc_proc.returncode})"
+                )
                 vnc_log.flush()
                 try:
                     with open(f"{LOG_DIR}/vnc-{slot.index}.log") as f:
@@ -148,7 +190,6 @@ class SlotPool:
                 slot.vnc_proc = None
                 return False
 
-            # Check if port is listening
             check = subprocess.run(
                 ["ss", "-tln"], capture_output=True, text=True
             )
@@ -156,13 +197,17 @@ class SlotPool:
                 break
             time.sleep(0.1)
         else:
-            print(f"[pool] Slot {slot.index}: x11vnc never bound port {
-                  slot.vnc_port}")
+            print(
+                f"[pool] Slot {slot.index}: x11vnc never bound "
+                f"port {slot.vnc_port}"
+            )
             self._stop_display(slot)
             return False
 
-        print(f"[pool] Slot {slot.index}: x11vnc ready on port {
-              slot.vnc_port}")
+        print(
+            f"[pool] Slot {slot.index}: x11vnc ready on port "
+            f"{slot.vnc_port}"
+        )
         return True
 
     def _stop_display(self, slot: Slot):
@@ -171,7 +216,6 @@ class SlotPool:
         slot.xvfb_proc = None
         slot.vnc_proc = None
 
-        # Clean up X socket
         socket_path = f"/tmp/.X11-unix/X{slot.display}"
         try:
             os.unlink(socket_path)
