@@ -1,39 +1,27 @@
 services:
-  redis:
-    image: redis:7-alpine
-
   api:
-    build: ./api
+    build: ./edge
+    restart: unless-stopped
     environment:
-      - REDIS_URL=redis://redis:6379
-    depends_on:
-      - redis
-
-  worker:
-    build: ./worker
-    environment:
-      - REDIS_URL=redis://redis:6379
-      - API_URL=http://api:3000
-      - DOMAIN=${DOMAIN}
-      - MAX_SLOTS=${MAX_SLOTS:-10}
-    depends_on:
-      - redis
-      - api
-    shm_size: "4gb"
+      - REDIS_URL=${REDIS_URL}
+    volumes:
+      - ./edge/service-account.json:/app/service-account.json:ro
+    expose:
+      - "3000"
 
   caddy:
     image: caddy:2-alpine
+    restart: unless-stopped
     ports:
       - "80:80"
       - "443:443"
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
-    environment:
-      - DOMAIN=${DOMAIN}
+      - caddy_config:/config
     depends_on:
       - api
-      - worker
 
 volumes:
   caddy_data:
+  caddy_config:
