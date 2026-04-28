@@ -99,6 +99,14 @@ export async function handleSaveDiscounts(body: InternalRequest) {
     console.log(`[save_discounts] incoming count=${incoming.length}`);
     for (const d of incoming) {
         console.log(`[save_discounts]   incoming: challanId="${d.challanId}" discount=${d.discountAmount} original=${d.originalAmount}`);
+        if (d.discountAmount === 0 && d.originalAmount > 0) {
+            console.warn(
+                `[save_discounts] SUSPICIOUS_ZERO: challanId=${d.challanId} ` +
+                `discount=0 with original=${d.originalAmount} ` +
+                `vehicle=${vehicleNumber} requestId=${requestId} jobId=${jobId}. ` +
+                `Saving as instructed — verify on Virtual Courts that "Proposed Fine" really shows 0.`
+            );
+        }
     }
 
     // Get the challanRequest doc directly by requestId

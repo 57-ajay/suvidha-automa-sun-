@@ -485,30 +485,93 @@ FOR EACH numbered record on the page (1, 2, 3, ...):
 
   3. From the header bar, read: Challan No. → challanId
 
-  4. From the offence details table below the header, read:
-     - "Offence" column text → offenceText
-     - "Fine" column (rightmost) → screenFine (number)
+  4. *** CRITICAL MENTAL MODEL — READ ONCE, INTERNALIZE, NEVER VIOLATE ***
 
-  5. Below the offence table, read: "Proposed Fine" → discountAmount (number)
+     The field name "discountAmount" is misleading. It does NOT mean "the size of the reduction
+     the court gave". It means "the settlement price the user must pay" — the literal number
+     shown on the page right now.
 
-  6. VALIDITY CHECK:
-     - Are BOTH screenFine and discountAmount readable numbers? If NO → SKIP this record.
+     On Virtual Courts:
+       - "Fine" (rightmost column in the offence table) and
+       - "Proposed Fine" (line below the offence table)
+     ALMOST ALWAYS display the SAME NUMBER. That number IS discountAmount. You COPY it. Verbatim.
 
-  7. DETERMINE originalAmount using OFFENCE-BASED OVERRIDE:
-     The screen "Fine" on Virtual Courts is often a reduced court amount, not the true fine.
+     WORKED EXAMPLES (memorize the pattern):
+       Page shows Fine=2000, Proposed Fine=2000 → discountAmount = 2000   (NOT 0)
+       Page shows Fine=1000, Proposed Fine=1000 → discountAmount = 1000   (NOT 0)
+       Page shows Fine=300,  Proposed Fine=300  → discountAmount = 300    (NOT 0)
+       Page shows Fine=0,    Proposed Fine=0    → discountAmount = 0      (only if literally 0 on page)
+
+     PROHIBITED REASONING (these are all WRONG and will get this record dropped):
+       ✗ "discount = original − settlement = 2000 − 2000 = 0"
+       ✗ "The court did not reduce the fine, so the discount is 0"
+       ✗ "Original was 2000 from Phase 1, settlement is 2000, so discountAmount = 0"
+       ✗ "Discount means reduction, and there is no reduction, so 0"
+
+     CORRECT REASONING (the only acceptable form):
+       ✓ "Page shows Proposed Fine = 2000. discountAmount = 2000."
+
+     The fact that discountAmount sometimes equals originalAmount is NORMAL and EXPECTED.
+     Save it anyway. It is not redundant. It is not zero. Copy the number on screen.
+
+  5. EXTRACT this record:
+     - Read "Offence" column text → offenceText
+     - Read "Fine" column (rightmost) → fineNumber  (the digits you see on screen)
+     - Read "Proposed Fine" below the table → proposedFineNumber  (the digits you see on screen)
+
+  6. CROSS-CHECK READING (mandatory — catches misreads):
+     a. Both must be readable integers. If either is blank, "—", "N/A", or non-numeric → SKIP this record.
+     b. fineNumber MUST equal proposedFineNumber.
+        If unequal → re-read both fields ONCE more on screen.
+        If still unequal after re-read → SKIP this record. Do NOT invent. Do NOT compromise.
+     c. Set discountAmount = proposedFineNumber.
+
+  7. ANTI-ZERO RE-READ (mandatory whenever discountAmount comes out as 0):
+     IF discountAmount == 0:
+       a. STOP. Do NOT add this record yet.
+       b. Look at "Proposed Fine" on the page ONCE MORE. Read the digits carefully, left to right.
+       c. Decide which case applies:
+          • The page LITERALLY shows the single digit "0" (zero) for Proposed Fine
+            → keep discountAmount = 0. This is rare but legitimate. Mark this record as
+              "verified-zero" in your working memory. Continue to step 8.
+          • The page shows a number like 100, 300, 500, 1000, 2000, etc.
+            → you misread on the first pass. UPDATE discountAmount to the correct number you
+              just re-read. Continue to step 8.
+          • You cannot tell (faded, overlapping, hidden, ambiguous)
+            → SKIP this record entirely. Do not guess.
+       d. You are FORBIDDEN from writing discountAmount=0 because "the court did not reduce
+          the fine". A reduction of zero is NOT the same as a settlement of zero. They are
+          completely different concepts. Do not confuse them.
+
+  8. DETERMINE originalAmount using OFFENCE-BASED OVERRIDE:
+     The screen "Fine" on Virtual Courts reflects the court ruling, not the original ticket fine.
      For known offences, use these fixed original amounts:
        - offenceText contains "red light" (case-insensitive) → originalAmount = 5000
-       - offenceText contains "permit" (case-insensitive) → originalAmount = 10000
-       - offenceText contains "parking" (case-insensitive) → originalAmount = 500
-       - offenceText contains "over speed" OR "overspeed" (case-insensitive) → originalAmount = 2000
-       - Any other offence → originalAmount = screenFine
+       - offenceText contains "permit" (case-insensitive)    → originalAmount = 10000
+       - offenceText contains "parking" (case-insensitive)   → originalAmount = 500
+       - offenceText contains "over speed" OR "overspeed"    → originalAmount = 2000
+       - Any other offence → originalAmount = fineNumber
      Use partial matching. First keyword match wins.
 
-     EXAMPLE: offenceText = "Improper or obstructing parking", screenFine = 300, discountAmount = 300
+     EXAMPLE A (court kept the full fine — common case):
+       offenceText = "LIMITS OF SPEED: OVERSPEED", fineNumber = 2000, proposedFineNumber = 2000
+       → "overspeed" matches → originalAmount = 2000
+       → discountAmount = 2000 (from step 6c, NOT 0)
+       → Save: {"challanId":"...","originalAmount":2000,"discountAmount":2000}
+
+     EXAMPLE B (court reduced the fine):
+       offenceText = "Improper or obstructing parking", fineNumber = 300, proposedFineNumber = 300
        → "parking" matches → originalAmount = 500
+       → discountAmount = 300
        → Save: {"challanId":"...","originalAmount":500,"discountAmount":300}
 
-  8. If this challanId is NOT already in thisDeptRecords → add:
+     EXAMPLE C (red light kept at full):
+       offenceText = "DRIVING DANGEROUSLY: RED LIGHT JUMPING", fineNumber = 1000, proposedFineNumber = 1000
+       → "red light" matches → originalAmount = 5000
+       → discountAmount = 1000 (the court reduced from 5000 to 1000)
+       → Save: {"challanId":"...","originalAmount":5000,"discountAmount":1000}
+
+  9. If this challanId is NOT already in thisDeptRecords → add:
      {"challanId": challanId, "originalAmount": originalAmount, "discountAmount": discountAmount}
 
 AFTER processing all visible records: scroll down to check for more records or pagination. Process any additional records the same way.
@@ -525,6 +588,28 @@ ABSOLUTE PROHIBITIONS IN STEP C:
 *** CRITICAL: You MUST complete this step before moving to the next department. ***
 *** Extracting data without saving it is USELESS. The whole point of Phase 2 is to call save_discounts. ***
 *** THIS IS THE MOST IMPORTANT STEP. If you skip this, all extraction work is wasted. ***
+
+0. PRE-FLIGHT VALIDATION (mandatory — catches anti-zero violations from Step C):
+
+   Walk every record currently in thisDeptRecords. For each {challanId, originalAmount, discountAmount}:
+
+     a. Both must be numbers.
+     b. originalAmount must be > 0.
+     c. If discountAmount == 0:
+        Recall: in Step C item 7, did you explicitly mark this record as "verified-zero"
+        (i.e., you re-read "Proposed Fine" on the page and confirmed it literally showed "0")?
+        - YES, marked verified-zero → keep this record.
+        - NO, not marked → DROP this record from thisDeptRecords.
+          Log: "[<dept>] dropped <challanId>: discount=0 not verified on screen"
+     d. If discountAmount > originalAmount → log
+        "[<dept>] WARNING <challanId>: discount=<n> exceeds original=<n>"
+        but keep the record.
+
+   AFTER walking the list:
+     - If thisDeptRecords is now empty → treat as "no valid records".
+       Update LEDGER: <dept> → SKIPPED (no valid records after pre-flight).
+       Move to Step E.
+     - Otherwise → continue to step 1 below.
 
 1. If thisDeptRecords is empty → note "[department] — no valid unpaid records (paidSkipped={n}, transferredSkipped={n}, pendingSkipped={n})". Update LEDGER: <dept> → SKIPPED (no valid records). Move to Step E.
 
@@ -571,16 +656,24 @@ You built the payNowChallans list in Phase 1 Step 10.
 
 2. If payNowChallans has 1 or more entries:
    a. Deduplicate by challanId. Remove any duplicates.
-   b. Remove any challanId that was ALREADY saved in Phase 2 (i.e., if a challan somehow appeared in both
-      Virtual Courts results AND as Pay Now — unlikely but be safe). Only save challans NOT already covered.
-   c. Verify count of unique challanIds = array length.
-   d. Call save_discounts with the payNowChallans list.
+   b. Remove any challanId that was ALREADY saved in Phase 2 (cross-check against the
+      records you sent to save_discounts in any department).
+   c. PRE-FLIGHT: walk every entry. For each:
+      - Confirm discountAmount > 0. If 0 → DROP this entry. Pay Now challans always have a
+        positive fine; a 0 here is a bug.
+        Log: "Pay Now dropped <challanId>: discount=0"
+      - Confirm discountAmount === originalAmount (Pay Now challans have no court reduction,
+        so they MUST be equal). If they differ → DROP this entry.
+        Log: "Pay Now dropped <challanId>: discount=<n> != original=<n>"
+   d. After dropping: if list is empty → Update LEDGER: Pay Now → SKIPPED (no valid entries).
+      Skip to PHASE 3. Otherwise continue.
+   e. Verify count of unique challanIds = array length.
+   f. Call save_discounts with the cleaned payNowChallans list.
       Format: [{"challanId":"41374772","discountAmount":2000,"originalAmount":2000}]
-      Remember: for Pay Now challans, discountAmount = originalAmount (the full fine).
-   e. WAIT for the tool response. READ it. Confirm "ok": true.
+   g. WAIT for the tool response. READ it. Confirm "ok": true.
       - If "ok": true → Update LEDGER: Pay Now → CONFIRMED (saved=N).
       - If "ok": false → Retry once. If retry fails → Update LEDGER: Pay Now → FAILED.
-   f. Note: "Pay Now challans — saved {n} discount records. Tool response confirmed."
+   h. Note: "Pay Now challans — saved {n} discount records. Tool response confirmed."
 
 ===
 PHASE 3 — RECONCILIATION (MANDATORY — do NOT skip)
