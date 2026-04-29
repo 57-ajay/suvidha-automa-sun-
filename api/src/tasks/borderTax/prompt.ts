@@ -89,7 +89,8 @@ VISUAL: "Verify and confirm Uttar Pradesh Transport Department transaction detai
 AVAILABLE ACTIONS: Type OTP into "Enter High Security Password" field, click yellow "CONFIRM".
 `;
 
-    // ── Phase 5 steps 4+ — the actual payment flow
+    // ── Phase 5 steps 4+ — the actual payment flow.
+    // Both UPI and Net Banking end at the confirmation click and hand off to Phase 6.
     const paymentSteps = isUPI
         ? `
 4. The SBI ePay Lite page loads (SBIePay / formerly SBMOPS).
@@ -124,10 +125,10 @@ AVAILABLE ACTIONS: Type OTP into "Enter High Security Password" field, click yel
    - IMPORTANT: After calling wait_for_human, do NOT interact with the page at all. The human will pay via their UPI app and the page will auto-redirect upon successful payment.
 
 7. After human confirms payment is done:
-   - The page should redirect to a receipt or success page automatically.
+   - The page should transition away from the QR code page automatically.
    - If the page still shows the QR code after the human said "done", wait up to 30 seconds for it to update.
    - If the page shows "Transaction Failed", "Payment Timeout", or any error → ABORT. Reason: "Payment failed: [exact error from page]"
-   - If the page redirects to the receipt → proceed to Phase 6.
+   - Once the QR page is gone (page is transitioning to SBI's success page or to the receipt) → proceed to Phase 6.
 `
         : `
 4. The SBI ePay Lite page loads (SBIePay / formerly SBMOPS).
@@ -183,7 +184,7 @@ AVAILABLE ACTIONS: Type OTP into "Enter High Security Password" field, click yel
      c. Click the yellow "CONFIRM" button.
      d. Wait for the page to redirect (may take 10-15 seconds).
    - If the page shows "Invalid OTP", "OTP Expired", or any error → ABORT. Reason: "Payment failed: [exact error from page]"
-   - If the page redirects to the receipt → proceed to Phase 6.
+   - Once the page transitions away from the OTP page (you see SBI's payment success page or the receipt) → proceed to Phase 6.
 `;
 
     return `
@@ -209,12 +210,13 @@ STRICTLY FORBIDDEN ACTIONS
 3. Clicking any button, link, or element not mentioned in these instructions.
 4. Retrying a page load if it fails (unless instructions say to retry).
 5. Submitting any form not described in these instructions.
+6. Clicking the "Print" button on the receipt page. The save_receipt tool captures the PDF directly — pressing Print is forbidden because it opens a system dialog that the agent cannot dismiss.
 
 ===
 YOUR TOOLS
 ===
 ${toolDesc}
-- save_receipt → Call EXACTLY once after payment is complete and receipt is saved.
+- save_receipt → Call EXACTLY once after the receipt page is fully visible. This tool captures the currently displayed receipt as a PDF, uploads it to cloud storage, and persists the metadata in one shot. You do NOT need to click "Print" — the tool grabs the rendered page directly. Pass only the metadata (vehicleNumber, receiptNumber, amount, paymentDate).
 
 ===
 CRITICAL-NOTE:
@@ -233,6 +235,10 @@ ABORT CONDITIONS
 - "No valid insurance detected" popup appears on the Vehicle Information page (either on page load or after selecting Service Type) → ABORT. Reason: "Vehicle ${vehicleNumber} has no valid insurance. Please renew the vehicle's insurance policy before attempting border tax payment."
 - Payment fails after human intervention → ABORT. Reason: "Payment failed: [details]"
 ${paymentAbort}
+
+PARTIAL-SUCCESS CONDITIONS (payment went through but post-payment step failed — DO NOT mark as full failure):
+- Receipt page does not appear within 60 seconds after payment success → call done with Status: partial. The money has already been deducted; this is NOT a failure of the payment itself. See Phase 6 for the exact partial-completion summary template.
+- save_receipt tool returns "ok": false → call done with Status: partial. Include the tool's error message in the summary.
 
 ===
 WHAT EACH PAGE LOOKS LIKE (memorize these)
@@ -278,6 +284,41 @@ VISUAL: "PAYMENT DETAILS" header. "Payment Id" (read-only), "Amount" (read-only)
   Checkbox "I accept terms and conditions." and "Submit" button. Footer with government service icons.
 AVAILABLE ACTIONS: Select "SBI (Multi Bank Payment)" from dropdown, check checkbox, click "Submit".
 ${paymentPageDescriptions}
+PAGE: SBI — Payment Successful (post-payment confirmation)
+VISUAL: SBI Online dark blue header strip at the top with "Welcome, [Name]" in the top-right. Below the header,
+  a centered green checkmark icon followed by the text "Your payment was successful". Below that, an
+  "Account Details" section with the following fields in three columns:
+    Reference No., Debit Account No., Transaction ID,
+    Amount, Amount in Words, Status (shows "Completed Successfully"),
+    Debit Branch, Commission Amount (including GST), Date - Time.
+  Below the Account Details box, a single line of text reading:
+    "Click here to return to the Uttar Pradesh Transport Department site. Else, you will be automatically
+     redirected to the Uttar Pradesh Transport Department site in 10 seconds."
+  The "Click here" portion is a hyperlink. There are NO other buttons on this page.
+AVAILABLE ACTIONS: Do NOT click "Click here". Do NOT click anything. Wait for the automatic 10-second redirect.
+
+PAGE: UTTAR PRADESH TRANSPORT DEPARTMENT — Receipt (Checkpost Tax e-Receipt)
+URL: usually under services.parivahan.gov.in/checkpostv4/
+VISUAL: Two buttons at the very top: a blue "Back" button and a blue "Print" button.
+  Below them, a printed-style receipt with these features:
+  - A faint diagonal watermark of "<vehicleNumber> <date> <time>" repeating across the page.
+  - Top-left: a red "उत्तर प्रदेश सरकार" (Uttar Pradesh Government) emblem.
+  - Top-center: heading "GOVERNMENT OF UTTAR PRADESH", subheading "Department of Transport",
+    sub-subheading "Checkpost Tax e-Receipt".
+  - Top-right: a QR code, with "Printed on : <date> <time>" above it.
+  - A red circular "उत्तर प्रदेश सरकार परिवहन विभाग" stamp behind the body of the receipt.
+  - Two-column body of fields:
+    Left column: Registration No., Payment Initialization Date, Chassis No., Vehicle Type, Vehicle Category,
+    CheckPost Name, Sleeper Cap, Payment Mode, Permit Validity, Insurance Validity, Service Type,
+    Payment Confirmation Date.
+    Right column: Receipt No., Owner Name, Tax Mode, Vehicle Class, Mobile No., Seating Capacity,
+    Bank Ref. No., Permit Number, Fitness Validity, PUCC Validity, Permit Type.
+  - A summary table near the bottom with columns: Tax/Fee Particular, Tax/Fees, Fine, Total.
+  - "Grand Total : <amount>/- <amount in words>" line.
+  - Terms and Conditions block with three numbered notes.
+  - Bottom: "Scan the QR code for genuinity of the receipt."
+AVAILABLE ACTIONS: Read the receipt fields. DO NOT click "Print". DO NOT click "Back". Call save_receipt.
+
 ===
 PHASE 1 — NAVIGATE TO CHECKPOST PORTAL
 ===
@@ -364,35 +405,125 @@ CAPTCHA RETRY (max 5 attempts):
    - Click the "Submit" button.
 ${paymentSteps}
 ===
-PHASE 6 — SAVE RECEIPT
+PHASE 6 — WAIT FOR RECEIPT AND CAPTURE IT
 ===
-1. After payment is confirmed, the page should redirect to the receipt page.
-   - If the page does not redirect within 30 seconds → check if there is an error message. If so → ABORT.
-2. Read the following from the receipt:
-   - Receipt No.
-   - Registration No. (vehicle number)
-   - Grand Total amount
-   - Payment Confirmation Date
-3. Click the "Print" button on the receipt page.
-   - Wait 30 seconds to allow the human to download/save the receipt PDF from the print dialog.
-   - After 30 seconds, proceed regardless.
-4. Call save_receipt with the receipt details:
-   {"vehicleNumber":"${vehicleNumber}","receiptNumber":"<receipt_no>","amount":<total_amount>,"paymentDate":"<YYYY-MM-DD>"}
+GOAL: After payment completes, the browser will (a) show SBI's "Your payment was successful" page,
+then (b) auto-redirect to the Uttar Pradesh Transport Department receipt page. Your job here is to
+wait for the receipt to appear and call save_receipt EXACTLY ONCE. You do NOT click Print, you do
+NOT click Back, you do NOT click "Click here". Just wait, verify, and call the tool.
+
+--- STEP 1: Wait for SBI Payment Success page ---
+After the payment was confirmed in Phase 5, the page should now show the SBI Payment Success page
+(see "PAGE: SBI — Payment Successful" description above).
+
+VERIFY you can see ALL of these on screen:
+  - The green checkmark icon
+  - The text "Your payment was successful"
+  - The "Account Details" section with Status: "Completed Successfully"
+  - The line "Click here to return to the Uttar Pradesh Transport Department site. Else, you will be
+    automatically redirected to the Uttar Pradesh Transport Department site in 10 seconds."
+
+DO NOT CLICK "Click here". DO NOT click anything on this page. Just wait.
+
+If you do NOT see the success page within 30 seconds of the payment confirmation:
+  - The page may have skipped straight to the receipt (sometimes the success page is shown only briefly).
+  - Proceed directly to STEP 2 — the receipt page check will tell you whether you're actually there.
+
+--- STEP 2: Wait for the receipt page (60-second budget, split into two 30-second windows) ---
+
+WINDOW A — first 30 seconds:
+  Wait approximately 30 seconds for the automatic redirect.
+  Then check whether the receipt page is fully rendered. The receipt page is identified by the
+  SIMULTANEOUS presence of ALL of these on screen:
+    1. The header text "GOVERNMENT OF UTTAR PRADESH".
+    2. The subheader "Department of Transport".
+    3. The line "Checkpost Tax e-Receipt".
+    4. A "Receipt No." label with a non-empty value next to it (e.g. "UPR2604280468752").
+    5. A "Registration No." label with the value "${vehicleNumber}" (or a value containing this vehicle number).
+    6. The "Print" and "Back" buttons at the very top of the page (DO NOT click them).
+
+  If ALL six markers are visible → proceed to STEP 3.
+  If any marker is missing OR the page is blank/white/still loading → continue to WINDOW B.
+
+WINDOW B — additional 30 seconds (only if WINDOW A failed):
+  Wait approximately 30 more seconds.
+  Re-run the same six-marker check from WINDOW A.
+
+  If ALL six markers are now visible → proceed to STEP 3.
+  If after a TOTAL of 60 seconds the receipt page is still not visible (page is still blank, still
+  loading, stuck on the SBI success page, or showing any error) → go to STEP 5 (PARTIAL COMPLETION).
+
+DO NOT click "Click here" on the SBI success page to try to speed things up. The auto-redirect is
+the only correct mechanism.
+
+--- STEP 3: Read receipt details ---
+The receipt page is now visible. Read the following values directly from the rendered page (do not
+click anything):
+  - Receipt No. (top-right area, e.g. "UPR2604280468752") → receiptNumber
+  - Registration No. (must equal "${vehicleNumber}") → confirm match. If it doesn't match, log a warning
+    in your final summary but continue.
+  - Grand Total amount, e.g. from the line "Grand Total : 120/- One Hundred Twenty Rupees Only" → amount
+    (just the number, no rupee symbol, no slash)
+  - Payment Confirmation Date, e.g. "28-Apr-2026, 12:52:59 PM" → paymentDate (convert to YYYY-MM-DD;
+    in this example: "2026-04-28")
+
+If any of receiptNumber / amount / paymentDate cannot be read clearly → go to STEP 5 (PARTIAL COMPLETION).
+
+--- STEP 4: Capture and save the receipt ---
+Call save_receipt EXACTLY ONCE with this payload:
+  {"vehicleNumber":"${vehicleNumber}","receiptNumber":"<receiptNumber>","amount":<amount>,"paymentDate":"<YYYY-MM-DD>"}
+
+The save_receipt tool will:
+  - Capture the currently visible receipt page as a PDF (it does not need you to click Print).
+  - Upload the PDF to cloud storage.
+  - Persist the receipt metadata in the database.
+
+WAIT for the response. Read it carefully. The response is JSON.
+  - If response has "ok": true AND "pdfUploaded": true → SUCCESS. Proceed to COMPLETION (full done).
+  - If response has "ok": true AND "pdfUploaded": false → the metadata saved but the PDF didn't.
+    Go to STEP 5 (PARTIAL COMPLETION) but include the saved receiptNumber in the summary.
+  - If response has "ok": false → Go to STEP 5 (PARTIAL COMPLETION). Include the tool's error
+    message in the summary. DO NOT retry the call.
+
+DO NOT call save_receipt more than once under any circumstance. DO NOT click "Print" on the page.
+DO NOT click "Back" on the page.
+
+--- STEP 5: PARTIAL COMPLETION (only if STEP 2/3/4 failed) ---
+The payment itself was successful — money has been debited. Only the receipt download/upload
+failed. Call done with this exact summary template (filling in the bracketed fields):
+
+  Vehicle: ${vehicleNumber}
+  State: Uttar Pradesh
+  Entry District: ${entryDistrict}
+  Entry Checkpoint: ${entryCheckpoint}
+  Service Type: ${serviceType}
+  Tax Mode: ${taxMode}
+  Tax Period: ${taxFrom} to ${taxUpto}
+  Payment Method: ${isUPI ? "UPI" : "SBI Net Banking"}
+  Amount Paid: ₹<amount if known, otherwise "unknown">
+  Receipt Number: <receiptNumber if read, otherwise "unknown">
+  Receipt PDF: not uploaded — <reason: "receipt page did not load within 60 seconds" / "save_receipt returned ok:false: <error>" / "could not read receipt fields">
+  Status: partial
+
+After writing this summary → call done. Do NOT retry. Do NOT call save_receipt again.
 
 ===
-COMPLETION
+COMPLETION (full success)
 ===
-Call "done" with this summary:
-Vehicle: ${vehicleNumber}
-State: Uttar Pradesh
-Entry District: ${entryDistrict}
-Entry Checkpoint: ${entryCheckpoint}
-Service Type: ${serviceType}
-Tax Mode: ${taxMode}
-Tax Period: ${taxFrom} to ${taxUpto}
-Payment Method: ${isUPI ? "UPI" : "SBI Net Banking"}
-Amount Paid: ₹<amount>
-Receipt Number: <receipt_no>
-Status: complete
+Reach this section ONLY when save_receipt returned "ok": true AND "pdfUploaded": true.
+
+Call done with this summary:
+  Vehicle: ${vehicleNumber}
+  State: Uttar Pradesh
+  Entry District: ${entryDistrict}
+  Entry Checkpoint: ${entryCheckpoint}
+  Service Type: ${serviceType}
+  Tax Mode: ${taxMode}
+  Tax Period: ${taxFrom} to ${taxUpto}
+  Payment Method: ${isUPI ? "UPI" : "SBI Net Banking"}
+  Amount Paid: ₹<amount>
+  Receipt Number: <receiptNumber>
+  Receipt PDF: uploaded
+  Status: complete
 `.trim();
 };

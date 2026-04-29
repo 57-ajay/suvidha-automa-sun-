@@ -1,7 +1,6 @@
 import { FieldValue } from "firebase-admin/firestore";
 import { getStorage } from "firebase-admin/storage";
 import { db, borderTaxRequestsRef } from "../../firebase";
-import * as fs from "fs";
 
 interface ReceiptData {
     vehicleNumber: string;
@@ -10,10 +9,11 @@ interface ReceiptData {
     paymentDate: string;
 }
 
-interface InternalRequest {
+export interface SaveReceiptInput {
     jobId: string;
     params: Record<string, string>;
     data: unknown;
+    pdfBuffer: Buffer;
 }
 
 /** Coerce a value to a number */
@@ -26,42 +26,47 @@ function toNumber(val: unknown): number | null {
     return null;
 }
 
-export async function handleSaveReceipt(body: InternalRequest) {
-    const jobId = body.jobId ?? "unknown";
-    const driverId = body.params?.driverId ?? "driverId";
+export async function handleSaveReceipt(input: SaveReceiptInput) {
+    const { jobId, params, data, pdfBuffer } = input;
+    const driverId = params?.driverId ?? "driverId";
 
-    console.log(`[save_receipt] START job=${jobId}`);
-    console.log(`[save_receipt] params=${JSON.stringify(body.params)}`);
-    console.log(`[save_receipt] data=${JSON.stringify(body.data)}`);
+    console.log(`[save_receipt] START job=${jobId} pdf=${pdfBuffer?.length ?? 0} bytes`);
+    console.log(`[save_receipt] params=${JSON.stringify(params)}`);
+    console.log(`[save_receipt] data=${JSON.stringify(data)}`);
 
-    const vehicleNumber = body.params?.vehicleNumber;
+    const vehicleNumber = params?.vehicleNumber;
     if (!vehicleNumber) {
         console.log(`[save_receipt] FAIL: vehicleNumber missing`);
         return { ok: false, error: "vehicleNumber missing from job params" };
     }
 
-    const requestId = body.params?.requestId;
+    const requestId = params?.requestId;
     if (!requestId) {
         console.log(`[save_receipt] FAIL: requestId missing`);
         return { ok: false, error: "requestId missing from job params" };
     }
 
-    // Parse receipt data
+    if (!pdfBuffer || pdfBuffer.length === 0) {
+        console.log(`[save_receipt] FAIL: empty PDF buffer`);
+        return { ok: false, error: "PDF buffer is empty" };
+    }
+
+    // Parse receipt data — defensive: accept object, array of one, or JSON string
     let receiptData: ReceiptData;
 
-    if (typeof body.data === "string") {
+    if (typeof data === "string") {
         try {
-            const parsed = JSON.parse(body.data);
+            const parsed = JSON.parse(data);
             receiptData = Array.isArray(parsed) ? parsed[0] : parsed;
         } catch (e) {
             return { ok: false, error: `data is not valid JSON: ${(e as Error).message}` };
         }
-    } else if (Array.isArray(body.data)) {
-        receiptData = body.data[0] as ReceiptData;
-    } else if (typeof body.data === "object" && body.data !== null) {
-        receiptData = body.data as ReceiptData;
+    } else if (Array.isArray(data)) {
+        receiptData = data[0] as ReceiptData;
+    } else if (typeof data === "object" && data !== null) {
+        receiptData = data as ReceiptData;
     } else {
-        return { ok: false, error: `Invalid data type: ${typeof body.data}` };
+        return { ok: false, error: `Invalid data type: ${typeof data}` };
     }
 
     if (!receiptData || !receiptData.receiptNumber) {
@@ -73,44 +78,42 @@ export async function handleSaveReceipt(body: InternalRequest) {
         return { ok: false, error: `Invalid amount: ${receiptData.amount}` };
     }
 
-    // Try to upload PDF if it exists on disk
+    // ── Upload PDF buffer directly to GCS (no disk involvement) ──
     let pdfUrl: string | null = null;
-    const pdfPath = `/app/receipts/${vehicleNumber}.pdf`;
+    let pdfUploadError: string | null = null;
 
     try {
-        if (fs.existsSync(pdfPath)) {
-            const bucket = getStorage().bucket();
-            const destination = `driverUtilities/stateTaxRequests/${requestId}_${driverId}/${receiptData.receiptNumber}_receipt.pdf`;
+        const bucket = getStorage().bucket();
+        const destination = `driverUtilities/stateTaxRequests/${requestId}_${driverId}/${receiptData.receiptNumber}_receipt.pdf`;
 
-            await bucket.upload(pdfPath, {
-                destination,
+        const file = bucket.file(destination);
+        await file.save(pdfBuffer, {
+            metadata: {
+                contentType: "application/pdf",
                 metadata: {
-                    contentType: "application/pdf",
-                    metadata: {
-                        vehicleNumber,
-                        receiptNumber: receiptData.receiptNumber,
-                        jobId,
-                    },
+                    vehicleNumber,
+                    receiptNumber: receiptData.receiptNumber,
+                    jobId,
                 },
-            });
+            },
+        });
 
-            const file = bucket.file(destination);
-            const [url] = await file.getSignedUrl({
-                action: "read",
-                expires: Date.now() + 365 * 24 * 60 * 60 * 1000, // 1 year
-            });
+        const [url] = await file.getSignedUrl({
+            action: "read",
+            expires: Date.now() + 365 * 24 * 60 * 60 * 1000, // 1 year
+        });
 
-            pdfUrl = url;
-            console.log(`[save_receipt] PDF uploaded: ${destination}`);
-        } else {
-            console.log(`[save_receipt] No PDF found at ${pdfPath}, saving metadata only`);
-        }
+        pdfUrl = url;
+        console.log(
+            `[save_receipt] PDF uploaded: ${destination} (${pdfBuffer.length} bytes)`
+        );
     } catch (e) {
-        console.error(`[save_receipt] PDF upload failed:`, e);
-        // Continue — save metadata even if PDF upload fails
+        pdfUploadError = (e as Error).message;
+        console.error(`[save_receipt] PDF upload FAILED:`, e);
+        // Continue — we still want to save the receipt metadata even if PDF upload fails
     }
 
-    // Save to Firestore
+    // ── Save receipt metadata to Firestore ──
     const borderTaxRef = db.collection("borderTaxPayments");
     const docData = {
         vehicleNumber,
@@ -121,10 +124,12 @@ export async function handleSaveReceipt(body: InternalRequest) {
         paymentDate: receiptData.paymentDate || new Date().toISOString().split("T")[0],
         state: "UTTAR PRADESH",
         ...(pdfUrl ? { pdfUrl } : {}),
+        ...(pdfUploadError ? { pdfUploadError } : {}),
         status: "paid",
         createdAt: FieldValue.serverTimestamp(),
     };
 
+    // Mark request as agent-updated (best-effort)
     try {
         await borderTaxRequestsRef.doc(requestId).update({
             borderTaxUpdatedBy: "agent",
@@ -137,7 +142,9 @@ export async function handleSaveReceipt(body: InternalRequest) {
     const docRef = await borderTaxRef.add(docData);
 
     console.log(
-        `[save_receipt] SUCCESS job=${jobId} vehicle=${vehicleNumber} receipt=${receiptData.receiptNumber} amount=₹${amount} doc=${docRef.id}`
+        `[save_receipt] DONE job=${jobId} vehicle=${vehicleNumber} ` +
+        `receipt=${receiptData.receiptNumber} amount=₹${amount} ` +
+        `doc=${docRef.id} pdfUploaded=${!!pdfUrl}`
     );
 
     return {
@@ -147,5 +154,6 @@ export async function handleSaveReceipt(body: InternalRequest) {
         amount,
         docId: docRef.id,
         pdfUploaded: !!pdfUrl,
+        ...(pdfUploadError ? { pdfUploadError } : {}),
     };
 }

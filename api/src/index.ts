@@ -9,7 +9,7 @@ import { saveAgentWorkSummary } from "./internal/agentWorkSummary";
 import { DASHBOARD_HTML } from "./dashboard";
 import { setAssignedPartner } from "./internal/assignedPartner";
 import { setAiAgentWorkStatus } from "./internal/aiAgentWorkStatus";
-import { challanRequestsRef } from "./firebase";
+import "./firebase";
 
 const redis = new Redis(process.env.REDIS_URL || "redis://localhost:6379");
 
@@ -327,24 +327,92 @@ const server = Bun.serve({
                 }
             }
 
-            // Border tax receipt save
+            // Border tax receipt save (multipart/form-data with PDF)
             if (req.method === "POST" && url.pathname === "/api/internal/border-tax/save-receipt") {
                 try {
-                    const raw = await req.text();
-                    console.log(`[API] POST /api/internal/border-tax/save-receipt | body length=${raw.length}`);
-                    console.log(`[API]   body preview: ${raw.substring(0, 500)}`);
-
-                    let body: InternalRequest;
-                    try {
-                        body = JSON.parse(raw) as InternalRequest;
-                    } catch (parseErr) {
-                        console.log(`[API]   FAIL: body is not valid JSON`);
-                        return Response.json({ ok: false, error: "Request body is not valid JSON" }, { status: 400 });
+                    const contentType = req.headers.get("content-type") || "";
+                    if (!contentType.toLowerCase().includes("multipart/form-data")) {
+                        console.log(`[API] POST /api/internal/border-tax/save-receipt
+                            | FAIL: wrong content-type=${contentType}`);
+                        return Response.json(
+                            { ok: false, error: `Expected multipart/form-data, got: ${contentType}` },
+                            { status: 400 }
+                        );
                     }
 
-                    console.log(`[API]   jobId=${body.jobId} params=${JSON.stringify(body.params)} dataType=${typeof body.data} isArray=${Array.isArray(body.data)}`);
+                    const formData = await req.formData();
+                    const pdfFile = formData.get("pdf");
+                    const jobIdField = formData.get("jobId");
+                    const paramsRaw = formData.get("params");
+                    const dataRaw = formData.get("data");
 
-                    const result = await handleSaveReceipt(body);
+                    if (!pdfFile || !(pdfFile instanceof Blob)) {
+                        return Response.json(
+                            { ok: false, error: "Missing or invalid 'pdf' part" },
+                            { status: 400 }
+                        );
+                    }
+                    if (typeof jobIdField !== "string" || !jobIdField) {
+                        return Response.json(
+                            { ok: false, error: "Missing 'jobId' field" },
+                            { status: 400 }
+                        );
+                    }
+                    if (typeof paramsRaw !== "string") {
+                        return Response.json(
+                            { ok: false, error: "Missing 'params' field" },
+                            { status: 400 }
+                        );
+                    }
+                    if (typeof dataRaw !== "string") {
+                        return Response.json(
+                            { ok: false, error: "Missing 'data' field" },
+                            { status: 400 }
+                        );
+                    }
+
+                    let parsedParams: Record<string, string>;
+                    let parsedData: unknown;
+                    try {
+                        parsedParams = JSON.parse(paramsRaw);
+                    } catch (e: any) {
+                        return Response.json(
+                            { ok: false, error: `'params' is not valid JSON: ${e.message}` },
+                            { status: 400 }
+                        );
+                    }
+                    try {
+                        parsedData = JSON.parse(dataRaw);
+                    } catch (e: any) {
+                        return Response.json(
+                            { ok: false, error: `'data' is not valid JSON: ${e.message}` },
+                            { status: 400 }
+                        );
+                    }
+
+                    const pdfBuffer = Buffer.from(await pdfFile.arrayBuffer());
+
+                    console.log(
+                        `[API] POST /api/internal/border-tax/save-receipt | ` +
+                        `jobId=${jobIdField} pdf=${pdfBuffer.length} bytes ` +
+                        `params=${JSON.stringify(parsedParams)} ` +
+                        `data=${JSON.stringify(parsedData).substring(0, 200)}`
+                    );
+
+                    if (pdfBuffer.length < 1000) {
+                        console.log(`[API]   FAIL: PDF too small (${pdfBuffer.length} bytes)`);
+                        return Response.json(
+                            { ok: false, error: `PDF too small (${pdfBuffer.length} bytes), likely corrupted or empty page` },
+                            { status: 400 }
+                        );
+                    }
+
+                    const result = await handleSaveReceipt({
+                        jobId: jobIdField,
+                        params: parsedParams,
+                        data: parsedData,
+                        pdfBuffer,
+                    });
                     const status = result.ok ? 200 : 400;
                     console.log(`[API]   result: ${JSON.stringify(result)}`);
                     return Response.json(result, { status });

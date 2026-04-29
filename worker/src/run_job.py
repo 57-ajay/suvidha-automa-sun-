@@ -176,12 +176,16 @@ async def main():
 
     request_id = job_params.get("requestId")
     source = job.get("source", "web")
+    task_id = job.get("taskId", "")
 
-    print(f"""[{job_id}] Agent starting on DISPLAY={display}, {
-          len(tool_defs)} tools, params={list(job_params.keys())}, source={source}""")
+    print(
+        f"[{job_id}] Agent starting on DISPLAY={display}, task={task_id}, "
+        f"{len(tool_defs)} dynamic tools, params={list(job_params.keys())}, "
+        f"source={source}"
+    )
 
     try:
-        result = await run_agent(prompt, job_id, job_params, tool_defs, r)
+        result = await run_agent(prompt, job_id, job_params, tool_defs, r, task_id)
 
         cost_data = extract_cost_data(result)
         final_result = result.final_result() or "No result returned"
