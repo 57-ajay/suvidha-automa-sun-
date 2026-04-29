@@ -1,5 +1,5 @@
 import { Timestamp, FieldValue } from "firebase-admin/firestore";
-import { db, challanRequestsRef } from "../../firebase";
+import { challanRequestsRef } from "../../firebase";
 
 interface AgentDiscount {
     challanId: string;
@@ -218,27 +218,27 @@ export async function handleSaveDiscounts(body: InternalRequest) {
         console.log(`[save_discounts] matched=${matched} created=${created} (${matchingIds.length} ID overlaps)`);
     }
 
-    // Write each challan to subChallans sub-collection
-    const subChallansRef = db.collection(`challans/${vehicleNumber}/subChallans`);
+    // // Write each challan to subChallans sub-collection
+    // const subChallansRef = db.collection(`challans/${vehicleNumber}/subChallans`);
+    //
+    // const subDocPromises = updatedChallans.map((challan: any) => {
+    //     const subDoc = {
+    //         challanAmount: challan.challanAmount ?? null,
+    //         challanDate: challan.challanDate ?? null,
+    //         challanNo: challan.challanNo ?? null,
+    //         id: challan.id,
+    //         location: challan.location ?? null,
+    //         offence: challan.offence ?? null,
+    //         paymentDetails: challan.paymentDetails ?? null,
+    //         quotation: challan.quotation ?? null,
+    //         status: challan.status || "unpaid",
+    //         settlementStatus: challan.status || "unpaid",
+    //         type: challan.type ?? null,
+    //     };
+    //     return subChallansRef.doc(challan.id).set(subDoc, { merge: true });
+    // });
 
-    const subDocPromises = updatedChallans.map((challan: any) => {
-        const subDoc = {
-            challanAmount: challan.challanAmount ?? null,
-            challanDate: challan.challanDate ?? null,
-            challanNo: challan.challanNo ?? null,
-            id: challan.id,
-            location: challan.location ?? null,
-            offence: challan.offence ?? null,
-            paymentDetails: challan.paymentDetails ?? null,
-            quotation: challan.quotation ?? null,
-            status: challan.status || "unpaid",
-            settlementStatus: challan.status || "unpaid",
-            type: challan.type ?? null,
-        };
-        return subChallansRef.doc(challan.id).set(subDoc, { merge: true });
-    });
-
-    await Promise.all(subDocPromises);
+    // await Promise.all(subDocPromises);
 
     // Update main request doc
     await docRef.update({

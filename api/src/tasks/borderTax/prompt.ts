@@ -1,8 +1,58 @@
+const MONTH_NAMES = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+];
+
+/** Accept "2026-04-29", "29-04-2026", "29/04/2026", "04/29/2026" → return "YYYY-MM-DD". */
+function normalizeISODate(input: string): string {
+    if (!input) return "";
+    const s = input.trim();
+
+    if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+
+    // DD-MM-YYYY or DD/MM/YYYY (Indian convention)
+    const dmy = s.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})$/);
+    if (dmy) {
+        const [, d, mo, y] = dmy;
+        return `${y}-${mo!.padStart(2, "0")}-${d!.padStart(2, "0")}`;
+    }
+
+    const dt = new Date(s);
+    if (!isNaN(dt.getTime())) return dt.toISOString().split("T")[0]!;
+
+    return s;
+}
+
+function dateParts(iso: string) {
+    const m = iso.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (!m) {
+        return {
+            iso, year: "????", mm: "??", dd: "??",
+            monthName: "???", mmddyyyy: iso,
+        };
+    }
+    const [, y, mo, d] = m;
+    return {
+        iso,
+        year: y!,
+        mm: mo!,
+        dd: d!,
+        monthName: MONTH_NAMES[parseInt(mo!, 10) - 1] || "???",
+        mmddyyyy: `${mo}/${d}/${y}`,
+    };
+}
+
 export const buildPrompt = async (p: Record<string, string>) => {
     const vehicleNumber = p.vehicleNumber;
     const taxMode = p.taxMode || "DAYS";
     const taxFrom = p.taxFrom;
     const taxUpto = p.taxUpto;
+
+    const taxFromISO = normalizeISODate(taxFrom!);
+    const taxUptoISO = normalizeISODate(taxUpto!);
+    const tf = dateParts(taxFromISO);
+    const tu = dateParts(taxUptoISO);
+
     const entryDistrict = p.entryDistrict || "GHAZIABAD";
     const entryCheckpoint = p.entryCheckpoint || "GHAZIABAD";
     const serviceType = p.serviceType || "Air Conditioned Service";
@@ -271,8 +321,14 @@ POSSIBLE POPUP: A red error popup reading "No valid insurance detected. Please r
 AVAILABLE ACTIONS: Select service type from dropdown, click "Next". If insurance popup appears → click "OK" → ABORT.
 
 PAGE: CHECKPOST PORTAL — Tax Information (Step 3 of 4)
-VISUAL: "Tax Mode" dropdown, "Tax From" and "Tax Upto" date fields. "Calculate Fee/Tax" button, then "Next" button.
-AVAILABLE ACTIONS: Select tax mode, enter dates, click "Calculate Fee/Tax", then click "Next".
+VISUAL: "Tax Mode" dropdown, "Tax From" and "Tax Upto" date fields, "Calculate Fee/Tax" button, "Next" button.
+  Both date fields are NATIVE HTML5 DATE INPUTS (input type="date"). They display "mm/dd/yyyy" as placeholder when empty.
+  Each field has THREE separate segments (mm | dd | yyyy) and a small CALENDAR ICON at the right edge of the field.
+  - Clicking the middle of the input or the placeholder text only focuses one segment — it does NOT open a popup.
+  - Clicking the calendar icon at the right edge opens a date-picker popup with a month grid and ↑/↓ navigation arrows.
+  - The standard "type into field" action with an ISO value (YYYY-MM-DD) also works on these inputs because Playwright's
+    fill() accepts the ISO form for date inputs and the browser then renders the locale-formatted display.
+AVAILABLE ACTIONS: Select tax mode, fill both date fields (per Phase 4), click "Calculate Fee/Tax", then click "Next".
 
 PAGE: CHECKPOST PORTAL — Disclaimer (Step 4 of 4)
 VISUAL: Vehicle and tax summary. CAPTCHA image + input field. Checkbox "I confirm that above information are correct as per my knowledge." and "Pay Online" button.
@@ -369,40 +425,86 @@ PHASE 3 — FILL ENTRY DETAILS
 PHASE 4 — TAX CALCULATION
 ===
 1. On the Tax Information page (Step 3 of 4):
-   - In "Tax Mode" dropdown, select "${taxMode}".
-   - In "Tax From" date field, enter "${taxFrom}".
-   - In "Tax Upto" date field, enter "${taxUpto}".
-2. Click the "Calculate Fee/Tax" button.
-3. Wait for the tax amount to appear in the table and the amount field.
-4. Verify the amount is displayed (it should be a number > 0).
+
+   --- 1a. Tax Mode ---
+   - Click the "Tax Mode" dropdown and select "${taxMode}".
+
+   --- 1b. Tax From (target: ${tf.iso}) ---
+   IMPORTANT: "Tax From" is a NATIVE HTML5 DATE INPUT (id="floatingTaxfrom").
+   It shows "mm/dd/yyyy" as a placeholder. It is NOT a regular text box —
+   the field has THREE separate segments (mm | dd | yyyy) and a small CALENDAR ICON
+   at the RIGHT EDGE of the field.
+
+   TARGET → month=${tf.mm} (${tf.monthName}), day=${tf.dd}, year=${tf.year}
+   Expected display after entry: "${tf.mmddyyyy}"
+
+   METHOD A — Direct ISO input (try this FIRST, simplest):
+     HTML5 date inputs accept the ISO form "YYYY-MM-DD" through the standard
+     input/type action — the browser parses it and fills the mm/dd/yyyy segments
+     automatically. The slashed display form is NOT accepted at this layer.
+
+     i.  Use your standard input/type action on the "Tax From" field with value
+         "${tf.iso}" exactly. Note the hyphens — this is YYYY-MM-DD, NOT mm/dd/yyyy.
+     ii. After the action, the field should display "${tf.mmddyyyy}" (the browser
+         renders the locale form automatically).
+
+     Do NOT type "${tf.mmddyyyy}" with slashes. Do NOT type "${taxFrom}" verbatim.
+     The ONLY accepted value for this method is the hyphenated ISO form: "${tf.iso}".
+
+   METHOD B — Calendar Picker (FALLBACK if Method A leaves the field showing "mm/dd/yyyy"):
+     i.   Click the SMALL CALENDAR ICON at the RIGHT EDGE of the "Tax From" input
+          field. Do NOT click the middle of the field, do NOT click the "mm/dd/yyyy"
+          placeholder text — those only focus the month segment and do NOT open the
+          picker. ONLY the calendar icon at the right edge opens the popup.
+     ii.  A date-picker popup appears below the field, showing: a header like
+          "April 2026 ▾" with ↑ and ↓ arrows on its right, a grid with weekday row
+          "S M T W T F S", and "Clear" / "Today" links at the bottom.
+     iii. Navigate to "${tf.monthName} ${tf.year}":
+          - If the header ALREADY reads "${tf.monthName} ${tf.year}" → skip to step iv.
+          - If you need a LATER month → click the ↓ (down arrow) once per month.
+          - If you need an EARLIER month → click the ↑ (up arrow) once per month.
+          - Or click the "${tf.monthName} ${tf.year}" header text (the ▾) to open
+            a year/month picker and pick directly.
+     iv.  Click the number "${tf.dd}" in the grid. Greyed-out numbers at the edges
+          belong to the previous/next month — click the BLACK/active "${tf.dd}".
+     v.   The picker closes; the input should now show "${tf.mmddyyyy}".
+
+   VERIFY: the field now shows "${tf.mmddyyyy}" (or similar), NOT "mm/dd/yyyy".
+   If it still shows "mm/dd/yyyy", the value did NOT take. If you used Method A
+   first → switch to Method B (calendar picker). If you used Method B and the
+   picker would not open → switch to Method A (direct ISO input).
+
+   --- 1c. Tax Upto (target: ${tu.iso}) ---
+   Same procedure on the "Tax Upto" field (id="floatingTaxupto").
+   TARGET → month=${tu.mm} (${tu.monthName}), day=${tu.dd}, year=${tu.year}
+   Expected display after entry: "${tu.mmddyyyy}"
+
+   METHOD A — Direct ISO input (try this FIRST):
+     i.  Use your standard input/type action on the "Tax Upto" field with value
+         "${tu.iso}" exactly (hyphenated ISO form, NOT slashed).
+     ii. After the action, the field should display "${tu.mmddyyyy}".
+
+   METHOD B — Calendar Picker (FALLBACK):
+     i.   Click the SMALL CALENDAR ICON at the RIGHT EDGE of the "Tax Upto" field.
+     ii.  Navigate the popup to "${tu.monthName} ${tu.year}" using the ↑/↓ arrows
+          or the header dropdown.
+     iii. Click the number "${tu.dd}" in the grid (the BLACK/active one, not greyed).
+     iv.  The picker closes; the input should now show "${tu.mmddyyyy}".
+
+   VERIFY: the field now shows "${tu.mmddyyyy}", NOT "mm/dd/yyyy".
+
+2. After BOTH "Tax From" and "Tax Upto" show their dates (not the placeholder),
+   click the "Calculate Fee/Tax" button.
+
+3. Wait for the tax row to appear in the table and the Total Amount field to populate.
+
+4. Verify the amount is displayed (must be a number > 0).
+   - If the amount stays blank or is 0 after 30 seconds → re-check both date fields.
+     If either still shows "mm/dd/yyyy", go back to step 1b/1c and re-enter using the
+     other method (whichever you didn't try yet).
+
 5. Click the "Next" button.
 
-===
-PHASE 5 — DISCLAIMER AND PAYMENT
-===
-1. On the Disclaimer page (Step 4 of 4):
-   - You will see vehicle details summary, tax details, and a CAPTCHA.
-   - Read the CAPTCHA image and type the answer in the captcha input field.
-   - Click the checkbox "I confirm that above information are correct as per my knowledge."
-     - If a popup appears after clicking the checkbox, close it.
-   - Click the "Pay Online" button.
-
-CAPTCHA RETRY (max 5 attempts):
-   a. If CAPTCHA fails, a new CAPTCHA image will appear.
-   b. Read the NEW CAPTCHA image.
-   c. Clear the captcha input field.
-   d. Type the new CAPTCHA text.
-   e. Try clicking "Pay Online" again.
-   f. After 5 failures → call wait_for_human: "CAPTCHA on Checkpost portal needs solving. Please solve it and click Pay Online, then reply done."
-
-2. A confirmation popup will appear asking "Are you sure?" or similar.
-   - Click "Yes" or "OK" to confirm.
-
-3. The PAYMENT GATEWAY page loads (Ministry of Road Transport & Highway — "PAYMENT DETAILS" page).
-   VERIFY: You see "Payment Id", "Amount", and "Select Payment Gateway" dropdown.
-   - In the "Select Payment Gateway" dropdown, select "SBI (Multi Bank Payment)".
-   - Click the checkbox "I accept terms and conditions."
-   - Click the "Submit" button.
 ${paymentSteps}
 ===
 PHASE 6 — WAIT FOR RECEIPT AND CAPTURE IT
@@ -498,7 +600,7 @@ failed. Call done with this exact summary template (filling in the bracketed fie
   Entry Checkpoint: ${entryCheckpoint}
   Service Type: ${serviceType}
   Tax Mode: ${taxMode}
-  Tax Period: ${taxFrom} to ${taxUpto}
+  Tax Period: ${tf.iso} to ${tu.iso}
   Payment Method: ${isUPI ? "UPI" : "SBI Net Banking"}
   Amount Paid: ₹<amount if known, otherwise "unknown">
   Receipt Number: <receiptNumber if read, otherwise "unknown">
@@ -519,7 +621,7 @@ Call done with this summary:
   Entry Checkpoint: ${entryCheckpoint}
   Service Type: ${serviceType}
   Tax Mode: ${taxMode}
-  Tax Period: ${taxFrom} to ${taxUpto}
+  Tax Period: ${tf.iso} to ${tu.iso}
   Payment Method: ${isUPI ? "UPI" : "SBI Net Banking"}
   Amount Paid: ₹<amount>
   Receipt Number: <receiptNumber>
