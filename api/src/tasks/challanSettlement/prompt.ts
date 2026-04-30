@@ -802,7 +802,9 @@ const challansFromDB = async (p: Record<string, string>): Promise<string[]> => {
                 depts.add("Delhi(Notice Department)");
             }
         }
-        return Array.from(depts);
+        const allDeps = Array.from(depts);
+        console.log("depsFromDB: ", allDeps.length);
+        return allDeps;
     } catch (e) {
         console.error("[challansFromDB] error:", e);
         return [];

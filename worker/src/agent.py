@@ -129,8 +129,8 @@ def make_tools(
                 return json.dumps({"ok": False, "error": msg})
 
             # ─── 2. Validate required fields ───
-            required = ["vehicleNumber", "receiptNumber",
-                        "amount", "paymentDate"]
+            required = ["vehicleNumber",
+                        "receiptNumber", "amount", "paymentDate"]
             missing = [
                 f for f in required
                 if f not in data or data[f] in ("", None)
@@ -147,48 +147,32 @@ def make_tools(
                 f"date={data['paymentDate']}"
             )
 
-            # ─── 3. Get the active page from the browser session ───
-            page = None
-            try:
-                if hasattr(browser_session, "get_current_page"):
-                    page = await browser_session.get_current_page()
-                elif hasattr(browser_session, "page"):
-                    page = browser_session.page
-            except Exception as e:
-                msg = f"Could not get active page: {e}"
-                print(f"[{job_id}]   ERROR: {msg}")
-                return json.dumps({"ok": False, "error": msg})
+            await asyncio.sleep(1.5)
 
-            if page is None:
-                msg = "No active page in browser session"
-                print(f"[{job_id}]   ERROR: {msg}")
-                return json.dumps({"ok": False, "error": msg})
-
-            # ─── 4. Capture PDF via Chrome DevTools Protocol ───
-            cdp = None
             try:
                 print(f"[{job_id}]   capturing PDF via CDP Page.printToPDF")
-                cdp = await page.context.new_cdp_session(page)
-                result = await cdp.send("Page.printToPDF", {
-                    "format": "A4",
-                    "printBackground": True,
-                    "preferCSSPageSize": True,
-                    "marginTop": 0.4,
-                    "marginBottom": 0.4,
-                    "marginLeft": 0.4,
-                    "marginRight": 0.4,
-                })
+                cdp = await browser_session.get_or_create_cdp_session()
+
+                await cdp.cdp_client.send.Page.enable(session_id=cdp.session_id)
+
+                result = await cdp.cdp_client.send.Page.printToPDF(
+                    params={
+                        "paperWidth": 8.27,
+                        "paperHeight": 11.69,
+                        "printBackground": True,
+                        "preferCSSPageSize": True,
+                        "marginTop": 0.4,
+                        "marginBottom": 0.4,
+                        "marginLeft": 0.4,
+                        "marginRight": 0.4,
+                        "transferMode": "ReturnAsBase64",
+                    },
+                    session_id=cdp.session_id,
+                )
             except Exception as e:
                 msg = f"CDP printToPDF failed: {str(e)}"
                 print(f"[{job_id}]   ERROR: {msg}")
                 return json.dumps({"ok": False, "error": msg})
-            finally:
-                if cdp is not None:
-                    try:
-                        await cdp.detach()
-                    except Exception:
-                        # Detach failure is non-fatal; we already have the bytes
-                        pass
 
             pdf_b64 = result.get("data", "")
             if not pdf_b64:
@@ -208,8 +192,8 @@ def make_tools(
             if len(pdf_bytes) < 1000:
                 # Sanity check — a real receipt PDF is at least a few KB.
                 # If we got something tiny, the page probably wasn't rendered.
-                msg = f"PDF suspiciously small ({
-                    len(pdf_bytes)} bytes) — receipt page may not have rendered"
+                msg = f"PDF suspiciously small ({len(
+                    pdf_bytes)} bytes) — receipt page may not have rendered"
                 print(f"[{job_id}]   WARNING: {msg}")
                 # Continue anyway — server will validate
 
