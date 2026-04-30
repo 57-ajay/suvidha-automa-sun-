@@ -760,7 +760,9 @@ const challansFromDB = async (p: Record<string, string>): Promise<string[]> => {
         if (!docSnap.exists) return [];
 
         const docData = docSnap.data()!;
-        const existingChallans: any[] = docData.challansDraft || [];
+
+        // console.log("data: ", { docData });
+        const existingChallans: any[] = docData.challans || [];
 
         // Map each existing challan to its Virtual Courts department name (same logic as Phase 1.5).
         const stateToDept: Record<string, string> = {
