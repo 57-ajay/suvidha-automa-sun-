@@ -69,24 +69,52 @@ export async function handleSaveDiscounts(body: InternalRequest) {
         return { ok: false, error: "data must be a non-empty array of discounts" };
     }
 
-    // Coerce amounts from strings to numbers and validate
     const incoming: AgentDiscount[] = [];
+    const droppedReasons: { challanId: string; reason: string }[] = [];
+
     for (const d of rawIncoming) {
-        if (!d.challanId || typeof d.challanId !== "string") {
-            console.log(`[save_discounts] FAIL: invalid challanId in ${JSON.stringify(d)}`);
-            return { ok: false, error: `Invalid challanId: ${JSON.stringify(d)}` };
+        if (!d || !d.challanId || typeof d.challanId !== "string") {
+            console.warn(`[save_discounts] DROP invalid_challanId: ${JSON.stringify(d)}`);
+            droppedReasons.push({ challanId: String(d?.challanId ?? ""), reason: "invalid_challanId" });
+            continue;
         }
 
         const discountAmount = toNumber(d.discountAmount);
         const originalAmount = toNumber(d.originalAmount);
 
         if (discountAmount === null) {
-            console.log(`[save_discounts] FAIL: cannot parse discountAmount for ${d.challanId}: ${d.discountAmount} (${typeof d.discountAmount})`);
-            return { ok: false, error: `Invalid discountAmount for challan ${d.challanId}: ${d.discountAmount}` };
+            console.warn(`[save_discounts] DROP unparseable_discount ${d.challanId}: ${d.discountAmount} (${typeof d.discountAmount})`);
+            droppedReasons.push({ challanId: d.challanId, reason: "unparseable_discount" });
+            continue;
         }
         if (originalAmount === null) {
-            console.log(`[save_discounts] FAIL: cannot parse originalAmount for ${d.challanId}: ${d.originalAmount} (${typeof d.originalAmount})`);
-            return { ok: false, error: `Invalid originalAmount for challan ${d.challanId}: ${d.originalAmount}` };
+            console.warn(`[save_discounts] DROP unparseable_original ${d.challanId}: ${d.originalAmount} (${typeof d.originalAmount})`);
+            droppedReasons.push({ challanId: d.challanId, reason: "unparseable_original" });
+            continue;
+        }
+
+        if (discountAmount > originalAmount) {
+            console.warn(
+                `[save_discounts] DROP exceeds_original ${d.challanId}: ` +
+                `discount=${discountAmount} > original=${originalAmount} ` +
+                `vehicle=${vehicleNumber} requestId=${requestId} jobId=${jobId}`
+            );
+            droppedReasons.push({ challanId: d.challanId, reason: "discount_exceeds_original" });
+            continue;
+        }
+
+        // Negative amounts are nonsense.
+        if (discountAmount < 0 || originalAmount < 0) {
+            console.warn(`[save_discounts] DROP negative_amount ${d.challanId}: discount=${discountAmount} original=${originalAmount}`);
+            droppedReasons.push({ challanId: d.challanId, reason: "negative_amount" });
+            continue;
+        }
+
+        // originalAmount of 0 doesn't make sense (every challan has some fine).
+        if (originalAmount === 0) {
+            console.warn(`[save_discounts] DROP zero_original ${d.challanId}: original=0`);
+            droppedReasons.push({ challanId: d.challanId, reason: "zero_original" });
+            continue;
         }
 
         incoming.push({
@@ -96,9 +124,13 @@ export async function handleSaveDiscounts(body: InternalRequest) {
         });
     }
 
-    console.log(`[save_discounts] incoming count=${incoming.length}`);
+    console.log(`[save_discounts] after-validation count=${incoming.length} dropped=${droppedReasons.length}`);
+    if (droppedReasons.length > 0) {
+        console.warn(`[save_discounts] dropped records: ${JSON.stringify(droppedReasons)}`);
+    }
+
     for (const d of incoming) {
-        console.log(`[save_discounts]   incoming: challanId="${d.challanId}" discount=${d.discountAmount} original=${d.originalAmount}`);
+        console.log(`[save_discounts]   accepted: challanId="${d.challanId}" discount=${d.discountAmount} original=${d.originalAmount}`);
         if (d.discountAmount === 0 && d.originalAmount > 0) {
             console.warn(
                 `[save_discounts] SUSPICIOUS_ZERO: challanId=${d.challanId} ` +
@@ -109,7 +141,21 @@ export async function handleSaveDiscounts(body: InternalRequest) {
         }
     }
 
-    // Get the challanRequest doc directly by requestId
+    if (incoming.length === 0) {
+        console.warn(`[save_discounts] all_records_dropped vehicle=${vehicleNumber} job=${jobId}`);
+        return {
+            ok: true,
+            saved: 0,
+            matched: 0,
+            created: 0,
+            total: rawIncoming.length,
+            dropped: droppedReasons.length,
+            droppedReasons,
+            note: "All records were dropped during validation. See droppedReasons for details. No save was performed.",
+            vehicle: vehicleNumber,
+        };
+    }
+
     const docRef = challanRequestsRef.doc(requestId);
     const docSnap = await docRef.get();
 
@@ -135,10 +181,6 @@ export async function handleSaveDiscounts(body: InternalRequest) {
     let updatedChallans: any[];
 
     if (existingChallans.length === 0) {
-        // -----------------------------------------------------------------
-        // No challans exist yet (save_challans was not called or found none).
-        // Create challan entries directly from the discount data.
-        // -----------------------------------------------------------------
         console.log(`[save_discounts] No existing challans — creating from discount data`);
 
         updatedChallans = incoming.map((d) => {
@@ -161,18 +203,28 @@ export async function handleSaveDiscounts(body: InternalRequest) {
 
         console.log(`[save_discounts] created ${created} challan entries from discount data`);
     } else {
-        // -----------------------------------------------------------------
-        // Challans exist — match and merge discounts
-        // -----------------------------------------------------------------
         const existingIds = existingChallans.map((c: any) => c.id);
         const incomingIds = incoming.map(d => d.challanId);
         console.log(`[save_discounts] existing IDs: ${JSON.stringify(existingIds)}`);
         console.log(`[save_discounts] incoming IDs: ${JSON.stringify(incomingIds)}`);
 
-        // Try to match existing challans with discounts
         updatedChallans = existingChallans.map((challan: any) => {
             const discount = discountMap.get(challan.id);
             if (discount && discount.discountAmount != null) {
+                const existingChallanAmount = toNumber(challan.challanAmount);
+                if (existingChallanAmount !== null && existingChallanAmount > 0 && discount.discountAmount > existingChallanAmount) {
+                    console.warn(
+                        `[save_discounts] DROP-AT-MERGE ${challan.id}: ` +
+                        `discount=${discount.discountAmount} > existing challanAmount=${existingChallanAmount}. ` +
+                        `Keeping existing quotation untouched.`
+                    );
+                    droppedReasons.push({ challanId: challan.id, reason: "discount_exceeds_existing_amount" });
+                    if (challan.quotation?.amount != null) {
+                        totalSettlementAmount += challan.quotation.amount;
+                    }
+                    return challan;
+                }
+
                 matched++;
                 totalSettlementAmount += discount.discountAmount;
                 console.log(`[save_discounts]   MATCHED ${challan.id} → discount=₹${discount.discountAmount}`);
@@ -191,8 +243,6 @@ export async function handleSaveDiscounts(body: InternalRequest) {
             return challan;
         });
 
-        // Add any incoming discounts that didn't match an existing challan
-        // (Virtual Courts may have challans that Delhi Traffic Police didn't)
         for (const d of incoming) {
             if (!existingChallans.some((c: any) => c.id === d.challanId)) {
                 created++;
@@ -203,7 +253,6 @@ export async function handleSaveDiscounts(body: InternalRequest) {
                     challanDate: Timestamp.fromDate(now),
                     challanNo: d.challanId,
                     id: d.challanId,
-                    // isSelected: true,
                     offence: null,
                     quotation: {
                         amount: d.discountAmount,
@@ -218,29 +267,6 @@ export async function handleSaveDiscounts(body: InternalRequest) {
         console.log(`[save_discounts] matched=${matched} created=${created} (${matchingIds.length} ID overlaps)`);
     }
 
-    // // Write each challan to subChallans sub-collection
-    // const subChallansRef = db.collection(`challans/${vehicleNumber}/subChallans`);
-    //
-    // const subDocPromises = updatedChallans.map((challan: any) => {
-    //     const subDoc = {
-    //         challanAmount: challan.challanAmount ?? null,
-    //         challanDate: challan.challanDate ?? null,
-    //         challanNo: challan.challanNo ?? null,
-    //         id: challan.id,
-    //         location: challan.location ?? null,
-    //         offence: challan.offence ?? null,
-    //         paymentDetails: challan.paymentDetails ?? null,
-    //         quotation: challan.quotation ?? null,
-    //         status: challan.status || "unpaid",
-    //         settlementStatus: challan.status || "unpaid",
-    //         type: challan.type ?? null,
-    //     };
-    //     return subChallansRef.doc(challan.id).set(subDoc, { merge: true });
-    // });
-
-    // await Promise.all(subDocPromises);
-
-    // Update main request doc
     await docRef.update({
         challansDraft: updatedChallans,
         challansUpdatedBy: "agent",
@@ -252,7 +278,9 @@ export async function handleSaveDiscounts(body: InternalRequest) {
     });
 
     console.log(
-        `[save_discounts] SUCCESS job=${jobId} vehicle=${vehicleNumber} matched=${matched} created=${created} total=₹${totalSettlementAmount} doc=${docSnap.id}`
+        `[save_discounts] SUCCESS job=${jobId} vehicle=${vehicleNumber} ` +
+        `matched=${matched} created=${created} dropped=${droppedReasons.length} ` +
+        `total=₹${totalSettlementAmount} doc=${docSnap.id}`
     );
 
     return {
@@ -260,6 +288,8 @@ export async function handleSaveDiscounts(body: InternalRequest) {
         matched,
         created,
         total: incoming.length,
+        dropped: droppedReasons.length,
+        droppedReasons: droppedReasons.length > 0 ? droppedReasons : undefined,
         totalSettlementAmount,
         vehicle: vehicleNumber,
         docId: docSnap.id,

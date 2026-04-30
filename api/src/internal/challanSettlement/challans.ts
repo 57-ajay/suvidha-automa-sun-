@@ -1,5 +1,6 @@
 import { Timestamp, FieldValue } from "firebase-admin/firestore";
 import { challanRequestsRef } from "../../firebase";
+import { priceForOffence } from "../../tasks/challanSettlement/prompt";
 
 export interface AgentChallan {
     challanId: string;
@@ -52,7 +53,6 @@ export async function handleSaveChallans(body: InternalRequest) {
         return { ok: false, error: "requestId missing from job params" };
     }
 
-    // Robust data parsing
     let rawIncoming: any[];
 
     if (Array.isArray(body.data)) {
@@ -79,31 +79,75 @@ export async function handleSaveChallans(body: InternalRequest) {
         return { ok: false, error: "data must be a non-empty array of challans" };
     }
 
-    // Coerce and validate
     const incoming: AgentChallan[] = [];
+    const droppedReasons: { challanId: string; reason: string; offence?: string }[] = [];
+    const filledFromKeyword: { challanId: string; offence: string; price: number }[] = [];
+
     for (const c of rawIncoming) {
-        if (!c.challanId || typeof c.challanId !== "string") {
-            console.log(`[save_challans] FAIL: invalid challanId in ${JSON.stringify(c)}`);
-            return { ok: false, error: `Invalid challanId: ${JSON.stringify(c)}` };
+        if (!c || !c.challanId || typeof c.challanId !== "string") {
+            console.warn(`[save_challans] DROP invalid_challanId: ${JSON.stringify(c)}`);
+            droppedReasons.push({ challanId: String(c?.challanId ?? ""), reason: "invalid_challanId" });
+            continue;
         }
 
-        const amount = toNumber(c.amount);
-        if (amount === null || amount <= 0) {
-            console.log(`[save_challans] FAIL: invalid amount for ${c.challanId}: ${c.amount} (${typeof c.amount})`);
-            return { ok: false, error: `Invalid amount for challan ${c.challanId}: ${c.amount}` };
+        const offence = (c.offence ?? "").toString();
+        const parsedAmount = toNumber(c.amount);
+
+        let amount: number;
+        if (parsedAmount === null || parsedAmount === 0) {
+            const derived = priceForOffence(offence);
+            if (derived !== null) {
+                console.warn(
+                    `[save_challans] FILL_FROM_KEYWORD ${c.challanId}: ` +
+                    `amount=${c.amount} (${typeof c.amount}) offence="${offence}" → price=${derived}`
+                );
+                amount = derived;
+                filledFromKeyword.push({ challanId: c.challanId, offence, price: derived });
+            } else {
+                console.warn(
+                    `[save_challans] DROP zero_or_missing_amount ${c.challanId}: ` +
+                    `amount=${c.amount} offence="${offence}" — no keyword match for fallback price`
+                );
+                droppedReasons.push({ challanId: c.challanId, reason: "zero_or_missing_amount_no_keyword", offence });
+                continue;
+            }
+        } else {
+            amount = parsedAmount;
+        }
+
+        if (amount < 0) {
+            console.warn(`[save_challans] DROP negative_amount ${c.challanId}: amount=${amount}`);
+            droppedReasons.push({ challanId: c.challanId, reason: "negative_amount" });
+            continue;
         }
 
         incoming.push({
             challanId: c.challanId.trim(),
-            offence: c.offence || "",
+            offence,
             amount,
-            date: c.date || "",
+            date: (c.date ?? "").toString(),
         });
     }
 
-    console.log(`[save_challans] incoming count=${incoming.length}`);
-    for (const c of incoming) {
-        console.log(`[save_challans]   incoming: challanId="${c.challanId}" offence="${c.offence}" amount=${c.amount} date=${c.date}`);
+    console.log(`[save_challans] after-validation count=${incoming.length} dropped=${droppedReasons.length} filled=${filledFromKeyword.length}`);
+    if (droppedReasons.length > 0) {
+        console.warn(`[save_challans] dropped records: ${JSON.stringify(droppedReasons)}`);
+    }
+    if (filledFromKeyword.length > 0) {
+        console.warn(`[save_challans] filled from keyword: ${JSON.stringify(filledFromKeyword)}`);
+    }
+
+    if (incoming.length === 0) {
+        console.warn(`[save_challans] all_records_dropped vehicle=${vehicleNumber} job=${jobId}`);
+        return {
+            ok: true,
+            saved: 0,
+            total: rawIncoming.length,
+            dropped: droppedReasons.length,
+            droppedReasons,
+            note: "All records were dropped during validation. See droppedReasons. No save was performed.",
+            vehicle: vehicleNumber,
+        };
     }
 
     const docRef = challanRequestsRef.doc(requestId);
@@ -119,7 +163,6 @@ export async function handleSaveChallans(body: InternalRequest) {
 
     console.log(`[save_challans] doc=${docSnap.id} existing challans=${existingChallans.length}`);
 
-    // Build a map of existing challans by id to preserve quotation data
     const existingMap = new Map<string, any>();
     for (const c of existingChallans) {
         if (c.id) {
@@ -127,7 +170,6 @@ export async function handleSaveChallans(body: InternalRequest) {
         }
     }
 
-    // Merge: update existing challans with fresh data, add new ones
     const mergedChallans = incoming.map((c) => {
         const existing = existingMap.get(c.challanId);
         const merged = {
@@ -135,7 +177,6 @@ export async function handleSaveChallans(body: InternalRequest) {
             challanDate: parseDate(c.date),
             challanNo: c.challanId,
             id: c.challanId,
-            // isSelected: true,
             offence: c.offence || null,
             ...(existing?.quotation ? { quotation: existing.quotation } : {}),
         };
@@ -149,12 +190,19 @@ export async function handleSaveChallans(body: InternalRequest) {
     });
 
     const savedIds = mergedChallans.map(c => c.id);
-    console.log(`[save_challans] SUCCESS job=${jobId} vehicle=${vehicleNumber} saved=${mergedChallans.length} doc=${docSnap.id}`);
+    console.log(
+        `[save_challans] SUCCESS job=${jobId} vehicle=${vehicleNumber} ` +
+        `saved=${mergedChallans.length} dropped=${droppedReasons.length} filled=${filledFromKeyword.length} ` +
+        `doc=${docSnap.id}`
+    );
     console.log(`[save_challans] saved IDs: ${JSON.stringify(savedIds)}`);
 
     return {
         ok: true,
         saved: mergedChallans.length,
+        dropped: droppedReasons.length,
+        droppedReasons: droppedReasons.length > 0 ? droppedReasons : undefined,
+        filledFromKeyword: filledFromKeyword.length > 0 ? filledFromKeyword : undefined,
         vehicle: vehicleNumber,
         docId: docSnap.id,
     };

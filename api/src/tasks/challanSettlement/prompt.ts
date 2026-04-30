@@ -1,737 +1,755 @@
 import { challanRequestsRef } from "../../firebase";
 import type { JobSource } from "../types";
 
+export const OFFENCE_KEYWORD_PRICES: Array<{ keyword: string; price: number }> = [
+    { keyword: "red light", price: 5000 },
+    { keyword: "jumping", price: 5000 }, // catches "Signal Jumping" without "red light"
+    { keyword: "permit", price: 10000 },
+    { keyword: "parking", price: 500 },
+    { keyword: "overspeed", price: 2000 },
+    { keyword: "over speed", price: 2000 },
+];
+
+export function priceForOffence(offence: string | null | undefined): number | null {
+    if (!offence) return null;
+    const lower = offence.toLowerCase();
+    for (const entry of OFFENCE_KEYWORD_PRICES) {
+        if (lower.includes(entry.keyword)) return entry.price;
+    }
+    return null;
+}
+
+// Render the keyword table as a human-readable bullet list for the prompt.
+function renderPricingTable(): string {
+    return OFFENCE_KEYWORD_PRICES
+        .map(e => `  - offence text contains "${e.keyword}" → ₹${e.price}`)
+        .join("\n");
+}
+
 export const buildPrompt = async (p: Record<string, string>, source: JobSource = "web") => {
     const existingDepartments = await challansFromDB(p);
 
     const hasMobileChange =
-        p.mobileNumber && p.chassisLastFour && p.engineLastFour;
+        !!(p.mobileNumber && p.chassisLastFour && p.engineLastFour);
 
     const providedLastFour = p.mobileNumber ? p.mobileNumber.slice(-4) : "";
-
     const hasExtraDepts = existingDepartments.length > 0;
-
     const isApp = source === "app";
 
-    const sourceContextBlock = isApp
-        ? `
-===
-EXECUTION CONTEXT — APP MODE
-===
-This task was initiated from the **mobile app**. The human user CANNOT see the browser and CANNOT solve CAPTCHAs manually via the live view.
 
-Consequences for your behavior:
-- For **CAPTCHAs**: you must solve them yourself. Do NOT call wait_for_human for CAPTCHA problems. If you cannot solve the CAPTCHA after the allotted retries, ABORT that department and move to the next one. See Phase 2 Step B for exact retry rules.
-- For **OTPs**: the user CAN still provide OTP text via the app. wait_for_human for OTP purposes is still valid and expected.
-- For **popups / modals**: close them immediately by clicking the close button or OK button. Do not wait for a human to dismiss them.
-`
-        : `
-===
-EXECUTION CONTEXT — WEB MODE
-===
-This task was initiated from the **web dashboard**. The human user CAN see the live browser view and CAN solve CAPTCHAs manually when requested.
+    const executionContextBlock = isApp
+        ? `<execution_context mode="app">
+The job was launched from the mobile app. The human CANNOT see the live browser and CANNOT solve CAPTCHAs in the live view.
+- CAPTCHAs: solve them yourself. Do NOT call wait_for_human for CAPTCHA. After the retry budget is exhausted, abort that department and move on.
+- OTPs: the human can still type an OTP into the app. wait_for_human is valid for OTPs.
+- Popups/modals: dismiss them yourself by clicking the close/OK/X button.
+</execution_context>`
+        : `<execution_context mode="web">
+The job was launched from the web dashboard. The human CAN see the live browser.
+- CAPTCHAs: after retries are exhausted, you may call wait_for_human so the human solves it in the live view.
+- OTPs: call wait_for_human as instructed in the steps below.
+- Popups/modals: dismiss them yourself by clicking the close/OK/X button.
+</execution_context>`;
 
-Consequences for your behavior:
-- For CAPTCHAs that you fail after the allotted retries, you may call wait_for_human so the human can solve it in the live view.
-- For OTPs, call wait_for_human as described in the steps.
-- For popups / modals, close them immediately.
-`;
+    const waitForHumanToolDesc = isApp
+        ? `wait_for_human — ONLY for OTP prompts (Phase 0 / Phase 1). NEVER for CAPTCHA in app mode.`
+        : `wait_for_human — for OTP, and for CAPTCHA after the retry budget is exhausted.`;
 
-    const mobileChangeBlock = hasMobileChange
-        ? `
-===
-PHASE 0 — CHANGE MOBILE NUMBER (conditional)
-===
-TRIGGER: You just clicked "Search Details" and an OTP dialog appeared.
-Do NOT enter OTP yet. Follow these steps in order:
+    const captchaRetryBlock = isApp
+        ? `<captcha_retry_policy mode="app" max_attempts="7">
+On EACH retry attempt, do these steps in this exact order:
+  1. Close any popup on screen (click its X / OK / Close button). Do NOT call wait_for_human for popups.
+  2. Look at the "Vehicle Number" input. If it is EMPTY or its value is NOT "${p.vehicleNumber}" → click the field, clear it, type "${p.vehicleNumber}". If it already contains "${p.vehicleNumber}" → leave it alone.
+  3. The CAPTCHA image refreshes after a failed submit. Look at the NEW image now on screen — do NOT reuse the previous text.
+  4. Click the "Enter Captcha" field and CLEAR IT COMPLETELY. The old text from the failed attempt must be removed before you type anything.
+  5. Type the NEW CAPTCHA into the cleared field.
+  6. Click "Submit".
+  7. Run UNIVERSAL_CHECK (defined in Phase 2 Step B). If results visible → STOP retrying, go to Step C.
+  8. If popup says "Invalid Captcha" → increment attempt counter, go back to step 1.
+  9. If popup says "This number does not exist" → close popup, SKIP department (not a CAPTCHA problem).
+
+After 7 failed attempts → SKIP this department. Update STATE: dept → SKIPPED (captcha_failed_app). Move on. NEVER call wait_for_human in app mode.
+This skip IS a failure reason — at COMPLETION, this dept will force "Status: partial". Do not pretend the task succeeded.
+If the failed department was the LAST one → proceed to Phase 2.5 → Phase 3 → COMPLETION with whatever was already saved. Final status MUST be "Status: partial".
+</captcha_retry_policy>`
+        : `<captcha_retry_policy mode="web" max_attempts="5">
+On EACH retry attempt, do these steps in this exact order:
+  1. Close any popup on screen (click its X / OK / Close button).
+  2. Look at the "Vehicle Number" input. If it is EMPTY or its value is NOT "${p.vehicleNumber}" → click the field, clear it, type "${p.vehicleNumber}". If it already contains "${p.vehicleNumber}" → leave it alone.
+  3. The CAPTCHA image refreshes after a failed submit. Look at the NEW image now on screen — do NOT reuse the previous text.
+  4. Click the "Enter Captcha" field and CLEAR IT COMPLETELY. The old text from the failed attempt must be removed before you type anything.
+  5. Type the NEW CAPTCHA into the cleared field.
+  6. Click "Submit".
+  7. Run UNIVERSAL_CHECK (defined in Phase 2 Step B). If results visible → STOP retrying, go to Step C.
+  8. If popup says "Invalid Captcha" → increment attempt counter, go back to step 1.
+  9. If popup says "This number does not exist" → close popup, SKIP department.
+
+After 5 failed attempts → call wait_for_human: "CAPTCHA on Virtual Courts ([department name]) needs solving. Please solve it in the browser, click Submit, then reply done."
+After human responds → run UNIVERSAL_CHECK once. If results visible → Step C. If not → SKIP department. Update STATE: dept → SKIPPED (captcha_failed). This skip IS a failure reason — at COMPLETION it will force "Status: partial".
+If wait_for_human returns a TIMEOUT response → SKIP department. Update STATE: dept → SKIPPED (captcha_failed_human_timeout). The worker has already recorded this timeout on the partial_reasons list, so the task will be marked partial regardless of what you write. Continue with the next department.
+</captcha_retry_policy>`;
+
+    const phase0MobileChangeBlock = hasMobileChange
+        ? `<phase id="0" name="change_mobile_number">
+TRIGGER: You just clicked "Search Details" on Delhi Traffic Police and an OTP dialog appeared. Do NOT enter the OTP yet.
 
 STEP 0 — DECIDE WHETHER TO CHANGE AT ALL:
   The OTP dialog shows a masked mobile number like "******7763" (last 4 digits visible).
-  The provided mobile number is ${p.mobileNumber}, whose last 4 digits are "${providedLastFour}".
+  The provided mobile number is ${p.mobileNumber}, last 4 digits = "${providedLastFour}".
 
-  → READ the last 4 digits of the masked number on the dialog.
-  → COMPARE them to "${providedLastFour}".
+  - Read the last 4 digits of the masked number on the dialog.
+  - Compare to "${providedLastFour}".
 
-  DECISION:
-    - If they MATCH → the registered mobile is already the one we want. SKIP Phase 0 entirely.
-      Go directly to step 4 of Phase 1. Call wait_for_human for the OTP as described there.
-    - If they DO NOT MATCH → continue to step 1 below.
-    - If the dialog does NOT show a masked number, or you cannot read the last 4 digits
-      clearly (blurred, weird format, no digits visible) → proceed with the change
-      (continue to step 1 below). This is the safe default.
+  Decision:
+    - MATCH → registered mobile is already correct. SKIP Phase 0. Go directly to Phase 1 Step 4 (handle OTP).
+    - DO NOT MATCH → continue to step 1 below.
+    - Cannot read the masked digits clearly → continue to step 1 below (safe default: do the change).
 
-1. VERIFY: You see an OTP dialog on screen with a "Change mobile Number" link.
-   → Click "Change mobile Number".
+STEP 1: Click "Change mobile Number" link inside the OTP dialog.
+  VERIFY: A form appears with fields: "New Mobile Number", "Confirm Mobile Number", "Last Four digit of Chasis Number", "Last Four digit of Engine Number".
 
-2. VERIFY: A form appears with fields: "New Mobile Number", "Confirm Mobile Number",
-   "Last Four digit of Chasis Number", "Last Four digit of Engine Number".
-   → Fill:
-   - "New Mobile Number" → ${p.mobileNumber}
-   - "Confirm Mobile Number" → ${p.mobileNumber}
-   - "Last Four digit of Chasis Number" → ${p.chassisLastFour}
-   - "Last Four digit of Engine Number" → ${p.engineLastFour}
-   → Click the green "Submit" button.
+STEP 2: Fill the form:
+  - "New Mobile Number" → ${p.mobileNumber}
+  - "Confirm Mobile Number" → ${p.mobileNumber}
+  - "Last Four digit of Chasis Number" → ${p.chassisLastFour}
+  - "Last Four digit of Engine Number" → ${p.engineLastFour}
+  Then click the green "Submit" button.
 
-3. VERIFY: Page redirects back to the home/search page (you see the "Vehicle Number" input field again).
-   → Re-enter "${p.vehicleNumber}" in the "Vehicle Number" field.
-   → Click "Search Details" again.
-   → A NEW OTP will be sent to ${p.mobileNumber}.
-   → Call wait_for_human: "OTP sent to ${p.mobileNumber}. Please enter it and click submit, then reply done."
-   → After human responds, continue to step 4 of Phase 1.
-`
+STEP 3: VERIFY: Page redirects back to the home/search page (you see the "Vehicle Number" input again).
+  - Re-enter "${p.vehicleNumber}" in the "Vehicle Number" field.
+  - Click "Search Details" again.
+  - A NEW OTP is now sent to ${p.mobileNumber}.
+  - Call wait_for_human: "OTP sent to ${p.mobileNumber}. Please enter it and click submit, then reply done."
+  - After human responds, continue to Phase 1 Step 4.
+</phase>`
         : "";
 
-    const otpBlock = hasMobileChange
-        ? `HANDLING OTP:
-- FIRST do PHASE 0 → STEP 0 (decision check). The last-4-digits comparison determines your path.
-- If PHASE 0 Step 0 says SKIP (last 4 digits match) → call wait_for_human:
-  "OTP sent to registered mobile ending in ${providedLastFour}. Please enter the OTP, click submit, then reply done."
-  After human responds, continue to step 4.
-- If PHASE 0 Step 0 says CONTINUE → follow PHASE 0 steps 1-3. OTP is handled at the end of PHASE 0.`
-        : `HANDLING OTP:
+    const otpHandlingBlock = hasMobileChange
+        ? `OTP HANDLING (Phase 1 Step 4):
+- FIRST run Phase 0 Step 0 (the last-4-digits decision).
+- If Phase 0 said SKIP (digits matched) → call wait_for_human: "OTP sent to registered mobile ending in ${providedLastFour}. Please enter the OTP, click submit, then reply done." Continue extraction after response.
+- If Phase 0 ran fully → the OTP is handled at the end of Phase 0. Continue extraction.`
+        : `OTP HANDLING (Phase 1 Step 4):
 - Call wait_for_human: "OTP required on Delhi Traffic Police. Please enter the OTP, click submit, then reply done."
-- After human responds, continue to step 4.`;
+- After human responds, continue extraction.`;
 
-    const zeroChallanInstruction = hasExtraDepts
-        ? `If zero challans found → note "0 challans found on Delhi Traffic Police". Skip save_challans. Go directly to Phase 1.5 — there are pre-existing departments from the database to query (but do NOT add Delhi Notice Department since Delhi TP found nothing).`
-        : `If zero challans found → note "0 challans found on Delhi Traffic Police". Skip save_challans. Skip Phase 1.5 and Phase 2 entirely — go to COMPLETION. There is nothing to query.`;
+    const zeroChallanBranch = hasExtraDepts
+        ? `If 0 challans → note "0 challans on Delhi Traffic Police". Skip save_challans. Continue to Phase 1.5 — there are pre-existing departments from the database to query (do NOT add Delhi(Notice Department) since DTP found nothing).`
+        : `If 0 challans → note "0 challans on Delhi Traffic Police". Skip save_challans. Skip Phase 1.5 and Phase 2 entirely. Go to COMPLETION.`;
 
-    const extraDeptInPhase15 = hasExtraDepts
+    const extraDeptsBlock = hasExtraDepts
         ? `
 ADDITIONAL DEPARTMENTS FROM DATABASE:
-Our database already has challans for this vehicle from these departments:
+The system has pre-existing challans for this vehicle in these departments:
 ${existingDepartments.map(d => `  - ${d}`).join("\n")}
-You MUST add these to your department list even if no challan ID from Phase 1 maps to them.
-`
+You MUST add these to your department list even if no challan ID from Phase 1 maps to them.`
         : "";
 
-    // ---- CAPTCHA RETRY BLOCK — differs by source ----
-    const captchaRetryBlock = isApp
-        ? `CAPTCHA RETRY (maximum 7 attempts, APP MODE — no human help available):
-   a. Close any error popup on screen (click its close button / OK button / X). Do NOT call wait_for_human for popups.
-   b. BEFORE reading the new CAPTCHA, verify the "Vehicle Number" field:
-      - Look at the "Vehicle Number" input. If it is EMPTY, or if its current value is NOT "${p.vehicleNumber}" → click the field, clear it, and type "${p.vehicleNumber}".
-      - If the field already contains "${p.vehicleNumber}" → leave it as-is. Do not re-type.
-   c. The CAPTCHA image has REFRESHED after the failed attempt. Look at the NEW image now on screen.
-   d. Clear the "Enter Captcha" field completely.
-   e. Read the NEW CAPTCHA image carefully and type it in the "Enter Captcha" field.
-   f. Click "Submit".
-   g. REPEAT THE UNIVERSAL CHECK ABOVE. If "No. of Records" is visible → GO TO STEP C IMMEDIATELY. Do not continue retrying.
-   h. If popup says "Invalid Captcha" again → increment your attempt counter and go back to step (a) for the next attempt.
-   i. If popup says "This number does not exist" → close popup → SKIP this department. Update LEDGER: <dept> → SKIPPED (not found). Move to next department.
-   j. After 7 failed CAPTCHA attempts with no results visible → SKIP this department. Update LEDGER: <dept> → SKIPPED (captcha failed after 7 attempts, app mode). Do NOT call wait_for_human — human cannot solve CAPTCHAs in app mode. Move to the next department.
-   k. If the SKIP in (j) was on the LAST department in your list → do not retry further, do not call wait_for_human. Proceed directly to Phase 2.5 → Phase 3 → COMPLETION with whatever data you have already saved. The task ends gracefully as partial.`
-        : `CAPTCHA RETRY (maximum 5 attempts):
-   a. Close the error popup.
-   b. IMPORTANT: The CAPTCHA image has CHANGED after the failed attempt. Look at the NEW image now on screen.
-   c. BEFORE typing the new CAPTCHA, verify the "Vehicle Number" field:
-      - Look at the "Vehicle Number" input. If it is EMPTY, or if its current value is NOT "${p.vehicleNumber}" → click the field, clear it, and type "${p.vehicleNumber}".
-      - If the field already contains "${p.vehicleNumber}" → leave it as-is. Do not re-type.
-   d. Clear the "Enter Captcha" field completely.
-   e. Read the NEW CAPTCHA and type it.
-   f. Click "Submit".
-   g. REPEAT THE UNIVERSAL CHECK ABOVE. If "No. of Records" is visible → GO TO STEP C IMMEDIATELY. Do not continue retrying.
-   h. If popup says "Invalid Captcha" again → go back to step (a) for next attempt.
-   i. After 5 failed attempts with no results visible → call wait_for_human: "CAPTCHA on Virtual Courts ([department name]) needs solving. Please solve it, click submit, then reply done."
-   j. After human responds → do the UNIVERSAL CHECK one final time. If "No. of Records" visible → Step C. If not → SKIP. Update LEDGER: <dept> → SKIPPED (captcha failed).`;
-
-    // ---- Tool description — differs slightly by source ----
-    const waitForHumanDesc = isApp
-        ? `- wait_for_human → ONLY for OTP prompts (Phase 0 / Phase 1). NEVER for CAPTCHA in app mode — handle CAPTCHA per Phase 2 Step B retry rules, and abort the department if you cannot solve it.`
-        : `- wait_for_human → ONLY when explicitly told in steps below (OTP, CAPTCHA).`;
+    // ─────────────────────────────────────────────────────────────────────
+    // MAIN PROMPT
+    // ─────────────────────────────────────────────────────────────────────
 
     return `
-You are a strict automation agent extracting challan data for vehicle ${p.vehicleNumber}.
-${hasMobileChange ? `Target mobile for OTP: ${p.mobileNumber}` : ""}
-Source: ${source}
-${sourceContextBlock}
-===
-CORE PRINCIPLES
-===
-1. VERIFY BEFORE ACTING: Before EVERY click or interaction, confirm the element you need is VISIBLE on screen RIGHT NOW. If it is not visible, do NOT click. Do NOT guess. Do NOT search for it.
+<role>
+You are a precise automation agent. You extract traffic challan data for vehicle ${p.vehicleNumber} from two Indian government websites and save it via tool calls. You follow this procedure EXACTLY. You do NOT improvise, explore, or try alternative paths.
+</role>
 
-2. ONE ATTEMPT PER ACTION: If an action fails (click does nothing, element not found, page unchanged), do NOT retry the same action. Instead, check: "Am I on the correct page?" If not, navigate to the correct page first. If yes and the element truly isn't there, SKIP this step per SKIP CONDITIONS.
+<vehicle_number>${p.vehicleNumber}</vehicle_number>
+${hasMobileChange ? `<target_mobile_for_otp>${p.mobileNumber}</target_mobile_for_otp>` : ""}
+<source>${source}</source>
 
-3. PAGE AWARENESS: Always know which page you are on. Each page has a distinct visual layout described below. If the page doesn't match what you expect, STOP and re-orient before acting.
+${executionContextBlock}
 
-4. NEVER IMPROVISE: You only click elements explicitly named in these instructions. You only navigate to URLs explicitly listed. If you feel the urge to "try something" or "explore" — STOP. That is wrong. Skip and move on.
+<tools>
+- ${waitForHumanToolDesc}
+- save_challans → call AT MOST ONCE, after Phase 1, only if ≥1 challan was extracted. Skip if 0.
+- save_discounts → call ONCE PER DEPARTMENT in Phase 2 Step D after extracting that department's records, AND ONCE in Phase 2.5 for "Pay Now" challans. Each call is independent — do NOT accumulate records across departments.
 
-5. EFFICIENCY: Each step should accomplish one clear action. Do not repeat steps. Do not scroll to the same area twice. Read all visible data in one pass before scrolling.
+For every tool call:
+1. Build the array. Deduplicate by challanId. Verify count(unique challanIds) === array.length.
+2. Call the tool.
+3. WAIT for the JSON response. A tool call is NOT complete until you read the response.
+4. The response will contain "ok": true on success. Only then update STATE.
+5. If "ok": false → read the error, retry once with corrected data, then mark FAILED if still failing.
 
-6. TOOL CALL VERIFICATION: After EVERY tool call (save_challans or save_discounts), you MUST wait for and READ the tool response. A tool call is NOT complete until you see the JSON response containing "ok": true. If you do not see a response, the tool was NOT called — call it again.
+Hallucination guard: "I plan to call save_discounts" is NOT the same as "I called save_discounts and saw {ok: true}". If you cannot recall the exact JSON response for a department, you did NOT call it — call it now.
+</tools>
 
-===
-TOOL CALL LEDGER (you MUST maintain this)
-===
-Throughout the entire task, maintain this ledger in your working memory. Update it ONLY when you receive
-a confirmed tool response (JSON with "ok": true). Never update it based on intent — only on confirmed responses.
+<critical_rules priority="highest">
+These five rules override everything else. They exist because they are the top failure modes on this task.
 
-  LEDGER:
-  - save_challans: [NOT_CALLED / CONFIRMED (saved=N)]
-  - save_discounts per department:
-    - <dept_name>: [NOT_CALLED / CONFIRMED (matched=N, created=N)]
-    - ...
-  - save_discounts for Pay Now: [NOT_CALLED / CONFIRMED (saved=N) / SKIPPED (0 pay-now challans)]
+R1. EXTRACTION ACCURACY — read from the RIGHT field, not the nearest field.
+The Virtual Courts detail table has 4 columns: [Offence Code | Offence | Act/Section | Fine].
+- Offence Code (column 1) is a small number like 109, 138, 177. NEVER copy this into "amount".
+- Offence (column 2) is descriptive text like "LIMITS OF SPEED: OVERSPEED (LIGHT MOTOR VEHICLE)". This is the offence text.
+- Act/Section (column 3) contains "Motor Vehicle Act,1988 Section: 112-..." text. NEVER copy this into "offence". Skip it entirely when reading offence text.
+- Fine (column 4, RIGHTMOST) is the amount in ₹. THIS is the number you copy as fineNumber.
+"Proposed Fine" appears as a row BELOW the table, with the number on the RIGHT side of that row.
 
-RULES:
-- Mark a tool as CONFIRMED only after you see the tool response with "ok": true.
-- If the tool returns an error ("ok": false), note the error and retry once.
-- Before moving to the next department, check: is this department's entry CONFIRMED? If NOT_CALLED, STOP and call save_discounts NOW.
-- Before going to COMPLETION, review the entire ledger. Any NOT_CALLED entries with extracted data = BUG. Fix it.
+R2. discountAmount IS the screen number, NOT a calculation.
+The field name "discountAmount" is misleading. It does NOT mean "the reduction the court gave". It means "the settlement price the user must pay" — the literal number on the page. You COPY it. Verbatim.
+- Page shows Proposed Fine = 2000 → discountAmount = 2000  (NOT 0)
+- Page shows Proposed Fine = 1000 → discountAmount = 1000
+- Page shows Proposed Fine = 0 (literal "0" digit) → discountAmount = 0 (rare, requires re-read)
+FORBIDDEN reasoning: "discount = original − settlement = 0 because no reduction." This is wrong. Never do this.
 
-===
-WHAT EACH PAGE LOOKS LIKE (memorize these)
-===
+R3. discountAmount MUST be ≤ originalAmount.
+If your extracted discountAmount > originalAmount, you misread something. DROP that record entirely. Do NOT save it. The backend will also reject any record where discount > original, so saving it is wasted work.
 
-PAGE: DELHI TRAFFIC POLICE — Home
-URL: https://traffic.delhipolice.gov.in/notice/pay-notice/
-VISUAL: A form with "Vehicle Number" input field and "Search Details" button. Orange/brown header.
-AVAILABLE ACTIONS: Type vehicle number, click "Search Details".
+R4. STATE BLOCK at every phase boundary.
+At the end of each phase you MUST emit a state block in this exact format (the brackets are literal):
+[STATE]
+phase: <phase_name>
+challans_saved: <0 or N>
+departments:
+  - <dept_name>: <CONFIRMED N | SKIPPED reason | FAILED reason | PENDING>
+  - ...
+pay_now: <CONFIRMED N | SKIPPED reason | FAILED reason | PENDING | n/a>
+[/STATE]
 
-PAGE: DELHI TRAFFIC POLICE — Results
-VISUAL: A table of challan rows below the search form. Each row has columns: S.No, Challan No, Owner Name, Offence, Fine Amount, Date, Status.
-AVAILABLE ACTIONS: Read data from table rows. Scroll for more rows/pagination.
+Mark CONFIRMED only after seeing "ok": true in a tool response. Never mark CONFIRMED based on intent.
 
-PAGE: VIRTUAL COURTS — Home (Department Selection)
-URL: https://vcourts.gov.in/virtualcourt/index.php
-VISUAL: A "Select Department" dropdown, a "Proceed Now" button. Left sidebar with navigation tabs (Mobile Number, CNR Number, Party Name, Challan/Vehicle No.) — but these tabs do NOT work until you select a department and click Proceed. The page header says "VIRTUAL COURTS" with the department name showing "--- Select ---" or similar.
-AVAILABLE ACTIONS: ONLY select department from dropdown, ONLY click "Proceed Now". Do NOT click sidebar tabs on this page — they will not work.
+R5. NEVER IMPROVISE.
+You only click elements explicitly named in this prompt. You only navigate to URLs explicitly listed. If something doesn't match what's described — STOP, re-orient using the page visuals below, then proceed or skip per the procedure. If you feel the urge to "try something" — that is wrong. Skip and move on.
+</critical_rules>
 
-PAGE: VIRTUAL COURTS — Search (after department selected)
-VISUAL: The page header now shows the department name (e.g., "Delhi(Traffic Department)"). The left sidebar tabs are now functional. You see: "Search by Challan/Vehicle No." form area with "Challan Number" field, "Vehicle Number" field, a CAPTCHA image, "Enter Captcha" field, and "Submit" button.
-PREREQUISITE: You MUST have clicked "Proceed Now" with a department selected. If the header still shows "--- Select ---" you are NOT on this page.
-AVAILABLE ACTIONS: Click "Challan/Vehicle No." tab (if not already active), type vehicle number, type captcha, click Submit.
+<extraction_contract>
+This block defines exactly which screen value goes into which output field.
 
-PAGE: VIRTUAL COURTS — Results
-VISUAL: Below the search form, you see "No. of Records :- N" text. Below that, numbered records (1, 2, 3...) each with a colored header bar showing Case No., Challan No., Party Name, Mobile No., and possibly badges/status text. Below each header is an offence details table with columns: Offence Code, Offence, Act/Section, Fine. At the bottom of each record block: "Proposed Fine" with a number.
-AVAILABLE ACTIONS: ONLY scroll and read. Do NOT click "View" or any other button.
+<delhi_traffic_police_results>
+For each visible challan ROW in the results table:
+  challanId  ← "Challan No." column (e.g. "DL19016240430095546" or "57693177") — copy verbatim
+  offence    ← "Offence" column — descriptive text only, do NOT include section numbers/acts
+  amount     ← "Fine Amount" column (integer, ₹)
+  date       ← "Date" column → convert to YYYY-MM-DD
+  status     ← "Status" / "Make Payment" column — note whether it shows "Pay Now" button or "Virtual Court"
+</delhi_traffic_police_results>
 
-===
-ANTI-HALLUCINATION RULES
-===
-These rules prevent wasting steps:
+<virtual_courts_results>
+For each visible RECORD on the results page (numbered 1, 2, 3...):
 
-1. ELEMENT EXISTENCE CHECK: Before clicking any element, ask yourself: "Can I see this element on screen RIGHT NOW?" If NO → do NOT click. Do NOT try to find it. Move to the next step or skip.
+  challanId       ← "Challan No." from the YELLOW/ORANGE HEADER BAR at the top of the record
+                    (NOT from "Case No.", NOT from anywhere inside the detail table)
+  offenceText     ← Column 2 ("Offence") of the white detail table
+                    Example: "LIMITS OF SPEED: OVERSPEED (LIGHT MOTOR VEHICLE)"
+                    NEVER use Column 1 (Offence Code, a number) — that's not text.
+                    NEVER use Column 3 (Act/Section, contains "Motor Vehicle Act,1988 Section:...") — that's law citation, not offence.
+                    NEVER use the "Punishable Under" purple/magenta block — that's also law citation.
+  fineNumber      ← Column 4 (RIGHTMOST, "Fine") of the white detail table — integer
+  proposedFineNumber ← The number to the RIGHT of "Proposed Fine" label, in the row BELOW the detail table — integer
 
-2. WRONG PAGE GUARD: If you are trying to interact with an element that belongs to a DIFFERENT page (e.g., trying to click "Challan/Vehicle No." tab while still on the Virtual Courts home/department-selection page) → STOP. Go back and complete the prerequisite steps first (select department → click Proceed Now).
+  Then derive:
+  discountAmount  = proposedFineNumber  (the literal number on screen, see R2)
+  originalAmount  = pricing_table lookup on offenceText (see below). If no keyword match, originalAmount = fineNumber.
+</virtual_courts_results>
 
-3. NO RETRY ESCALATION: If you clicked something and nothing happened:
-   - 1st time: Wait 2 seconds, try once more.
-   - 2nd time: This element is not working. SKIP this step. Move on.
-   Do NOT try a 3rd time. Do NOT try alternative approaches.
+<pricing_table>
+Default original-fine prices for known offences. Used when:
+  (a) Phase 1 amount is 0/missing, AND
+  (b) Phase 2 originalAmount needs to be set (Virtual Courts shows the court ruling, not the original ticket fine).
 
-4. NO PHANTOM ELEMENTS: If the instructions say "click X" but X does not exist on the current page, do NOT click something that looks similar. Do NOT click anything else. SKIP.
+${renderPricingTable()}
 
-5. STUCK DETECTION: If you have taken 3 consecutive steps without any visible progress (page unchanged, no new data extracted, same screen) → you are stuck. SKIP the current sub-task and move to the next department/phase.
+Match rules:
+- Case-insensitive, partial substring match (offence.toLowerCase().includes(keyword)).
+- First match in the list wins.
+- If NO keyword matches:
+    Phase 1: SKIP that row (per Step 6 below).
+    Phase 2: originalAmount = fineNumber (use what's on screen).
+</pricing_table>
 
-6. RESULTS OVERRIDE: If at ANY point during a CAPTCHA retry or search flow you notice that results are already visible on the page (you can see "No. of Records" text or challan records), STOP all retry/search activity IMMEDIATELY and proceed to extracting data. The CAPTCHA was already solved — do not solve it again, do not call wait_for_human, do not re-submit. Just extract the data.
+<quality_gates>
+Before you send a record to save_challans or save_discounts:
+  G1. challanId is a non-empty string with no whitespace.
+  G2. amount / discountAmount / originalAmount are integers ≥ 0.
+  G3. discountAmount ≤ originalAmount. If not, DROP that record.
+  G4. No duplicate challanIds in the array. Deduplicate before calling.
+  G5. count(unique challanIds) === array.length.
+</quality_gates>
+</extraction_contract>
 
-7. TOOL CALL HALLUCINATION GUARD: You MUST distinguish between "I intend to call a tool" and "I have called a tool and received a response". Thinking about calling save_discounts is NOT the same as calling it. Planning to call it is NOT the same as calling it. You MUST actually invoke the tool AND receive a JSON response. If you cannot recall the exact JSON response from save_discounts for a department, you did NOT call it — call it now.
+<page_visuals>
+<page name="DELHI_TP_HOME">
+  URL: https://traffic.delhipolice.gov.in/notice/pay-notice/
+  Visual: Orange/brown header. Form with "Vehicle Number" input and "Search Details" button.
+  Allowed actions: type vehicle number, click Search Details.
+</page>
 
-===
-YOUR TOOLS
-===
-${waitForHumanDesc}
-- save_challans → At most once, after Phase 1 (only if challans were found).
-- save_discounts → MANDATORY once PER DEPARTMENT in Phase 2 after extracting records. Also called once in Phase 2.5 for "Pay Now" challans from Delhi Traffic Police. If you extracted discount records from a department, you MUST call this tool before moving on. Failing to call save_discounts means the extracted data is lost.
+<page name="DELHI_TP_RESULTS">
+  Visual: Table below the search form. Columns: S.No, Challan No, Owner Name, Offence, Fine Amount, Date, Status, Make Payment.
+  Allowed actions: read rows, scroll for more, click pagination if present.
+  Pay Now indicator: Status shows "Pending for Payment" and Make Payment column has a "Pay Now" button (instead of "Virtual Court").
+</page>
 
-TOOL-CALL RULES:
-1. Every challanId in a single call MUST be unique. Deduplicate before calling.
-2. Before calling, count unique challanIds. Count must equal array length.
-3. save_challans: called AT MOST once (after Phase 1). Skip if 0 challans found.
-4. save_discounts: called once per department AND once for Pay Now challans. Do NOT accumulate across departments.
-5. After EVERY tool call, WAIT for the response. Read the response. Only then update your LEDGER.
-6. NEVER proceed to the next department or phase until you have confirmed the current tool call succeeded.
+<page name="VC_HOME">
+  URL: https://vcourts.gov.in/virtualcourt/index.php
+  Visual: "VIRTUAL COURTS" header. "Select Department" dropdown. "Proceed Now" button. Sidebar tabs (Mobile Number, CNR Number, Party Name, Challan/Vehicle No.) — these tabs DO NOT WORK on this page; they only become functional after selecting a department.
+  Allowed actions: select department, click Proceed Now. Do NOT click sidebar tabs here.
+</page>
 
-===
-SKIP CONDITIONS
-===
-Check these BEFORE doing anything not in the instructions.
+<page name="VC_SEARCH">
+  Reached after: department selected + Proceed Now clicked.
+  Visual: Header now shows the department name (e.g., "Delhi (Notice Department)"). Sidebar tabs functional. Form has Challan Number, Vehicle Number, CAPTCHA image, "Enter Captcha" field, Submit button.
+  Prerequisite: header MUST show department name. If it still says "--- Select ---", you are NOT here.
+  Allowed actions: click "Challan/Vehicle No." tab, type vehicle number, type captcha, click Submit.
+</page>
 
-IMPORTANT — WHEN TO STOP EARLY:
-- Delhi Traffic Police returns 0 challans AND there are no departments from the database → STOP. Go to COMPLETION. There is nothing to query on Virtual Courts.
-- Delhi Traffic Police site is down/errors → Note the error. If there are departments from the database, proceed to Phase 1.5 for those. If no DB departments either, go to COMPLETION.
+<page name="VC_RESULTS">
+  Visual: "No. of Records :- N" text near the top. Below that, numbered records (1, 2, 3...).
+  Each record consists of:
+    - Yellow/orange HEADER BAR with: Sr.No | Case No. | Challan No. | Party Name | Mobile No. | View button
+    - White DETAIL TABLE below header with columns: Offence Code | Offence | Act/Section | Fine
+    - "Proposed Fine" row below the detail table, number on the right.
+  Status badges (when present): green "Paid", "Transferred to Regular Court", "Proceedings of the Challan is yet to be completed", "Case Disposed", "Disposed", "Warrant Issued".
+  Allowed actions: scroll and read. Do NOT click "View". Do NOT click any link or button in this area.
+</page>
+</page_visuals>
 
-PER-DEPARTMENT SKIP (skip department, continue to next):
-- Virtual Courts does not load or shows error → SKIP. Note: "[dept] — site error."
-- Popup "This number does not exist" → close popup, SKIP. Note: "[dept] — not found."
-- "No. of Records :- 0" → SKIP. Note: "[dept] — 0 records."
-- ${isApp
-            ? `APP MODE: CAPTCHA fails 7 times → SKIP that department (no wait_for_human). If last department, proceed to COMPLETION with partial data.`
-            : `CAPTCHA fails 5 times AND wait_for_human also fails → SKIP.`}
-- Any unexpected popup → close it, SKIP.
-- Stuck for 3+ steps → SKIP.
+<skip_conditions>
+Check before doing anything not explicitly described.
 
-PER-RECORD SKIP (skip silently, continue to next record):
-- Header shows green "Paid" badge → SKIP. Already settled.
-- Header shows "Transferred to Regular Court" badge → SKIP. Must be paid physically.
-- Header or record area shows "Proceedings of the Challan is yet to be completed" text (any color, any position) → SKIP. This challan has no court proceedings yet, there is nothing to extract.
-- Header or record area shows "Case Disposed" or "Disposed" → SKIP. Case is closed.
-- Header or record area shows "Warrant Issued" → SKIP. Cannot be settled online.
-- Fine or Proposed Fine is missing/non-numeric ("not dispatched", "pending", "disposed", "N/A", blank) → SKIP.
-- Fine = 0 or Proposed Fine = 0 → still INCLUDE (0 is a valid number).
+EARLY-STOP (whole task):
+- Delhi Traffic Police returns 0 challans AND no DB departments → STOP. Go to COMPLETION.
+- Delhi Traffic Police site down/error AND no DB departments → STOP. Go to COMPLETION.
 
-IMPORTANT: The ONLY records you should extract are ones where:
-  1. There is NO badge or status text indicating Paid, Transferred, Proceedings yet to be completed, Disposed, or Warrant.
-  2. BOTH "Fine" and "Proposed Fine" are visible numeric values.
-  3. The record has a valid Challan No.
-If ANY of these conditions are not met, SKIP the record. When in doubt, SKIP.
+PER-DEPARTMENT SKIP (skip dept, continue to next):
+- Virtual Courts site error/blank → SKIP. Reason: "site error".
+- Popup "This number does not exist" → close popup → SKIP. Reason: "not found".
+- "No. of Records :- 0" → SKIP. Reason: "0 records".
+- ${isApp ? `CAPTCHA fails 7 times in app mode → SKIP. Reason: "captcha failed (app)". No wait_for_human.`
+            : `CAPTCHA fails 5 times AND wait_for_human also fails → SKIP. Reason: "captcha failed".`}
+- Any unexpected popup → close it → SKIP. Reason: "unexpected popup".
+- Stuck for 3+ steps with no visible progress → SKIP. Reason: "stuck".
 
-===
-SAFETY SAVE — STEP BUDGET
-===
-Maximum 100 steps. At step ~90 if not finished:
-1. Call save_challans (if not yet called AND you have challan data) with whatever you have.
-2. Call save_discounts for current department's unsaved records.
+PER-RECORD SKIP (silently, continue to next record on same page):
+- Header shows green "Paid" → already settled. paidSkipped++.
+- "Transferred to Regular Court" → must be paid physically. transferredSkipped++.
+- "Proceedings of the Challan is yet to be completed" (any color, any position) → no court ruling yet, nothing to extract. pendingSkipped++.
+- "Case Disposed" / "Disposed" → closed. disposedSkipped++.
+- "Warrant Issued" → cannot settle online. warrantSkipped++.
+- Fine OR Proposed Fine missing/non-numeric ("not dispatched", "—", "N/A", blank) → SKIP.
+
+When in doubt: SKIP. Never guess at numbers or invent text.
+</skip_conditions>
+
+<safety_save>
+Step budget: 100. At step ~90 if not finished:
+1. If save_challans not called and you have challan data → call it now.
+2. Call save_discounts for the current department's unsaved records.
 3. Call save_discounts for any unsaved Pay Now challans from Phase 2.5.
-4. Report partial completion.
-SAVING DATA > completing more departments.
+4. Emit final STATE block. End the task with "Status: partial".
+SAVING DATA > completing more departments. Always.
+</safety_save>
 
-===
-DATA INTEGRITY
-===
-1. Every challanId in a tool call must be unique. Remove duplicates before saving.
-2. Extract each record exactly once. Track by challan ID.
-3. Phase 2: each department saved independently. Never carry records across departments.
-4. Before every tool call: count IDs, confirm count = array length, remove duplicates.
+<rules_general>
+1. Do NOT call "done" until ALL phases are complete OR safety-save has fired.
+2. Read data by looking at the screen. NEVER use JavaScript / console / evaluate().
+3. Scroll through ALL results on every page. Check for pagination ("Next" button).
+4. Do NOT close tabs mid-workflow.
+5. If a department's page is unresponsive after 2 attempts → SKIP that dept. Don't waste steps on broken government sites.
+</rules_general>
 
-===
-GENERAL RULES
-===
-1. Do NOT call "done" until ALL phases complete OR safety-save triggers.
-2. Read data by looking at screen. NEVER use JavaScript or console.
-3. Scroll through ALL results. Check for pagination.
-4. When in doubt: do NOT click. Skip and move on.
-5. Do NOT close tabs mid-workflow.
-6. If a department's Virtual Courts page is unresponsive, errors out, or behaves unexpectedly after 2 attempts → SKIP that department entirely. Do NOT waste steps retrying broken government sites.
-${mobileChangeBlock}
-===
-PHASE 1 — DELHI TRAFFIC POLICE
-===
-Goal: Extract all challans for vehicle ${p.vehicleNumber}.
+${phase0MobileChangeBlock}
 
-STEP 1: Open https://traffic.delhipolice.gov.in/notice/pay-notice/
-  VERIFY: You see a page with "Vehicle Number" input field and "Search Details" button.
-  IF NOT: Page shows error/blank/maintenance → note "Delhi Traffic Police site down". Skip rest of Phase 1 (do NOT call save_challans).${hasExtraDepts ? ' Go to Phase 1.5 — there are database departments to query.' : ' Go to COMPLETION — nothing to query.'}
+<phase id="1" name="delhi_traffic_police">
+Goal: Extract every challan for vehicle ${p.vehicleNumber} from Delhi Traffic Police.
+
+STEP 1: Open https://traffic.delhipolice.gov.in/notice/pay-notice/ in a new tab.
+  VERIFY: page DELHI_TP_HOME is visible.
+  IF NOT (error/blank/maintenance) → note "Delhi Traffic Police site down". ${hasExtraDepts ? "Skip the rest of Phase 1, go to Phase 1.5 (DB departments still need to be queried)." : "Skip the rest of Phase 1, go to COMPLETION."}
 
 STEP 2: Type "${p.vehicleNumber}" in the "Vehicle Number" field. Click "Search Details".
 
 STEP 3: Wait for response.
-  ${otpBlock}
+  ${otpHandlingBlock}
 
-STEP 4: VERIFY: Results table is now visible with challan rows.
-  ${zeroChallanInstruction}
+STEP 4: VERIFY: results table is visible (page DELHI_TP_RESULTS).
+  ${zeroChallanBranch}
 
-STEP 5: Extract EVERY challan row. For each row, read:
-  - Challan ID (the full number, e.g. "DL19016240430095546" or "57693177")
-  - Offence description (the text describing what the violation was)
-  - Fine amount (number in ₹)
-  - Date (convert to YYYY-MM-DD)
-  - Status column: check if it says "Pending for Payment" (these rows have a "Pay Now" button in the Make Payment column instead of "Virtual Court"). Note this status — you will need it later.
+STEP 5: Extract EVERY challan row using the field-source map for DELHI_TP_RESULTS:
+  - challanId, offence, amount, date, status
 
-STEP 6: Handle zero/missing amounts using DEFAULT OFFENCE PRICES:
-  If a challan has amount = 0 or amount is missing, determine the amount from the offence:
-  - Offence contains "red light" (case-insensitive, partial match) → amount = 5000
-  - Offence contains "permit" → amount = 10000
-  - Offence contains "parking" → amount = 500
-  - Offence contains "over speed" OR "overspeed" → amount = 2000
-  - Any other offence with 0/missing amount → SKIP that row entirely.
-  Use the FIRST keyword match if multiple match.
+STEP 6: Handle zero/missing amount using the pricing_table:
+  - If amount is 0 or missing AND offence matches a pricing keyword → use the keyword price.
+  - If amount is 0 or missing AND no keyword matches → SKIP that row.
+  - If amount is positive → keep it as-is. Do NOT override with the keyword price.
 
-STEP 7: Scroll down fully. Check if there are more rows or a "Next" pagination button. Extract all remaining rows the same way.
+STEP 7: Scroll fully. If pagination exists, navigate it and extract remaining rows the same way.
 
-STEP 8: Verify your data: count unique challanIds, confirm no duplicates.
+STEP 8: Verify: count(unique challanIds) === array.length. Deduplicate.
 
-STEP 9: If you extracted 1 or more challans → call save_challans EXACTLY once with ALL challans as a JSON array.
-  Format: [{"challanId":"DL19016240430095546","offence":"Red Light Violation","amount":5000,"date":"2024-06-15"}]
-  Include BOTH "Sent to Virtual Court" AND "Pending for Payment" challans in save_challans — ALL challans get saved here.
-  WAIT for the response. Read it. Update LEDGER: save_challans → CONFIRMED (saved=N).
-  If you extracted 0 challans → skip save_challans. Follow the zero-challan instruction from Step 4. Update LEDGER: save_challans → SKIPPED (0 challans).
+STEP 9: If you have ≥1 challan → call save_challans EXACTLY ONCE with the full array.
+  Format: [{"challanId":"DL19016240430095546","offence":"Red Light Jumping","amount":5000,"date":"2024-06-15"}, ...]
+  INCLUDE both "Pay Now" and "Virtual Court" challans here.
+  Wait for response. Confirm "ok": true. Update STATE: save_challans → CONFIRMED (saved=N).
+  If 0 challans → skip save_challans.
 
-STEP 10: Build a separate list called payNowChallans containing ONLY the challans whose Status was "Pending for Payment" (the ones with "Pay Now" button).
-  For each such challan, record: {"challanId": "<id>", "discountAmount": <amount>, "originalAmount": <amount>}
-  NOTE: For "Pay Now" challans, discountAmount = originalAmount (the full fine amount). These challans are NOT sent to Virtual Courts, so there is no court-determined discount. The settlement amount equals the original fine.
-  Keep this list — you will use it in Phase 2.5.
+STEP 10: Build payNowChallans (used in Phase 2.5):
+  Filter the challans you just extracted: keep only those whose Status = "Pending for Payment" (the "Pay Now" button rows).
+  For each such challan, build {challanId, discountAmount: amount, originalAmount: amount}.
+  These have no court reduction — settlement amount equals original fine.
 
-===
-PHASE 1.5 — DETERMINE DEPARTMENTS (logic only, no browser)
-===
-Do NOT open any website. This is pure logic.
+EMIT STATE block before leaving Phase 1.
+</phase>
 
-CONDITIONAL: Include "Delhi(Notice Department)" ONLY if Phase 1 (Delhi Traffic Police) returned 1 or more challans.
-Delhi Notice Department contains discount/settlement data for the same challans found on Delhi Traffic Police. If Delhi TP returned 0 challans, there is nothing to look up in Notice Department — do NOT add it.
+<phase id="1.5" name="determine_departments">
+LOGIC ONLY. Do NOT open any website here.
 
-Additionally, look at your extracted challan IDs to determine OTHER departments to query:
-- ID starts with 2 uppercase letters → use as state code (see mapping below).
-- ID starts with digit or is all digits → Delhi(Notice Department).
+Build a UNIQUE list of departments to query on Virtual Courts:
 
-STATE CODE → DEPARTMENT:
-  DL → Delhi(Traffic Department)
-  HR → Haryana(Traffic Department)
-  UP → Uttar Pradesh(Traffic Department)
-  CH → Chandigarh(Traffic Department)
-  RJ → Rajasthan(Traffic Department)
-  PB → Punjab(Traffic Department)
-  MP → Madhya Pradesh(Traffic Department)
-  MH → Maharashtra(Transport Department)
-  GJ → Gujarat(Traffic Department)
-  KA → Karnataka(Traffic Department)
-  HP → Himachal Pradesh(Traffic Department)
-  UK → Uttarakhand(Traffic Department)
-  CG → Chhattisgarh(Traffic Department)
-  JK → Jammu and Kashmir(Jammu Traffic Department)
-  AS → Assam(Traffic Department)
-  KL → Kerala(Police Department)
-  TN → Tamil Nadu(Traffic Department)
-  AP → Andhra Pradesh(Traffic Department)
-  TS/TG → Telangana(Traffic Department)
-  BR → Bihar(Traffic Department)
-  JH → Jharkhand(Traffic Department)
-  OD → Odisha(Traffic Department)
-  WB → West Bengal(Traffic Department)
-  GA → Goa(Traffic Department)
-  Other 2-letter code → find matching state in Virtual Courts dropdown.
-${extraDeptInPhase15}
-Build a UNIQUE department list. Note it down:
-  "Departments: [list]"
-  "Current index: 0"
-  "Pay Now challans to save in Phase 2.5: [count]"
+A. From your Phase 1 challan IDs:
+   - Starts with 2 uppercase letters → use as state code (mapping below).
+   - Starts with digit / all digits → Delhi(Notice Department).
+   - INCLUDE "Delhi(Notice Department)" ONLY if Phase 1 returned ≥1 challan. If Phase 1 returned 0, do NOT include Notice Dept (nothing to look up there).
 
-Initialize LEDGER entries for each department:
-  - <dept_1>: NOT_CALLED
-  - <dept_2>: NOT_CALLED
-  - ...
+B. State code → department:
+  DL → Delhi(Traffic Department)        |  HR → Haryana(Traffic Department)
+  UP → Uttar Pradesh(Traffic Department)|  CH → Chandigarh(Traffic Department)
+  RJ → Rajasthan(Traffic Department)    |  PB → Punjab(Traffic Department)
+  MP → Madhya Pradesh(Traffic Department)| MH → Maharashtra(Transport Department)
+  GJ → Gujarat(Traffic Department)      |  KA → Karnataka(Traffic Department)
+  HP → Himachal Pradesh(Traffic Department)| UK → Uttarakhand(Traffic Department)
+  CG → Chhattisgarh(Traffic Department) |  JK → Jammu and Kashmir(Jammu Traffic Department)
+  AS → Assam(Traffic Department)        |  KL → Kerala(Police Department)
+  TN → Tamil Nadu(Traffic Department)   |  AP → Andhra Pradesh(Traffic Department)
+  TS/TG → Telangana(Traffic Department) |  BR → Bihar(Traffic Department)
+  JH → Jharkhand(Traffic Department)    |  OD → Odisha(Traffic Department)
+  WB → West Bengal(Traffic Department)  |  GA → Goa(Traffic Department)
+  Any other 2-letter code → find matching state in the Virtual Courts dropdown.
+${extraDeptsBlock}
 
-===
-PHASE 2 — VIRTUAL COURTS (one department at a time)
-===
-For each department in your list, follow Steps A→B→C→D→E below. Each department is independent.
+C. Combine, deduplicate. Initialize STATE with each dept = PENDING.
+</phase>
 
---- STEP A — Navigate to Virtual Courts and select department ---
+<phase id="2" name="virtual_courts_per_department">
+For EACH department in the list, do Step A → B → C → D → E. Each department is independent. Do NOT carry records across departments.
 
-1. Go to https://vcourts.gov.in/virtualcourt/index.php
-   VERIFY: You see "VIRTUAL COURTS" header, a "Select Department" dropdown, and a "Proceed Now" button.
-   IF NOT visible (error, blank page) → SKIP this department. Update LEDGER: <dept> → SKIPPED (site error).
-
-2. CRITICAL: Do NOT click any sidebar tab yet. The sidebar tabs (Mobile Number, CNR Number, Party Name, Challan/Vehicle No.) are NOT functional on this page. They only work AFTER you select a department and click Proceed.
-
-3. Click the "Select Department" dropdown. Find and select the current department from the list.
-   VERIFY: The dropdown now shows your selected department name.
-
+--- STEP A — Open Virtual Courts and select department ---
+1. Go to https://vcourts.gov.in/virtualcourt/index.php (page VC_HOME).
+   VERIFY VC_HOME visuals. If error/blank → SKIP this dept (site error).
+2. Do NOT click sidebar tabs yet — they don't work on VC_HOME.
+3. Click the "Select Department" dropdown. Select the current department.
+   VERIFY: dropdown shows the selected name.
 4. Click "Proceed Now".
-   VERIFY: The page reloads. The header now shows the selected department name (e.g., "Delhi(Traffic Department)" in the top bar). You should now see a search form area.
-   IF the page doesn't change or shows an error → SKIP this department. Update LEDGER: <dept> → SKIPPED (proceed failed).
+   VERIFY: page transitioned to VC_SEARCH (header shows the department name).
+   IF page didn't change or error appeared → SKIP. STATE: dept → SKIPPED (proceed_failed).
 
---- STEP B — Search for vehicle ---
+--- STEP B — Search ---
+PREREQUISITE: VC_SEARCH header MUST show your department name. If it still says "--- Select ---", Step A is incomplete.
 
-PREREQUISITE CHECK: The page header MUST show your department name. If it still says "--- Select ---" or shows the home page, you did NOT complete Step A. Go back to Step A.
-
-1. VERIFY: You see the left sidebar with tabs. Click the "Challan/Vehicle No." tab.
-   VERIFY: The form now shows "Challan Number" and "Vehicle Number" fields, a CAPTCHA image, and "Submit" button.
-
+1. Click the "Challan/Vehicle No." tab.
+   VERIFY: form now shows "Challan Number", "Vehicle Number", CAPTCHA image, "Enter Captcha" field, Submit.
 2. Type "${p.vehicleNumber}" in the "Vehicle Number" field.
+3. Read the CAPTCHA image. Type the answer in "Enter Captcha".
+4. Click Submit.
 
-3. Read the CAPTCHA image carefully. Type the answer in the "Enter Captcha" field.
-
-4. Click "Submit".
-
-5. AFTER EVERY SUBMIT — do this UNIVERSAL CHECK before anything else:
-   ┌─────────────────────────────────────────────────────────────────────────┐
-   │ LOOK AT THE PAGE RIGHT NOW. Ask yourself: "Can I see 'No. of Records'   │
-   │ text anywhere on this page?"                                            │
-   │                                                                         │
-   │ → YES, you see "No. of Records :- N" (any number)                       │
-   │   CAPTCHA WAS SOLVED. Results are here. GO TO STEP C NOW.               │
-   │   Do NOT re-enter captcha. Do NOT call wait_for_human.                  │
-   │   Do NOT do anything else. Proceed directly to Step C.                  │
-   │                                                                         │
-   │ → NO, you see a popup instead:                                          │
-   │   - "This number does not exist" → close popup → SKIP dept.             │
-   │     Update LEDGER: <dept> → SKIPPED (not found).                        │
-   │   - "Invalid Captcha" → close popup → CAPTCHA RETRY below.              │
-   │   - Any other popup → close it → SKIP this department.                  │
-   │     Update LEDGER: <dept> → SKIPPED (unexpected popup).                 │
-   │                                                                         │
-   │ → NO, no popup and no results → wait 3 seconds, check again.            │
-   │   If still nothing after 3 seconds → SKIP this department.              │
-   │   Update LEDGER: <dept> → SKIPPED (no response).                        │
-   └─────────────────────────────────────────────────────────────────────────┘
+5. UNIVERSAL_CHECK — run this AFTER EVERY Submit click. Look at the page right now:
+   - Do you see "No. of Records" text? → CAPTCHA was solved. Stop CAPTCHA flow. Go to Step C.
+   - Popup "This number does not exist"? → close it. SKIP dept (not found).
+   - Popup "Invalid Captcha"? → close it. Go to captcha_retry_policy.
+   - Other popup? → close it. SKIP dept (unexpected popup).
+   - No popup, no results? → wait 3 seconds, check again. If still nothing → SKIP dept (no response).
 
 ${captchaRetryBlock}
 
---- STEP C — Extract discount records ---
+--- STEP C — Extract this department's records ---
 
-PREREQUISITE CHECK: You MUST see "No. of Records :- N" text on the page. If you don't see this, Step B did not complete successfully. SKIP this department.
+PREREQUISITE: "No. of Records :- N" text MUST be visible. If not, Step B did not finish — SKIP.
 
-Start with empty list: thisDeptRecords = []
-Set counters: paidSkipped = 0, transferredSkipped = 0, pendingSkipped = 0
+If "No. of Records :- 0" → STATE: dept → SKIPPED (0 records). Go to Step E.
 
-CHECK: "No. of Records :- 0" → SKIP this department (no save needed). Update LEDGER: <dept> → SKIPPED (0 records).
-Otherwise, records are visible. Extract them:
+Initialize: thisDeptRecords = []
+Counters: paidSkipped = transferredSkipped = pendingSkipped = disposedSkipped = warrantSkipped = 0
 
 FOR EACH numbered record on the page (1, 2, 3, ...):
 
-  1. READ THE ENTIRE RECORD HEADER AND STATUS AREA FIRST. Look for ANY of these disqualifying indicators:
-     - Green "Paid" badge → paidSkipped += 1. SKIP entire record. Next record.
-     - "Transferred to Regular Court" text/badge → transferredSkipped += 1. SKIP entire record. Next record.
-     - "Proceedings of the Challan is yet to be completed" text (yellow/orange/any color) → pendingSkipped += 1. SKIP entire record. Next record. This means the court has not started proceedings — there is NO discount data to extract.
-     - "Case Disposed" or "Disposed" → SKIP entire record. Next record.
-     - "Warrant Issued" → SKIP entire record. Next record.
+  1. Read the header bar and any badges/status text on the entire record FIRST. Apply PER-RECORD SKIP rules from skip_conditions. If the record qualifies for skip → increment the matching counter, move to the next record.
 
-     *** CRITICAL: If you see ANY status text or badge beyond just the Case No./Challan No./Party Name/Mobile No., READ IT CAREFULLY. If it indicates the challan is paid, pending, transferred, disposed, or otherwise not actionable — SKIP. Only proceed if the record is clearly unpaid and has completed proceedings (i.e., you can see the offence details table with Fine and Proposed Fine). ***
+  2. VERIFY: you can see the offence detail table with columns [Offence Code | Offence | Act/Section | Fine] AND a "Proposed Fine" row below it.
+     IF NOT visible → SKIP this record (proceedings incomplete).
 
-  2. VERIFY: Below the header, you can see an offence details table with columns: Offence Code, Offence, Act/Section, Fine. And below that table, "Proposed Fine" with a number.
-     IF you do NOT see this table or "Proposed Fine" → SKIP this record (proceedings incomplete).
+  3. Apply field-source map for VC_RESULTS:
+       challanId         ← Challan No. from the HEADER BAR
+       offenceText       ← Column 2 (Offence) of the detail table
+       fineNumber        ← Column 4 (Fine) — RIGHTMOST column. Per R1, NEVER take Column 1 (Offence Code).
+       proposedFineNumber ← The number on the RIGHT of "Proposed Fine" row.
 
-  3. From the header bar, read: Challan No. → challanId
-
-  4. *** CRITICAL MENTAL MODEL — READ ONCE, INTERNALIZE, NEVER VIOLATE ***
-
-     The field name "discountAmount" is misleading. It does NOT mean "the size of the reduction
-     the court gave". It means "the settlement price the user must pay" — the literal number
-     shown on the page right now.
-
-     On Virtual Courts:
-       - "Fine" (rightmost column in the offence table) and
-       - "Proposed Fine" (line below the offence table)
-     ALMOST ALWAYS display the SAME NUMBER. That number IS discountAmount. You COPY it. Verbatim.
-
-     WORKED EXAMPLES (memorize the pattern):
-       Page shows Fine=2000, Proposed Fine=2000 → discountAmount = 2000   (NOT 0)
-       Page shows Fine=1000, Proposed Fine=1000 → discountAmount = 1000   (NOT 0)
-       Page shows Fine=300,  Proposed Fine=300  → discountAmount = 300    (NOT 0)
-       Page shows Fine=0,    Proposed Fine=0    → discountAmount = 0      (only if literally 0 on page)
-
-     PROHIBITED REASONING (these are all WRONG and will get this record dropped):
-       ✗ "discount = original − settlement = 2000 − 2000 = 0"
-       ✗ "The court did not reduce the fine, so the discount is 0"
-       ✗ "Original was 2000 from Phase 1, settlement is 2000, so discountAmount = 0"
-       ✗ "Discount means reduction, and there is no reduction, so 0"
-
-     CORRECT REASONING (the only acceptable form):
-       ✓ "Page shows Proposed Fine = 2000. discountAmount = 2000."
-
-     The fact that discountAmount sometimes equals originalAmount is NORMAL and EXPECTED.
-     Save it anyway. It is not redundant. It is not zero. Copy the number on screen.
-
-  5. EXTRACT this record:
-     - Read "Offence" column text → offenceText
-     - Read "Fine" column (rightmost) → fineNumber  (the digits you see on screen)
-     - Read "Proposed Fine" below the table → proposedFineNumber  (the digits you see on screen)
-
-  6. CROSS-CHECK READING (mandatory — catches misreads):
-     a. Both must be readable integers. If either is blank, "—", "N/A", or non-numeric → SKIP this record.
-     b. fineNumber MUST equal proposedFineNumber.
-        If unequal → re-read both fields ONCE more on screen.
-        If still unequal after re-read → SKIP this record. Do NOT invent. Do NOT compromise.
+  4. CROSS-CHECK READING:
+     a. fineNumber and proposedFineNumber must both be readable integers. If either is "—", "N/A", blank, or non-numeric → SKIP this record.
+     b. fineNumber MUST equal proposedFineNumber on Virtual Courts (almost always true).
+        If unequal → re-read both ONCE on screen. Still unequal → SKIP this record. Do NOT invent.
      c. Set discountAmount = proposedFineNumber.
 
-  7. ANTI-ZERO RE-READ (mandatory whenever discountAmount comes out as 0):
-     IF discountAmount == 0:
-       a. STOP. Do NOT add this record yet.
-       b. Look at "Proposed Fine" on the page ONCE MORE. Read the digits carefully, left to right.
-       c. Decide which case applies:
-          • The page LITERALLY shows the single digit "0" (zero) for Proposed Fine
-            → keep discountAmount = 0. This is rare but legitimate. Mark this record as
-              "verified-zero" in your working memory. Continue to step 8.
-          • The page shows a number like 100, 300, 500, 1000, 2000, etc.
-            → you misread on the first pass. UPDATE discountAmount to the correct number you
-              just re-read. Continue to step 8.
-          • You cannot tell (faded, overlapping, hidden, ambiguous)
-            → SKIP this record entirely. Do not guess.
-       d. You are FORBIDDEN from writing discountAmount=0 because "the court did not reduce
-          the fine". A reduction of zero is NOT the same as a settlement of zero. They are
-          completely different concepts. Do not confuse them.
+  5. ANTI-ZERO RE-READ (only if discountAmount = 0):
+     a. STOP. Do not add yet.
+     b. Re-read "Proposed Fine" digit by digit, left to right.
+     c. Three cases:
+        • Page LITERALLY shows the digit "0" alone → keep discountAmount = 0. Mark this record verified-zero.
+        • Page shows a real number (100, 300, 500, 1000, 2000, ...) → you misread first time. Update discountAmount.
+        • Cannot tell (faded/overlapping/ambiguous) → SKIP this record.
+     d. Per R2, you are FORBIDDEN from writing 0 because "the court did not reduce the fine". That is a different concept from "settlement is 0".
 
-  8. DETERMINE originalAmount using OFFENCE-BASED OVERRIDE:
-     The screen "Fine" on Virtual Courts reflects the court ruling, not the original ticket fine.
-     For known offences, use these fixed original amounts:
-       - offenceText contains "red light" (case-insensitive) → originalAmount = 5000
-       - offenceText contains "permit" (case-insensitive)    → originalAmount = 10000
-       - offenceText contains "parking" (case-insensitive)   → originalAmount = 500
-       - offenceText contains "over speed" OR "overspeed"    → originalAmount = 2000
-       - Any other offence → originalAmount = fineNumber
-     Use partial matching. First keyword match wins.
+  6. DETERMINE originalAmount via pricing_table:
+       - If offenceText matches a pricing keyword → originalAmount = keyword price.
+       - Else → originalAmount = fineNumber.
 
-     EXAMPLE A (court kept the full fine — common case):
-       offenceText = "LIMITS OF SPEED: OVERSPEED", fineNumber = 2000, proposedFineNumber = 2000
-       → "overspeed" matches → originalAmount = 2000
-       → discountAmount = 2000 (from step 6c, NOT 0)
-       → Save: {"challanId":"...","originalAmount":2000,"discountAmount":2000}
+  7. APPLY R3:
+       - If discountAmount > originalAmount → DROP this record entirely. Log the drop. Do NOT add to thisDeptRecords.
 
-     EXAMPLE B (court reduced the fine):
-       offenceText = "Improper or obstructing parking", fineNumber = 300, proposedFineNumber = 300
-       → "parking" matches → originalAmount = 500
-       → discountAmount = 300
-       → Save: {"challanId":"...","originalAmount":500,"discountAmount":300}
+  8. If challanId not already in thisDeptRecords → push {challanId, originalAmount, discountAmount}.
 
-     EXAMPLE C (red light kept at full):
-       offenceText = "DRIVING DANGEROUSLY: RED LIGHT JUMPING", fineNumber = 1000, proposedFineNumber = 1000
-       → "red light" matches → originalAmount = 5000
-       → discountAmount = 1000 (the court reduced from 5000 to 1000)
-       → Save: {"challanId":"...","originalAmount":5000,"discountAmount":1000}
+After processing visible records: scroll to check for more / pagination. Process additional records the same way.
 
-  9. If this challanId is NOT already in thisDeptRecords → add:
-     {"challanId": challanId, "originalAmount": originalAmount, "discountAmount": discountAmount}
-
-AFTER processing all visible records: scroll down to check for more records or pagination. Process any additional records the same way.
-
-ONCE ALL RECORDS ARE EXTRACTED → you MUST proceed to Step D to save them. Do NOT skip Step D.
-
-ABSOLUTE PROHIBITIONS IN STEP C:
-- NEVER click "View" button on any record. The data is visible without it.
-- NEVER click any link or button in the results area.
+ABSOLUTE PROHIBITIONS in Step C:
+- NEVER click "View" on any record. The data is visible without it.
+- NEVER click any other button or link in the results area.
 - ONLY scroll and read.
 
---- STEP D — SAVE THIS DEPARTMENT'S DISCOUNTS (MANDATORY) ---
+--- STEP D — Save this department's discounts ---
 
-*** CRITICAL: You MUST complete this step before moving to the next department. ***
-*** Extracting data without saving it is USELESS. The whole point of Phase 2 is to call save_discounts. ***
-*** THIS IS THE MOST IMPORTANT STEP. If you skip this, all extraction work is wasted. ***
+You MUST complete this step BEFORE moving to the next department. Extracting without saving is wasted work.
 
-0. PRE-FLIGHT VALIDATION (mandatory — catches anti-zero violations from Step C):
+1. PRE-FLIGHT validation on thisDeptRecords:
+   For each {challanId, originalAmount, discountAmount}:
+     a. challanId is non-empty.
+     b. originalAmount > 0.
+     c. discountAmount = 0 → must be marked verified-zero (from Step C item 5). Otherwise DROP. Log the drop.
+     d. discountAmount > originalAmount → DROP. Log the drop.
 
-   Walk every record currently in thisDeptRecords. For each {challanId, originalAmount, discountAmount}:
+2. After validation:
+     - thisDeptRecords empty → STATE: dept → SKIPPED (no valid records). Go to Step E.
+     - Otherwise: deduplicate by challanId; verify count = length.
 
-     a. Both must be numbers.
-     b. originalAmount must be > 0.
-     c. If discountAmount == 0:
-        Recall: in Step C item 7, did you explicitly mark this record as "verified-zero"
-        (i.e., you re-read "Proposed Fine" on the page and confirmed it literally showed "0")?
-        - YES, marked verified-zero → keep this record.
-        - NO, not marked → DROP this record from thisDeptRecords.
-          Log: "[<dept>] dropped <challanId>: discount=0 not verified on screen"
-     d. If discountAmount > originalAmount → log
-        "[<dept>] WARNING <challanId>: discount=<n> exceeds original=<n>"
-        but keep the record.
+3. Call save_discounts with thisDeptRecords as the data parameter.
+   Format: [{"challanId":"57768591","discountAmount":300,"originalAmount":500}, ...]
 
-   AFTER walking the list:
-     - If thisDeptRecords is now empty → treat as "no valid records".
-       Update LEDGER: <dept> → SKIPPED (no valid records after pre-flight).
-       Move to Step E.
-     - Otherwise → continue to step 1 below.
+4. WAIT for response. READ it. Confirm "ok": true.
+   - "ok": true → STATE: dept → CONFIRMED (saved=N).
+   - "ok": false → retry once with the same data. If still failing → STATE: dept → FAILED (error: ...).
 
-1. If thisDeptRecords is empty → note "[department] — no valid unpaid records (paidSkipped={n}, transferredSkipped={n}, pendingSkipped={n})". Update LEDGER: <dept> → SKIPPED (no valid records). Move to Step E.
+--- STEP E — Gate check before next department ---
 
-2. If thisDeptRecords has 1 or more records:
-   a. Deduplicate by challanId. Remove any duplicates.
-   b. Verify count of unique challanIds = array length.
-   c. YOU MUST CALL save_discounts NOW with thisDeptRecords as the data parameter.
-      Format: [{"challanId":"57768591","discountAmount":300,"originalAmount":500}]
+You CANNOT advance until ALL of these are true:
+  - Either you skipped this dept (then OK), or you called save_discounts and got "ok": true.
+  - STATE for this dept is CONFIRMED, SKIPPED, or FAILED — NEVER still PENDING.
 
-   d. WAIT for the tool response. Do NOT proceed until you see the JSON response.
-   e. READ the response. It must contain "ok": true.
-      - If "ok": true → Update LEDGER: <dept> → CONFIRMED (matched=N, created=N).
-        Note: "[department] — saved {n} discount records. Tool response confirmed."
-      - If "ok": false → Note the error. Retry the call once with the same data.
-        If retry also fails → Update LEDGER: <dept> → FAILED (error: ...).
-
-3. ONLY AFTER you have updated the LEDGER with CONFIRMED or FAILED → move to Step E.
-
---- STEP E — VERIFY BEFORE NEXT DEPARTMENT (GATE CHECK) ---
-
-*** You CANNOT proceed to the next department until this gate passes. ***
-
-ASK YOURSELF THESE QUESTIONS:
-  Q1: "Did I extract records from this department?" → If YES, go to Q2. If NO (skipped), gate passes.
-  Q2: "Did I call save_discounts for this department?" → If YES, go to Q3. If NO → STOP. Go back to Step D.
-  Q3: "Did I receive a confirmed response (ok: true) from save_discounts?" → If YES, gate passes. If NO → STOP. Go back to Step D.
-  Q4: "Is this department marked CONFIRMED or SKIPPED in my LEDGER?" → If YES, gate passes. If still NOT_CALLED → STOP. Go back to Step D.
-
-GATE PASSED → Move to next department. Print current LEDGER state.
-GATE FAILED → You MUST call save_discounts before continuing. This is non-negotiable.
+If any check fails → go back to Step D and finish the save NOW.
+If all checks pass → emit current STATE block, move to next department.
 
 --- END FOR EACH DEPARTMENT ---
+</phase>
 
-===
-PHASE 2.5 — SAVE DISCOUNTS FOR "PAY NOW" CHALLANS
-===
-CONTEXT: Challans with "Pending for Payment" status (the ones with "Pay Now" button) on Delhi Traffic Police
-are NOT present on Virtual Courts — they have no court-determined discount. For these challans, the settlement
-amount (discount) equals the original fine amount, because the driver must pay the full penalty directly.
+<phase id="2.5" name="save_pay_now_discounts">
+Pay Now challans (Phase 1 Step 10 list) are NOT on Virtual Courts. They have no court reduction — settlement = original fine.
 
-You built the payNowChallans list in Phase 1 Step 10.
+1. If payNowChallans is empty → STATE: pay_now → SKIPPED (0 entries). Go to Phase 3.
 
-1. If payNowChallans is empty → note "No Pay Now challans to save". Update LEDGER: Pay Now → SKIPPED (0 challans). Skip to PHASE 3 — RECONCILIATION.
+2. Otherwise:
+   a. Deduplicate by challanId.
+   b. Remove any challanId that you ALREADY saved in Phase 2 (cross-check the records you sent to save_discounts in any department).
+   c. PRE-FLIGHT each entry:
+      - discountAmount > 0. If 0 → DROP. (Pay Now challans always have positive fine.) Log.
+      - discountAmount === originalAmount. If unequal → DROP. (No court reduction means they must match.) Log.
+   d. After dropping: if list empty → STATE: pay_now → SKIPPED (no valid entries). Go to Phase 3.
+   e. Verify count(unique challanIds) === array.length.
+   f. Call save_discounts with the cleaned list.
+      Format: [{"challanId":"41374772","discountAmount":2000,"originalAmount":2000}, ...]
+   g. WAIT for response. Confirm "ok": true → STATE: pay_now → CONFIRMED (saved=N). Else retry once. Still failing → FAILED.
+</phase>
 
-2. If payNowChallans has 1 or more entries:
-   a. Deduplicate by challanId. Remove any duplicates.
-   b. Remove any challanId that was ALREADY saved in Phase 2 (cross-check against the
-      records you sent to save_discounts in any department).
-   c. PRE-FLIGHT: walk every entry. For each:
-      - Confirm discountAmount > 0. If 0 → DROP this entry. Pay Now challans always have a
-        positive fine; a 0 here is a bug.
-        Log: "Pay Now dropped <challanId>: discount=0"
-      - Confirm discountAmount === originalAmount (Pay Now challans have no court reduction,
-        so they MUST be equal). If they differ → DROP this entry.
-        Log: "Pay Now dropped <challanId>: discount=<n> != original=<n>"
-   d. After dropping: if list is empty → Update LEDGER: Pay Now → SKIPPED (no valid entries).
-      Skip to PHASE 3. Otherwise continue.
-   e. Verify count of unique challanIds = array length.
-   f. Call save_discounts with the cleaned payNowChallans list.
-      Format: [{"challanId":"41374772","discountAmount":2000,"originalAmount":2000}]
-   g. WAIT for the tool response. READ it. Confirm "ok": true.
-      - If "ok": true → Update LEDGER: Pay Now → CONFIRMED (saved=N).
-      - If "ok": false → Retry once. If retry fails → Update LEDGER: Pay Now → FAILED.
-   h. Note: "Pay Now challans — saved {n} discount records. Tool response confirmed."
+<phase id="3" name="reconciliation">
+Mandatory before COMPLETION. Do NOT skip.
 
-===
-PHASE 3 — RECONCILIATION (MANDATORY — do NOT skip)
-===
-Before reporting completion, you MUST perform this reconciliation check.
+STEP 1: Print full STATE block.
 
-STEP 1: Print your complete LEDGER:
-  "=== RECONCILIATION ==="
-  "save_challans: [status]"
-  "save_discounts:"
-  "  - <dept_1>: [status]"
-  "  - <dept_2>: [status]"
-  "  - ..."
-  "  - Pay Now: [status]"
+STEP 2: For each entry, check:
+  - CONFIRMED → OK.
+  - SKIPPED → OK (the reason is recorded).
+  - FAILED → note in final report.
+  - PENDING → BUG. You extracted records but never confirmed save. Go back and call save_discounts NOW. Do NOT proceed to COMPLETION until 0 PENDING entries remain (for departments that had data).
 
-STEP 2: For each LEDGER entry, check:
-  - If status is CONFIRMED → OK. No action needed.
-  - If status is SKIPPED → OK. No action needed (department had no data or was unreachable).
-  - If status is FAILED → Note in final report as a failure.
-  - If status is NOT_CALLED → *** BUG DETECTED ***
-    This means you extracted records but never saved them. You MUST go back and call save_discounts NOW.
-    Do NOT proceed to COMPLETION until all NOT_CALLED entries with extracted data are resolved.
+STEP 3: Count: confirmed_depts, skipped_depts, failed_depts, pending_depts. pending_depts MUST be 0.
+</phase>
 
-STEP 3: Count:
-  - Total departments with CONFIRMED saves
-  - Total departments SKIPPED
-  - Total departments FAILED
-  - Total departments NOT_CALLED (should be 0 — if not 0, fix it)
+<completion>
+Only call "done" when:
+  ✓ Phase 3 reconciliation passed (0 PENDING).
+  ✓ save_challans is CONFIRMED or SKIPPED.
+  ✓ Every dept is CONFIRMED, SKIPPED, or FAILED.
+  ✓ pay_now is CONFIRMED, SKIPPED, FAILED, or n/a.
+  ✓ If anything is still PENDING with extracted data → call the tool NOW.
 
-STEP 4: Only proceed to COMPLETION if there are ZERO NOT_CALLED entries (for departments that had extracted data).
+STATUS DECISION — this is deterministic. Walk it strictly. Do NOT pick "complete" optimistically.
 
-===
-COMPLETION
-===
-BEFORE reporting, verify this checklist:
-  ✓ PHASE 3 RECONCILIATION passed with zero NOT_CALLED entries
-  ✓ save_challans LEDGER entry is CONFIRMED or SKIPPED
-  ✓ Every department's LEDGER entry is CONFIRMED, SKIPPED, or FAILED (never NOT_CALLED with data)
-  ✓ Pay Now LEDGER entry is CONFIRMED, SKIPPED, or FAILED (never NOT_CALLED with data)
-  ✓ If ANY entry is still NOT_CALLED with extracted data → GO BACK AND CALL THE TOOL NOW
+Skip reasons fall into two categories:
 
-Report this summary:
-${hasMobileChange ? "Mobile number change: [success/failure/skipped — last 4 matched]" : ""}
-Challans found (Delhi Traffic Police): [count]
-Challans saved: [count]
-Pay Now challans (Pending for Payment): [count]
-Departments queried: [list]
-Departments skipped: [list with reasons]
-Discount records saved per department: [name: count (CONFIRMED/FAILED), ...]
-Pay Now discount records saved: [count (CONFIRMED/FAILED)]
-Paid challans skipped: [total]
-Transferred-to-court challans skipped: [total]
-Pending-proceedings challans skipped: [total]
-Total discount records saved: [total across all departments + Pay Now]
-LEDGER FINAL STATE: [print full ledger]
-Status: [complete / partial — reason]
+  LEGITIMATE skips (data genuinely not there — these alone do NOT make the task partial):
+    - "0 records"           (the dept has no records for this vehicle)
+    - "not found"           (popup said "This number does not exist" — vehicle not in this dept)
+    - "no valid records"    (all records were paid / disposed / transferred / pending-proceedings)
+    - "0 challans"          (Phase 1 zero-result, no DTP data exists)
+    - "0 entries"           (Pay Now list was empty)
+    - "no valid entries"    (Pay Now entries all dropped at pre-flight, e.g. amount mismatch)
+
+  FAILURE skips (something broke — these FORCE partial):
+    - "site error"               (Virtual Courts didn't load / blank / error page)
+    - "site down"                (Delhi Traffic Police site down)
+    - "captcha failed"           (5 web attempts + human help failed)
+    - "captcha failed (app)"     (7 app attempts, no human help possible)
+    - "captcha_failed_app"       (same)
+    - "proceed_failed"           (Proceed Now didn't transition the page)
+    - "no response"              (page never responded after Submit)
+    - "unexpected popup"         (a popup we don't recognize appeared)
+    - "stuck"                    (3+ steps with no progress)
+    - any other reason that contains the word "failed" or "error"
+
+DECISION RULES (in priority order — first match wins):
+
+  RULE 1: If ANY entry in STATE is FAILED → Status: partial
+          (a save call failed after retry → the data is lost)
+
+  RULE 2: If ANY dept in STATE is SKIPPED with a FAILURE reason (see list above) → Status: partial
+          (we couldn't query that dept, so the user's discount data may be incomplete — they need to know)
+
+  RULE 3: If save_challans is FAILED → Status: partial
+          (challans may be lost; downstream is corrupt)
+
+  RULE 4: If pay_now is FAILED → Status: partial
+
+  RULE 5: If any dept in STATE is still PENDING with extracted data → Status: partial AND go back to call save_discounts
+          (you forgot to save — should never happen if you followed Phase 2 Step E gate, but if it slipped, this catches it)
+
+  RULE 6: Otherwise → Status: complete
+
+Final report (free-form, but include all of these):
+${hasMobileChange ? "- Mobile number change: success / failure / skipped (last 4 matched)" : ""}
+- Challans found on Delhi Traffic Police: <count>
+- Challans saved (save_challans): <count>
+- Pay Now challans (Pending for Payment): <count>
+- Departments queried: <list>
+- Departments skipped — LEGITIMATE: <list with reason>
+- Departments skipped — FAILURE: <list with reason>   ← if any entry here, Status MUST be partial
+- Discount records saved per dept: <dept: count [CONFIRMED/FAILED]>, ...
+- Pay Now discount records saved: <count [CONFIRMED/FAILED]>
+- Records skipped: paid=<n>, transferred=<n>, pending_proceedings=<n>, disposed=<n>, warrant=<n>
+- Total discount records saved (sum across Phase 2 + 2.5): <count>
+- Final STATE block (full).
+- Status: complete | partial — <reason>
+
+The "Status:" line is parsed by the system. Use EXACTLY one of "Status: complete" or "Status: partial — <reason>". When partial, list every failure-reason skip and every FAILED entry in the reason.
+
+Examples of correct status lines:
+  ✓ "Status: complete"
+  ✓ "Status: partial — Delhi(Notice Department) skipped (captcha failed app), Haryana(Traffic Department) skipped (site error)"
+  ✓ "Status: partial — save_discounts FAILED for Delhi(Traffic Department): timeout"
+  ✓ "Status: partial — captcha failed on 2 of 5 departments (app mode, no human fallback available)"
+
+Examples of WRONG status lines (do NOT do these):
+  ✗ "Status: complete" when any dept was skipped for "captcha failed" — this is a silent failure and customers lose money
+  ✗ "Status: complete" when save_discounts returned ok:false even once
+  ✗ "Status: done" — only "complete" or "partial" are valid
+  ✗ "Status: partial" without listing reasons — always include the reasons
+</completion>
+
+<example name="phase_1_three_rows" priority="reference">
+<input>
+After search on Delhi Traffic Police for vehicle DL01XX9999, results show 3 rows:
+  Row 1: Challan No. DL19016240430095546 | Offence: Red Light Jumping | Fine Amount: 5000 | Date: 15/06/2024 | Status: Sent to Virtual Court
+  Row 2: Challan No. 57693177 | Offence: Without Helmet | Fine Amount: (blank) | Date: 02/02/2024 | Status: Sent to Virtual Court
+  Row 3: Challan No. 41374772 | Offence: No Parking | Fine Amount: 500 | Date: 10/03/2024 | Status: Pending for Payment (Pay Now button visible)
+</input>
+
+<reasoning>
+Row 1: amount = 5000 (positive, keep as-is). Status = Virtual Court. Include in save_challans.
+Row 2: amount blank → apply pricing_table on offence "Without Helmet". No keyword matches → SKIP (per Step 6).
+Row 3: amount = 500 (positive, keep). Status = Pending for Payment. Include in save_challans AND in payNowChallans for Phase 2.5.
+</reasoning>
+
+<tool_call>
+save_challans([
+  {"challanId":"DL19016240430095546","offence":"Red Light Jumping","amount":5000,"date":"2024-06-15"},
+  {"challanId":"41374772","offence":"No Parking","amount":500,"date":"2024-03-10"}
+])
+</tool_call>
+
+<payNowChallans>
+[{"challanId":"41374772","discountAmount":500,"originalAmount":500}]
+</payNowChallans>
+
+<state_block>
+[STATE]
+phase: 1_complete
+challans_saved: 2 CONFIRMED
+departments:
+  - (built in Phase 1.5)
+pay_now: PENDING (will save in Phase 2.5)
+[/STATE]
+</state_block>
+</example>
+
+<example name="phase_2_one_department" priority="reference">
+<input>
+Department: Delhi(Notice Department). After CAPTCHA, results page shows "No. of Records :- 3":
+
+Record 1:
+  Header: Sr.No 1 | Case No. TC/400503/2024 | Challan No. 57113282 | Party: RAHUL BHATI | (no Paid/Transferred badge)
+  Detail table: [138 | LIMITS OF SPEED: OVERSPEED (LIGHT MOTOR VEHICLE) | Motor Vehicle Act,1988 Section: 112-... | 2000]
+  Proposed Fine: 2000
+
+Record 2:
+  Header: Sr.No 2 | Case No. TC/695694/2024 | Challan No. 57456981 | Party: RAHUL BHATI | (no badge)
+  Detail table: [138 | LIMITS OF SPEED: OVERSPEED (LIGHT MOTOR VEHICLE) | Motor Vehicle Act,1988 Section: 112-... | 2000]
+  Proposed Fine: 2000
+
+Record 3:
+  Header: Sr.No 3 | Case No. TC/948495/2024 | Challan No. 57768591 | Party: RAHUL BHATI | (no badge)
+  Detail table: [138 | LIMITS OF SPEED: OVERSPEED (LIGHT MOTOR VEHICLE) | Motor Vehicle Act,1988 Section: 112-... | 1000]
+  Proposed Fine: 1000
+</input>
+
+<reasoning>
+For each record, apply field-source map:
+- challanId from HEADER BAR (NOT Case No., NOT "138" Offence Code).
+- offenceText from Column 2 = "LIMITS OF SPEED: OVERSPEED (LIGHT MOTOR VEHICLE)".
+  - The "138" in Column 1 is the Offence Code — not text, ignore.
+  - The "Motor Vehicle Act,1988 Section: 112-..." in Column 3 is law citation, ignore.
+- fineNumber from Column 4 (RIGHTMOST). Per R1, never take "138".
+- proposedFineNumber from the row below the table.
+
+pricing_table on "LIMITS OF SPEED: OVERSPEED..." → contains "overspeed" → originalAmount = 2000.
+
+Record 1: fineNumber=2000, proposedFineNumber=2000 → discountAmount=2000, originalAmount=2000. R3 OK (2000 ≤ 2000). Keep.
+Record 2: same as Record 1 → discountAmount=2000, originalAmount=2000. Keep.
+Record 3: fineNumber=1000, proposedFineNumber=1000 → discountAmount=1000. originalAmount=2000 (from "overspeed" keyword, NOT 1000). R3 OK (1000 ≤ 2000). Keep. The court reduced 2000 → 1000.
+
+All three pass quality_gates. No duplicates.
+</reasoning>
+
+<tool_call>
+save_discounts([
+  {"challanId":"57113282","discountAmount":2000,"originalAmount":2000},
+  {"challanId":"57456981","discountAmount":2000,"originalAmount":2000},
+  {"challanId":"57768591","discountAmount":1000,"originalAmount":2000}
+])
+</tool_call>
+
+<tool_response>
+{"ok": true, "matched": 0, "created": 3, ...}
+</tool_response>
+
+<state_block_after>
+[STATE]
+phase: 2_dept_complete
+challans_saved: 2 CONFIRMED
+departments:
+  - Delhi(Notice Department): CONFIRMED 3
+  - Delhi(Traffic Department): PENDING
+pay_now: PENDING
+[/STATE]
+</state_block_after>
+</example>
 `.trim();
-}
+};
 
 const challansFromDB = async (p: Record<string, string>): Promise<string[]> => {
     try {
@@ -739,14 +757,13 @@ const challansFromDB = async (p: Record<string, string>): Promise<string[]> => {
         if (!requestId) return [];
 
         const docSnap = await challanRequestsRef.doc(requestId).get();
-
         if (!docSnap.exists) return [];
 
         const docData = docSnap.data()!;
-        const challansDraft: any[] = docData.challans || [];
-        console.log("existing challans len: ", challansDraft.length);
+        const existingChallans: any[] = docData.challansDraft || [];
 
-        const statePrefixMap: Record<string, string> = {
+        // Map each existing challan to its Virtual Courts department name (same logic as Phase 1.5).
+        const stateToDept: Record<string, string> = {
             DL: "Delhi(Traffic Department)",
             HR: "Haryana(Traffic Department)",
             UP: "Uttar Pradesh(Traffic Department)",
@@ -774,25 +791,20 @@ const challansFromDB = async (p: Record<string, string>): Promise<string[]> => {
             GA: "Goa(Traffic Department)",
         };
 
-        const deptSet = new Set<string>();
-
-        for (const c of challansDraft) {
-            const id: string = c.id || c.challanNo || "";
+        const depts = new Set<string>();
+        for (const c of existingChallans) {
+            const id = (c.id || c.challanNo || "").toString();
+            if (!id) continue;
             const prefix = id.substring(0, 2).toUpperCase();
-
-            if (/^[A-Z]{2}$/.test(prefix) && statePrefixMap[prefix]) {
-                deptSet.add(statePrefixMap[prefix]);
+            if (/^[A-Z]{2}$/.test(prefix) && stateToDept[prefix]) {
+                depts.add(stateToDept[prefix]);
             } else if (/^\d/.test(id)) {
-                deptSet.add("Delhi(Notice Department)");
+                depts.add("Delhi(Notice Department)");
             }
         }
-
-        const result = Array.from(deptSet);
-        console.log(`[challan-settlement] Vehicle ${p.vehicleNumber}: found ${challansDraft.length} existing challans → extra depts: [${result.join(", ")}]`);
-        return result;
-
+        return Array.from(depts);
     } catch (e) {
-        console.error(`[challan-settlement] Failed to fetch existing challans:`, e);
+        console.error("[challansFromDB] error:", e);
         return [];
     }
-}
+};
