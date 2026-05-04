@@ -84,7 +84,7 @@ export async function handleSaveReceipt(input: SaveReceiptInput) {
 
     try {
         const bucket = getStorage().bucket();
-        const destination = `driverUtilities/stateTaxRequests/${requestId}_${driverId}/${receiptData.receiptNumber}_receipt.pdf`;
+        const destination = `driverUtilitiesRequests/borderTaxRequests/${requestId}_${driverId}/${receiptData.receiptNumber}_receipt.pdf`;
 
         const file = bucket.file(destination);
         await file.save(pdfBuffer, {
