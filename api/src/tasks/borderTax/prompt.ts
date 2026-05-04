@@ -514,46 +514,52 @@ then (b) auto-redirect to the Uttar Pradesh Transport Department receipt page. Y
 wait for the receipt to appear and call save_receipt EXACTLY ONCE. You do NOT click Print, you do
 NOT click Back, you do NOT click "Click here". Just wait, verify, and call the tool.
 
---- STEP 1: Wait for SBI Payment Success page ---
-After the payment was confirmed in Phase 5, the page should now show the SBI Payment Success page
-(see "PAGE: SBI — Payment Successful" description above).
+--- STEP 1: Check for SBI Payment Success page (check first, poll only if needed) ---
+After the payment was confirmed in Phase 5, ONE of three things will be on screen:
+  (a) The SBI Payment Success page.
+  (b) The Uttar Pradesh receipt page (the success page flashed by and auto-redirect already happened).
+  (c) Neither yet — the page is still loading/transitioning.
 
-VERIFY you can see ALL of these on screen:
+The SBI Payment Success page is identified by ALL of these on screen:
   - The green checkmark icon
   - The text "Your payment was successful"
   - The "Account Details" section with Status: "Completed Successfully"
   - The line "Click here to return to the Uttar Pradesh Transport Department site. Else, you will be
     automatically redirected to the Uttar Pradesh Transport Department site in 10 seconds."
 
-DO NOT CLICK "Click here". DO NOT click anything on this page. Just wait.
+CHECK-FIRST POLLING (do NOT blindly sleep 30 seconds):
+  1. Inspect the page RIGHT NOW.
+     - If the receipt page is already visible (the six-marker check from STEP 2 passes) →
+       SKIP STEP 1 entirely and jump straight to STEP 3. Do NOT wait.
+     - If the SBI success page markers above are visible → success page is showing.
+       Proceed to STEP 2 (do NOT click "Click here"; the auto-redirect is the only correct mechanism).
+     - If NEITHER is visible → wait 5 seconds, then re-check.
+  2. Repeat the 5-second wait + re-check up to 6 times (≈30 seconds total).
+  3. If after ~30 seconds you have not seen either page → the success page may have already passed.
+     Proceed to STEP 2 anyway — the receipt-page check there is the source of truth.
 
-If you do NOT see the success page within 30 seconds of the payment confirmation:
-  - The page may have skipped straight to the receipt (sometimes the success page is shown only briefly).
-  - Proceed directly to STEP 2 — the receipt page check will tell you whether you're actually there.
+DO NOT CLICK "Click here". DO NOT click anything on this page. Just wait for the auto-redirect.
 
---- STEP 2: Wait for the receipt page (60-second budget, split into two 30-second windows) ---
+--- STEP 2: Wait for the receipt page (poll every 5s, 60-second total budget) ---
 
-WINDOW A — first 30 seconds:
-  Wait approximately 30 seconds for the automatic redirect.
-  Then check whether the receipt page is fully rendered. The receipt page is identified by the
-  SIMULTANEOUS presence of ALL of these on screen:
-    1. The header text "GOVERNMENT OF UTTAR PRADESH".
-    2. The subheader "Department of Transport".
-    3. The line "Checkpost Tax e-Receipt".
-    4. A "Receipt No." label with a non-empty value next to it (e.g. "UPR2604280468752").
-    5. A "Registration No." label with the value "${vehicleNumber}" (or a value containing this vehicle number).
-    6. The "Print" and "Back" buttons at the very top of the page (DO NOT click them).
+The receipt page is identified by the SIMULTANEOUS presence of ALL of these on screen:
+  1. The header text "GOVERNMENT OF UTTAR PRADESH".
+  2. The subheader "Department of Transport".
+  3. The line "Checkpost Tax e-Receipt".
+  4. A "Receipt No." label with a non-empty value next to it (e.g. "UPR2604280468752").
+  5. A "Registration No." label with the value "${vehicleNumber}" (or a value containing this vehicle number).
+  6. The "Print" and "Back" buttons at the very top of the page (DO NOT click them).
 
-  If ALL six markers are visible → proceed to STEP 3.
-  If any marker is missing OR the page is blank/white/still loading → continue to WINDOW B.
-
-WINDOW B — additional 30 seconds (only if WINDOW A failed):
-  Wait approximately 30 more seconds.
-  Re-run the same six-marker check from WINDOW A.
-
-  If ALL six markers are now visible → proceed to STEP 3.
-  If after a TOTAL of 60 seconds the receipt page is still not visible (page is still blank, still
-  loading, stuck on the SBI success page, or showing any error) → go to STEP 5 (PARTIAL COMPLETION).
+POLL-AND-CHECK (do NOT blindly sleep — exit early as soon as the page is rendered):
+  1. Check the page RIGHT NOW for ALL six markers.
+     - If ALL six are visible → proceed to STEP 3 IMMEDIATELY. Do NOT wait any longer.
+     - If any marker is missing OR the page is blank/white/still loading/still on the SBI success page
+       → wait 5 seconds, then re-check.
+  2. Repeat the 5-second wait + re-check up to 12 times (≈60 seconds total).
+  3. The MOMENT all six markers are visible at any check → exit the loop and go to STEP 3.
+  4. If after the full 60-second budget the receipt page is still not visible (page still blank,
+     still loading, stuck on the SBI success page, or showing any error) → go to STEP 5
+     (PARTIAL COMPLETION).
 
 DO NOT click "Click here" on the SBI success page to try to speed things up. The auto-redirect is
 the only correct mechanism.

@@ -132,13 +132,18 @@ export async function handleSaveReceipt(input: SaveReceiptInput) {
     // Mark request as agent-updated (best-effort)
     try {
         await borderTaxRequestsRef.doc(requestId).update({
+            status: "completed",
             borderTaxUpdatedBy: "agent",
+            receiptUpdatedAt: FieldValue.serverTimestamp(),
+            ...(pdfUrl ? { receiptDocumentUrl: pdfUrl } : {}),
         });
-        console.log(`[save_receipt] marked borderTaxRequests/${requestId} as agent-updated`);
+        console.log(
+            `[save_receipt] marked borderTaxRequests/${requestId} status=completed ` +
+            `(receiptDocumentUrl=${pdfUrl ? "set" : "skipped — pdf upload failed"})`
+        );
     } catch (e) {
         console.error(`[save_receipt] failed to mark borderTaxRequests/${requestId}:`, e);
     }
-
     const docRef = await borderTaxRef.add(docData);
 
     console.log(

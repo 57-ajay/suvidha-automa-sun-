@@ -1,6 +1,11 @@
 services:
   redis:
     image: redis:7-alpine
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
 
   api:
     build: ./api
@@ -8,6 +13,11 @@ services:
       - REDIS_URL=redis://redis:6379
     depends_on:
       - redis
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
 
   worker:
     build: ./worker
@@ -20,6 +30,11 @@ services:
       - redis
       - api
     shm_size: "4gb"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
 
   caddy:
     image: caddy:2-alpine
@@ -34,6 +49,11 @@ services:
     depends_on:
       - api
       - worker
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
 
 volumes:
   caddy_data:
