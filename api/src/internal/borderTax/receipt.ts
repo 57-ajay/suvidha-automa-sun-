@@ -113,6 +113,8 @@ export async function handleSaveReceipt(input: SaveReceiptInput) {
         // Continue — we still want to save the receipt metadata even if PDF upload fails
     }
 
+    const stateLabel = ((params?.state || "UTTAR PRADESH").trim().toUpperCase());
+
     // ── Save receipt metadata to Firestore ──
     const borderTaxRef = db.collection("borderTaxPayments");
     const docData = {
@@ -122,7 +124,7 @@ export async function handleSaveReceipt(input: SaveReceiptInput) {
         receiptNumber: receiptData.receiptNumber,
         amount,
         paymentDate: receiptData.paymentDate || new Date().toISOString().split("T")[0],
-        state: "UTTAR PRADESH",
+        state: stateLabel,
         ...(pdfUrl ? { pdfUrl } : {}),
         ...(pdfUploadError ? { pdfUploadError } : {}),
         status: "paid",
