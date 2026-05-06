@@ -11,7 +11,9 @@ export const buildPrompt = async (p: Record<string, string>): Promise<string> =>
     const tf = dateParts(taxFromISO);
     const tu = dateParts(taxUptoISO);
 
-    // Haryana-specific defaults (UP defaults are different).
+    const tfDtLocal = `${tf.iso}T00:00`;
+    const tuDtLocal = `${tu.iso}T00:00`;
+
     const entryDistrict = p.entryDistrict || "FARIDABAD";
     const entryCheckpoint = p.entryCheckpoint || "FARIDABAD";
     const serviceType = p.serviceType || "NOT APPLICABLE";
@@ -128,20 +130,19 @@ AVAILABLE ACTIONS: Type OTP into "Enter High Security Password" field, click yel
 
    - IMPORTANT: Do NOT click "CANCEL TRANSACTION" under any circumstances.
    - Call wait_for_human with reason: "UPI payment of ₹<amount> required for border tax of vehicle ${vehicleNumber}. A QR code is displayed on screen — please scan it with your UPI app and complete the payment. The transaction will expire in a few minutes. After payment is successful, wait for the page to update automatically, then reply done."
-   - IMPORTANT: After calling wait_for_human, do NOT interact with the page at all.
+   - After calling wait_for_human, do NOT interact with the page.
 
 7. After human confirms payment is done:
    - The page should transition away from the QR code page automatically.
    - If the page still shows the QR code after the human said "done", wait up to 30 seconds for it to update.
    - If the page shows "Transaction Failed", "Payment Timeout", or any error → ABORT. Reason: "Payment failed: [exact error from page]"
-   - Once the QR page is gone (page is transitioning to SBI's success page or to the receipt) → proceed to Phase 6.
+   - Once the QR page is gone (page is transitioning to a success page or to the receipt) → proceed to Phase 6.
 `
         : `
 4. The SBI ePay Lite page loads (SBIePay / formerly SBMOPS).
    VERIFY: You see the payment method selection page with sections: "Net Banking", "Card Payments",
    "Other Payment Modes", and "Wallet Payment". Each option has a name, bank charges, and a ">" arrow button.
-   - Under "Net Banking", find "SBI Net Banking" showing "Bank Charges(₹): 0.0".
-   - Click the ">" arrow button next to "SBI Net Banking" (the first option under Net Banking).
+   - Under "Net Banking", click "SBI Net Banking".
    - Wait for the next page to load.
 
 5. The SBI Net Banking login page loads.
@@ -219,6 +220,8 @@ ABORT CONDITIONS
 - "Get Details" returns no vehicle data, or shows an error → ABORT. Reason: "Vehicle ${vehicleNumber} details could not be fetched: [exact error]"
 - Insurance / fitness / PUCC popup blocks the form (red error popup with "renew" or "expired" wording) → click OK on the popup → ABORT.
   Reason: "Vehicle ${vehicleNumber} has no valid insurance. Please renew the vehicle's insurance policy before attempting border tax payment."
+- Tax From / Tax Upto target date is BEFORE the field's "min" attribute (i.e. earlier than the
+  earliest date the form will accept) → ABORT. Reason: "Tax From/Upto date is before the form's allowed minimum (the form does not accept past dates)."
 - Payment fails after human intervention → ABORT. Reason: "Payment failed: [details]"
 ${paymentAbort}
 
@@ -265,14 +268,51 @@ AVAILABLE ACTIONS: Set Permit Type, Service Type, Distance(In KM), click "Next".
 
 PAGE: CHECKPOST PORTAL — Tax Information (Step 3 of 4)
 VISUAL: "Tax Mode" dropdown, "Tax From" and "Tax Upto" date fields, "Calculate Fee/Tax" button, "Next" button.
-  Both date fields are NATIVE HTML5 DATE INPUTS (input type="date"). They display "mm/dd/yyyy" as placeholder when empty.
-  Each field has THREE separate segments (mm | dd | yyyy) and a small CALENDAR ICON at the right edge of the field.
-  - Clicking the middle of the input or the placeholder text only focuses one segment — it does NOT open a popup.
-  - Clicking the calendar icon at the right edge opens a date-picker popup with a month grid and ↑/↓ navigation arrows.
-  - The standard "type into field" action with an ISO value (YYYY-MM-DD) also works on these inputs because Playwright's
-    fill() accepts the ISO form for date inputs and the browser then renders the locale-formatted display.
-  After Calculate Fee/Tax is clicked, a single row appears in the tax table (e.g. "MV Tax") with computed amount,
-  and the total amount field (right of the Calculate button) populates.
+
+  CRITICAL — both "Tax From" and "Tax Upto" are NATIVE HTML5 DATETIME-LOCAL INPUTS
+  (input type="datetime-local"), NOT plain date inputs and NOT plain text. The actual
+  HTML, observed via DevTools:
+
+    Tax From input:
+      id="floatingTaxfrom"
+      type="datetime-local"
+      name="startDate"
+      placeholder="DD-MM-YYYY"        ← author-set placeholder; browsers IGNORE it for
+                                        datetime-local and show the locale format instead
+      min="<today>T00:00"             ← form rejects past dates
+      max="2999-12-31 23:59"
+      class="form-control form-control-sm green-border ng-untouched ng-pristine ng-valid"
+
+    Tax Upto input:
+      id="uptpDate"                    ← NOTE: id is "uptpDate", a typo of "uptoDate".
+                                        The label nearby has for="floatingTaxupto" but
+                                        NO element actually has that id — the label's
+                                        for-attribute is broken on this page. Always
+                                        target the input by its real id "uptpDate".
+      type="datetime-local"
+      placeholder="DD-MM-YYYY"
+      min="<>=Tax From>T<HH:MM>"
+      max="2999-12-31 23:59"
+
+  IMPORTANT VISUAL vs PROGRAMMATIC FORMATS:
+    - The browser overrides the HTML "DD-MM-YYYY" placeholder for datetime-local inputs
+      and instead displays segments like "mm/dd/yyyy ____ __:__ __" (US-locale style).
+      So when EMPTY the field shows "mm/dd/yyyy" + a time portion — NOT "DD-MM-YYYY".
+    - The DOM .value the browser ACCEPTS programmatically is ISO datetime-local form:
+      "YYYY-MM-DDTHH:MM"  (literal "T" between date and time).
+    - Date-only "YYYY-MM-DD" will SILENTLY FAIL on these inputs because they are
+      datetime-local, not date.
+    - The visible display after typing/picking renders the date portion as mm/dd/yyyy
+      and the time portion as 12:00 AM (for the T00:00 default).
+
+  Each field has a small CALENDAR ICON at the right edge that opens a date-picker popup
+  with a month grid and ↑/↓ navigation arrows. Clicking the middle of the input or the
+  placeholder text only focuses one segment — it does NOT open a popup.
+
+  After "Calculate Fee/Tax" is clicked, a single row appears in the tax table (e.g.
+  "MV Tax") with the computed amount, and the total amount field (right of the
+  Calculate button) populates.
+
 AVAILABLE ACTIONS: Select tax mode, fill both date fields (per Phase 4), click "Calculate Fee/Tax", then click "Next".
 
 PAGE: CHECKPOST PORTAL — Disclaimer (Step 4 of 4)
@@ -414,64 +454,115 @@ PHASE 4 — TAX CALCULATION
    --- 1a. Tax Mode ---
    - Click the "Tax Mode" dropdown and select "${taxMode}".
 
-   --- 1b. Tax From (target: ${tf.iso}) ---
-   IMPORTANT: "Tax From" is a NATIVE HTML5 DATE INPUT.
-   It shows "mm/dd/yyyy" as a placeholder. It is NOT a regular text box —
-   the field has THREE separate segments (mm | dd | yyyy) and a small CALENDAR ICON
-   at the RIGHT EDGE of the field.
+   --- 1b. Tax From (target: ${tf.iso}, programmatic value: ${tfDtLocal}) ---
 
-   TARGET → month=${tf.mm} (${tf.monthName}), day=${tf.dd}, year=${tf.year}
-   Expected display after entry: "${tf.mmddyyyy}"
+   The "Tax From" field is a native HTML5 datetime-local input. Concretely:
+     - selector: #floatingTaxfrom   (id="floatingTaxfrom")
+     - type="datetime-local"        (NOT type="date" — this distinction matters)
+     - the placeholder you SEE in the empty field is "mm/dd/yyyy ____ __:__ __"
+       (browser locale display), NOT "DD-MM-YYYY", regardless of what the page
+       HTML's placeholder attribute says
+     - the DOM value the browser ACCEPTS programmatically is the ISO 8601
+       datetime-local form: "YYYY-MM-DDTHH:MM" with a literal "T".
 
-   METHOD A — Direct ISO input (try this FIRST, simplest):
-     HTML5 date inputs accept the ISO form "YYYY-MM-DD" through the standard
-     input/type action — the browser parses it and fills the mm/dd/yyyy segments
-     automatically. The slashed display form is NOT accepted at this layer.
+   TARGET DOM VALUE → "${tfDtLocal}"
+   (this is ${tf.monthName} ${tf.dd}, ${tf.year} at midnight; date portion will
+    DISPLAY as ${tf.mm}/${tf.dd}/${tf.year} once the value sticks, time portion as 12:00 AM)
 
-     i.  Use your standard input/type action on the "Tax From" field with value
-         "${tf.iso}" exactly. Note the hyphens — this is YYYY-MM-DD, NOT mm/dd/yyyy.
-     ii. After the action, the field should display "${tf.mmddyyyy}" (the browser
-         renders the locale form automatically).
+   METHOD A — Direct datetime-local input (try this FIRST, simplest):
+     i.   Use your standard input/type/fill action targeting selector
+          #floatingTaxfrom with the EXACT value "${tfDtLocal}".
+          Note the literal "T" — this is NOT a slashed form, NOT a hyphen-only
+          date, NOT DD-MM-YYYY.
+     ii.  After the action, the DISPLAYED date portion should read
+          "${tf.mm}/${tf.dd}/${tf.year}" and the time portion "12:00 AM".
 
-     Do NOT type "${tf.mmddyyyy}" with slashes. Do NOT type "${taxFrom}" verbatim.
-     The ONLY accepted value for this method is the hyphenated ISO form: "${tf.iso}".
+     CRITICAL — common mistakes to avoid:
+       ✗  Do NOT type "${tf.iso}"          (date-only — silently rejected)
+       ✗  Do NOT type "${tf.mmddyyyy}"     (slashed display form — rejected at value layer)
+       ✗  Do NOT type "${tf.dd}-${tf.mm}-${tf.year}"  (DD-MM-YYYY — rejected)
+       ✓  Do type   "${tfDtLocal}"        (datetime-local ISO with T — accepted)
 
-   METHOD B — Calendar Picker (FALLBACK if Method A leaves the field showing "mm/dd/yyyy"):
-     i.   Click the SMALL CALENDAR ICON at the RIGHT EDGE of the "Tax From" input field.
-     ii.  A date-picker popup appears.
-     iii. Navigate to "${tf.monthName} ${tf.year}" using the ↑ and ↓ arrows in the picker header.
-     iv.  Click the number "${tf.dd}" in the grid (the BLACK/active one, not the greyed numbers
-          from the previous/next month).
-     v.   The picker closes; the input should now show "${tf.mmddyyyy}".
+   METHOD B — Calendar Picker (FALLBACK if Method A leaves the field empty):
+     i.   Click the SMALL CALENDAR ICON at the RIGHT EDGE of the #floatingTaxfrom
+          input field. Do NOT click the middle of the field, do NOT click the
+          "mm/dd/yyyy" placeholder text — those only focus one segment and do
+          NOT open the picker. ONLY the calendar icon at the right edge opens
+          the popup.
+     ii.  A date-picker popup appears below the field with a month grid, a
+          weekday header, and ↑ / ↓ navigation arrows on the month/year header.
+     iii. Navigate to "${tf.monthName} ${tf.year}":
+          - If the header ALREADY reads "${tf.monthName} ${tf.year}" → skip to step iv.
+          - For a LATER month → click the ↓ (down arrow) once per month.
+          - For an EARLIER month → click the ↑ (up arrow) once per month.
+          - Or click the "${tf.monthName} ${tf.year}" header text to open a
+            year/month picker and select directly.
+     iv.  Click the number "${tf.dd}" in the grid. Greyed-out numbers at the
+          edges belong to the previous/next month — click the BLACK/active
+          "${tf.dd}".
+     v.   The picker closes; the field's date portion should now display
+          "${tf.mm}/${tf.dd}/${tf.year}".
 
-   VERIFY: the field now shows "${tf.mmddyyyy}", NOT "mm/dd/yyyy".
-   If it still shows "mm/dd/yyyy", switch to the other method.
+   VERIFY (mandatory before moving on):
+     The #floatingTaxfrom DOM .value MUST be non-empty AND start with
+     "${tf.iso}" (typical full value: "${tfDtLocal}" or "${tfDtLocal}:00").
+     If the value is empty or unchanged → the entry did NOT take. Switch to
+     the OTHER method (Method A → Method B, or B → A) and retry once.
+     If after BOTH methods the field is still empty:
+       - Check the field's "min" attribute. If "${tfDtLocal}" is BEFORE that
+         min, the form is rejecting your date. ABORT with reason:
+         "Tax From date ${tf.iso} is before the form's allowed minimum."
+       - Otherwise, ABORT with reason:
+         "Could not enter Tax From date despite trying both direct input and the calendar picker."
 
-   --- 1c. Tax Upto (target: ${tu.iso}) ---
-   Same procedure on the "Tax Upto" field.
-   TARGET → month=${tu.mm} (${tu.monthName}), day=${tu.dd}, year=${tu.year}
-   Expected display after entry: "${tu.mmddyyyy}"
+   --- 1c. Tax Upto (target: ${tu.iso}, programmatic value: ${tuDtLocal}) ---
 
-   METHOD A — Direct ISO input (try this FIRST):
-     i.  Use your standard input/type action on the "Tax Upto" field with value
-         "${tu.iso}" exactly (hyphenated ISO form, NOT slashed).
-     ii. After the action, the field should display "${tu.mmddyyyy}".
+   Tax Upto is identical in TYPE to Tax From, but the SELECTOR is different —
+   READ THIS CAREFULLY:
+     - The actual input id is "uptpDate" (note the spelling — it is a typo of
+       "uptoDate" in the government site's HTML).
+     - There is a <label for="floatingTaxupto"> NEAR this input, but NO element
+       on the page has the id "floatingTaxupto" — that label is a broken
+       reference. Do NOT search for "floatingTaxupto"; it does not exist.
+     - Always target this field by selector: #uptpDate
+     - type="datetime-local", same display/value rules as Tax From.
+
+   TARGET DOM VALUE → "${tuDtLocal}"
+
+   METHOD A — Direct datetime-local input (try this FIRST):
+     Use your input/type/fill action on selector #uptpDate with value
+     "${tuDtLocal}" exactly. Date-only "${tu.iso}" will NOT stick.
 
    METHOD B — Calendar Picker (FALLBACK):
-     i.   Click the SMALL CALENDAR ICON at the RIGHT EDGE of the "Tax Upto" field.
-     ii.  Navigate the popup to "${tu.monthName} ${tu.year}".
-     iii. Click the number "${tu.dd}" in the grid.
-     iv.  The picker closes; the input should now show "${tu.mmddyyyy}".
+     i.   Click the calendar icon at the RIGHT EDGE of the #uptpDate field.
+     ii.  Navigate the popup to "${tu.monthName} ${tu.year}" via arrows or the
+          header dropdown.
+     iii. Click "${tu.dd}" in the grid (the BLACK/active number).
+     iv.  Picker closes; field's date portion should display
+          "${tu.mm}/${tu.dd}/${tu.year}".
 
-   VERIFY: the field now shows "${tu.mmddyyyy}", NOT "mm/dd/yyyy".
+   VERIFY (mandatory):
+     #uptpDate DOM .value MUST be non-empty AND start with "${tu.iso}".
+     If empty after BOTH methods:
+       - Check the field's "min" attribute (it is dynamic: typically forced to
+         be ≥ Tax From). If "${tuDtLocal}" violates that min → ABORT with
+         reason: "Tax Upto date ${tu.iso} is before the form's allowed minimum (often equals or exceeds Tax From)."
+       - Otherwise → ABORT with reason:
+         "Could not enter Tax Upto date despite trying both direct input and the calendar picker."
 
-2. After BOTH "Tax From" and "Tax Upto" show their dates (not the placeholder),
-   click the "Calculate Fee/Tax" button.
+2. After BOTH #floatingTaxfrom and #uptpDate hold non-empty DOM values
+   (verified per the steps above), click the "Calculate Fee/Tax" button.
 
 3. Wait for the tax row to appear in the table and the Total Amount field to populate.
 
 4. Verify the amount is displayed (must be a number > 0).
-   - If the amount stays blank or is 0 after 30 seconds → re-check both date fields.
+   - If the amount stays blank or is 0 after 30 seconds → re-read the DOM
+     values of #floatingTaxfrom and #uptpDate.
+     • If either is empty or does NOT start with the expected ISO date prefix
+       (${tf.iso} for Tax From, ${tu.iso} for Tax Upto) → return to step 1b/1c
+       and retry that field with whichever method (A or B) you didn't use yet.
+     • If both values look correct but amount is still 0 after the retry →
+       ABORT with reason: "Calculate Fee/Tax did not produce an amount despite both date fields holding correct values."
 
 5. Click the "Next" button.
 
