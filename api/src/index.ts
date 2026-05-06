@@ -9,6 +9,7 @@ import { saveAgentWorkSummary } from "./internal/agentWorkSummary";
 import { DASHBOARD_HTML } from "./dashboard";
 import { setAssignedPartner } from "./internal/assignedPartner";
 import { setAiAgentWorkStatus } from "./internal/aiAgentWorkStatus";
+import { handleVncHttp, tryUpgradeVnc, vncWebSocketHandlers } from "./vncProxy";
 import "./firebase";
 
 const redis = new Redis(process.env.REDIS_URL || "redis://localhost:6379");
@@ -27,10 +28,36 @@ function corsHeaders(): Record<string, string> {
 
 const server = Bun.serve({
     port: 3000,
-    async fetch(req) {
+
+    websocket: vncWebSocketHandlers,
+
+    async fetch(req, server) {
         // CORS preflight
         if (req.method === "OPTIONS") {
             return new Response(null, { status: 204, headers: corsHeaders() });
+        }
+
+        // /vnc/{jobId}/* — live-view proxy. Routes WS + HTTP to whichever worker holds the job.
+        {
+            const url = new URL(req.url);
+            if (url.pathname.startsWith("/vnc/")) {
+                const upgradeInfo = await tryUpgradeVnc(req, redis);
+                if (upgradeInfo) {
+                    const upstream = new WebSocket(upgradeInfo.upstreamUrl);
+                    const success = server.upgrade(req, {
+                        data: {
+                            workerId: upgradeInfo.workerId,
+                            upstream,
+                            upstreamReady: false,
+                            queued: [],
+                        },
+                    });
+                    if (success) return undefined as any;
+                    try { upstream.close(); } catch { }
+                    return new Response("upgrade failed", { status: 426 });
+                }
+                return await handleVncHttp(req, redis);
+            }
         }
 
         const res = await (async (): Promise<Response> => {
