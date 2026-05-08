@@ -36,6 +36,7 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
   .badge.done               { background:#0a2d3d; color:#60a5fa; }
   .badge.failed             { background:#3d0a0a; color:#f87171; }
   .badge.cancelled          { background:#2a2a2a; color:#888; }
+  .badge.partial            { background:#2d1f0a; color:#fb923c; }
   .badge.waiting_for_human  { background:#3d1f0a; color:#fb923c; animation:pulse 2s infinite; }
 
   @keyframes pulse {
@@ -90,6 +91,37 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .error-preview { font-size:12px; color:#f87171; margin-top:4px; max-width:500px;
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+
+  /* ── QR Code panel ── */
+  .qr-panel {
+    display:flex; gap:16px; align-items:flex-start; margin-bottom:12px;
+    padding:12px 14px; background:#0f1a0f; border:1px solid #22c55e44;
+    border-radius:8px;
+  }
+  .qr-panel img {
+    width:160px; height:160px; border-radius:6px;
+    border:3px solid #22c55e; flex-shrink:0; image-rendering:pixelated;
+    background:#fff;
+  }
+  .qr-panel img.loading { opacity:0.4; }
+  .qr-info { flex:1; min-width:0; }
+  .qr-info .qr-title {
+    font-size:13px; font-weight:600; color:#22c55e; margin-bottom:6px;
+    display:flex; align-items:center; gap:6px;
+  }
+  .qr-info .qr-title .dot {
+    width:8px; height:8px; border-radius:50%; background:#22c55e;
+    animation:pulse 1.5s infinite;
+  }
+  .qr-info .qr-hint {
+    font-size:12px; color:#888; line-height:1.5;
+  }
+  .qr-info .qr-expiry {
+    font-size:12px; color:#fb923c; margin-top:6px; font-weight:500;
+  }
+  .qr-expired-msg {
+    font-size:12px; color:#f87171; margin-top:4px;
+  }
 </style>
 </head>
 <body>
@@ -104,6 +136,8 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
 
 <script>
 const sentJobs = new Set();
+// Track QR upload times so we can show a countdown: jobId -> timestamp ms when qrCodeUrl appeared
+const qrSeenAt = {};
 
 function timeAgo(iso) {
   if (!iso) return '';
@@ -120,12 +154,14 @@ function detectType(reason) {
   const r = reason.toLowerCase();
   if (r.includes('otp')) return 'otp';
   if (r.includes('captcha')) return 'captcha';
+  if (r.includes('upi') || r.includes('qr code') || r.includes('qr')) return 'upi';
   return 'text';
 }
 
 function placeholder(type) {
-  if (type === 'otp') return 'Enter OTP (e.g. 143562)';
+  if (type === 'otp') return 'Enter OTP (e.g. 123456)';
   if (type === 'captcha') return 'Type what you see or "done" after solving in browser';
+  if (type === 'upi') return 'Type "done" after payment is complete';
   return 'Type your response...';
 }
 
@@ -134,7 +170,22 @@ function quickActions(type) {
   if (type === 'captcha') {
     return [{label:"I solved it in browser", value:"done"}, ...common];
   }
+  if (type === 'upi') {
+    return [{label:"✅ Payment done", value:"done"}, {label:"❌ Payment failed", value:"failed"}];
+  }
   return common;
+}
+
+function qrExpiryText(jobId) {
+  const seen = qrSeenAt[jobId];
+  if (!seen) return '';
+  const elapsedMs = Date.now() - seen;
+  const remainMs = 3 * 60 * 1000 - elapsedMs; // 3-minute window
+  if (remainMs <= 0) return '<span class="qr-expired-msg">⚠️ QR may have expired — check the live browser view</span>';
+  const remainSec = Math.ceil(remainMs / 1000);
+  const mm = Math.floor(remainSec / 60);
+  const ss = remainSec % 60;
+  return '<span class="qr-expiry">⏱ Expires in ~' + mm + ':' + String(ss).padStart(2,'0') + '</span>';
 }
 
 async function refresh() {
@@ -157,12 +208,23 @@ async function refresh() {
 
     grid.innerHTML = jobs.map(j => {
       const params = (() => { try { return JSON.parse(j.params || '{}'); } catch { return {}; } })();
-      const paramStr = Object.entries(params).map(([k,v]) => k + '=' + v).join(', ');
+      const paramStr = [
+        params.vehicleNumber ? ('🚗 ' + params.vehicleNumber) : '',
+        params.state         ? ('📍 ' + params.state) : '',
+        params.paymentMethod ? ('💳 ' + params.paymentMethod) : '',
+        params.requestId     ? ('id: ' + params.requestId.substring(0,12) + '…') : '',
+      ].filter(Boolean).join('  ·  ');
+
       const isWaiting = j.status === 'waiting_for_human';
       const canCancel = ['running','queued','waiting_for_human'].includes(j.status);
       const hasLive = j.liveUrl && ['running','waiting_for_human'].includes(j.status);
       const type = detectType(j.waitReason);
       const wasSent = sentJobs.has(j.id);
+
+      // Track first time we see a qrCodeUrl so we can show a countdown
+      if (j.qrCodeUrl && !qrSeenAt[j.id]) {
+        qrSeenAt[j.id] = Date.now();
+      }
 
       let html = '<div class="job' + (isWaiting ? ' waiting' : '') + '">';
       html += '<div class="job-top">';
@@ -174,8 +236,8 @@ async function refresh() {
       if (j.status === 'done' && j.result) {
         html += '<div class="result-preview" title="' + j.result.replace(/"/g,'&quot;') + '">' + j.result.substring(0,120) + '</div>';
       }
-      if (j.status === 'failed' && j.error) {
-        html += '<div class="error-preview">' + j.error.substring(0,120) + '</div>';
+      if ((j.status === 'failed' || j.status === 'partial') && j.error) {
+        html += '<div class="error-preview">' + (j.error||'').substring(0,120) + '</div>';
       }
       html += '</div>'; // .left
 
@@ -188,6 +250,21 @@ async function refresh() {
 
       if (isWaiting) {
         html += '<div class="intervene">';
+
+        // ── QR Code display (UPI border-tax only) ──
+        if (j.qrCodeUrl && type === 'upi') {
+          html += '<div class="qr-panel">';
+          html += '<img src="' + j.qrCodeUrl + '" alt="UPI QR Code" '
+                + 'onerror="this.style.opacity=0.2;this.alt=\\'QR expired or unavailable\\'">';
+          html += '<div class="qr-info">';
+          html += '<div class="qr-title"><span class="dot"></span>UPI QR Code Ready</div>';
+          html += '<div class="qr-hint">Scan this QR with any UPI app (Google Pay, PhonePe, Paytm…)'
+                + '<br>The page will auto-redirect after payment — then click <strong>Payment done</strong> below.</div>';
+          html += qrExpiryText(j.id);
+          html += '</div>'; // .qr-info
+          html += '</div>'; // .qr-panel
+        }
+
         html += '<div class="intervene-reason"><span class="icon">⏳</span><span>' + (j.waitReason || 'Waiting for human input') + '</span></div>';
 
         const qas = quickActions(type);

@@ -37,8 +37,10 @@ export const buildPrompt = async (p: Record<string, string>): Promise<string> =>
     const isUPI = paymentMethod === "upi";
 
     const toolDesc = isUPI
-        ? `- wait_for_human → Call ONLY when explicitly told to in the steps below (CAPTCHA, UPI payment confirmation).`
+        ? `- wait_for_human → Call ONLY when explicitly told to in the steps below (CAPTCHA, UPI payment confirmation).
+- save_qr_code → Call ONCE when the UPI QR code page is fully visible, BEFORE calling wait_for_human. Takes no parameters: save_qr_code({}). Non-blocking: if it returns ok:false log the error and still proceed to wait_for_human.`
         : `- wait_for_human → Call ONLY when explicitly told to in the steps below (CAPTCHA, OTP for net banking payment).`;
+
 
     const paymentAbort = isUPI
         ? `- UPI payment not completed within timeout → ABORT. Reason: "UPI payment timed out or was cancelled."`
@@ -71,10 +73,31 @@ export const buildPrompt = async (p: Record<string, string>): Promise<string> =>
    - Click the blue "Proceed" button.
    - Wait for the next page to load.
 
-6. The QR Code page loads (provider's UPI page — likely shows a QR + countdown).
-   VERIFY: A QR code is displayed on screen along with the amount and a transaction reference.
-   - DO NOT click any "Cancel" button.
-   - Call wait_for_human with reason: "UPI payment of ₹<amount> required for border tax of vehicle ${vehicleNumber}. A QR code is displayed on screen — please scan it with your UPI app and complete the payment. The transaction will expire in a few minutes. After payment is successful, wait for the page to update automatically, then reply done."
+6. The QR Code page loads (eGRAS Rajasthan UPI page).
+   VERIFY: The page shows the eGRAS header "E-CHALLAN FOR Government of Rajasthan".
+   The page contains:
+   - "GRN:-" reference number at the top left.
+   - "Total/NetAmount:- ₹ X.XX" at the top right.
+   - Radio buttons: "UPI ID" and "QR CODE" — the "QR CODE" option should already be selected.
+   - A QR code image inside the div with id="ct100_ContentPlaceHolder1_divQRCode".
+     The QR image has NO id attribute — it is the only <img> inside that container div.
+     Its src is a base64 data URI (starts with "data:image/png;base64,...").
+   - A countdown timer below the QR: "Complete Your Payment before it time out!" with MM:SS display
+     inside div id="ct100_ContentPlaceHolder1_divTimer".
+   - The expiry is approximately 3 minutes from page load.
+   - DO NOT click any button on this page.
+
+   - STEP A — Upload the QR code (do this FIRST, before anything else):
+     Call save_qr_code({}).
+     This extracts the base64 QR image directly from the page DOM and uploads it so the
+     client can display it to the user.
+     - Wait for the response.
+     - If response is {"ok": true} → QR uploaded successfully. Continue to STEP B.
+     - If response is {"ok": false} → Log the error message. Do NOT abort or retry. Continue to STEP B.
+     The QR upload must NEVER block the payment — always proceed to STEP B regardless.
+
+   - STEP B — Wait for human payment:
+     Call wait_for_human with reason: "UPI payment of ₹<amount> required for border tax of vehicle ${vehicleNumber}. A QR code is displayed on screen — please scan it with your UPI app and complete the payment. The transaction will expire in a few minutes. After payment is successful, wait for the page to update automatically, then reply done."
    - After calling wait_for_human, do NOT interact with the page.
 
 7. After human confirms payment is done:

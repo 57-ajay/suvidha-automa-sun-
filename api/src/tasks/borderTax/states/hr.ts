@@ -26,7 +26,8 @@ export const buildPrompt = async (p: Record<string, string>): Promise<string> =>
     const isUPI = paymentMethod === "upi";
 
     const toolDesc = isUPI
-        ? `- wait_for_human → Call ONLY when explicitly told to in the steps below (CAPTCHA, UPI payment confirmation).`
+        ? `- wait_for_human → Call ONLY when explicitly told to in the steps below (CAPTCHA, UPI payment confirmation).
+- save_qr_code → Call ONCE when the UPI QR code page is fully visible, BEFORE calling wait_for_human. Takes no parameters: save_qr_code({}). Non-blocking: if it returns ok:false log the error and still proceed to wait_for_human.`
         : `- wait_for_human → Call ONLY when explicitly told to in the steps below (CAPTCHA, OTP for net banking payment).`;
 
     const paymentAbort = isUPI
@@ -124,12 +125,22 @@ AVAILABLE ACTIONS: Type OTP into "Enter High Security Password" field, click yel
      • Merchant Reference No
      • Amount to be Remitted shown in red (e.g. "Rs X.00 /-")
      • Transaction Status: "Collect Request Initiated Successfully"
-   - A QR Code image below the form details.
+   - A QR Code image below the form details (element id="qrcodeImg" inside div id="qrcode").
    - A yellow "CANCEL TRANSACTION" button at the bottom.
    - A timer showing how many minutes remain to complete the transaction.
 
    - IMPORTANT: Do NOT click "CANCEL TRANSACTION" under any circumstances.
-   - Call wait_for_human with reason: "UPI payment of ₹<amount> required for border tax of vehicle ${vehicleNumber}. A QR code is displayed on screen — please scan it with your UPI app and complete the payment. The transaction will expire in a few minutes. After payment is successful, wait for the page to update automatically, then reply done."
+
+   - STEP A — Upload the QR code (do this FIRST, before anything else):
+     Call save_qr_code({}).
+     This captures the QR image from the page and uploads it so the client can display it to the user.
+     - Wait for the response.
+     - If response is {"ok": true} → QR uploaded successfully. Continue to STEP B.
+     - If response is {"ok": false} → Log the error message. Do NOT abort or retry. Continue to STEP B.
+     The QR upload must NEVER block the payment — always proceed to STEP B regardless.
+
+   - STEP B — Wait for human payment:
+     Call wait_for_human with reason: "UPI payment of ₹<amount> required for border tax of vehicle ${vehicleNumber}. A QR code is displayed on screen — please scan it with your UPI app and complete the payment. The transaction will expire in a few minutes. After payment is successful, wait for the page to update automatically, then reply done."
    - After calling wait_for_human, do NOT interact with the page.
 
 7. After human confirms payment is done:

@@ -10,6 +10,7 @@ import { DASHBOARD_HTML } from "./dashboard";
 import { setAssignedPartner } from "./internal/assignedPartner";
 import { setAiAgentWorkStatus } from "./internal/aiAgentWorkStatus";
 import "./firebase";
+import { handleSaveQR } from "./internal/borderTax/qr";
 
 const redis = new Redis(process.env.REDIS_URL || "redis://localhost:6379");
 
@@ -323,6 +324,90 @@ const server = Bun.serve({
                     return Response.json(result, { status });
                 } catch (e: any) {
                     console.error("[API] ERROR save_discounts:", e);
+                    return Response.json({ ok: false, error: e.message }, { status: 500 });
+                }
+            }
+
+            if (req.method === "POST" && url.pathname === "/api/internal/border-tax/save-qr") {
+                try {
+                    const contentType = req.headers.get("content-type") || "";
+                    if (!contentType.toLowerCase().includes("multipart/form-data")) {
+                        console.log(
+                            `[API] POST /api/internal/border-tax/save-qr | FAIL: wrong content-type=${contentType}`
+                        );
+                        return Response.json(
+                            { ok: false, error: `Expected multipart/form-data, got: ${contentType}` },
+                            { status: 400 }
+                        );
+                    }
+
+                    const formData = await req.formData();
+                    const imageFile = formData.get("image");
+                    const jobIdField = formData.get("jobId");
+                    const paramsRaw = formData.get("params");
+
+                    if (!imageFile || !(imageFile instanceof Blob)) {
+                        return Response.json(
+                            { ok: false, error: "Missing or invalid 'image' part" },
+                            { status: 400 }
+                        );
+                    }
+                    if (typeof jobIdField !== "string" || !jobIdField) {
+                        return Response.json(
+                            { ok: false, error: "Missing 'jobId' field" },
+                            { status: 400 }
+                        );
+                    }
+                    if (typeof paramsRaw !== "string") {
+                        return Response.json(
+                            { ok: false, error: "Missing 'params' field" },
+                            { status: 400 }
+                        );
+                    }
+
+                    let parsedParams: Record<string, string>;
+                    try {
+                        parsedParams = JSON.parse(paramsRaw);
+                    } catch (e: any) {
+                        return Response.json(
+                            { ok: false, error: `'params' is not valid JSON: ${e.message}` },
+                            { status: 400 }
+                        );
+                    }
+
+                    const imageBuffer = Buffer.from(await imageFile.arrayBuffer());
+
+                    console.log(
+                        `[API] POST /api/internal/border-tax/save-qr | ` +
+                        `jobId=${jobIdField} image=${imageBuffer.length} bytes ` +
+                        `params=${JSON.stringify(parsedParams)}`
+                    );
+
+                    if (imageBuffer.length < 100) {
+                        console.log(`[API]   FAIL: image too small (${imageBuffer.length} bytes)`);
+                        return Response.json(
+                            { ok: false, error: `Image too small (${imageBuffer.length} bytes), likely a blank screenshot` },
+                            { status: 400 }
+                        );
+                    }
+
+                    const result = await handleSaveQR({
+                        jobId: jobIdField,
+                        params: parsedParams,
+                        imageBuffer,
+                    });
+
+                    if (result.ok && result.qrUrl) {
+                        redis.hset(`job:${jobIdField}`, "qrCodeUrl", result.qrUrl).catch((e: any) => {
+                            console.error(`[API] save-qr: failed to write qrCodeUrl to Redis job hash:`, e);
+                        });
+                    }
+
+                    const status = result.ok ? 200 : 400;
+                    console.log(`[API]   result: ${JSON.stringify(result)}`);
+                    return Response.json(result, { status });
+                } catch (e: any) {
+                    console.error("[API] ERROR save_qr:", e);
                     return Response.json({ ok: false, error: e.message }, { status: 500 });
                 }
             }

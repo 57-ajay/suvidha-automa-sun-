@@ -74,8 +74,176 @@ def make_tools(
             "then complete with 'Status: partial'."
         )
 
-    # -- border-tax-only: save_receipt (captures the rendered receipt page as PDF) --
     if task_id == "border-tax":
+        @tools.action(
+            description=(
+                "Call this ONCE when the UPI QR code page is fully loaded and visible, "
+                "BEFORE calling wait_for_human. "
+                "This tool extracts the QR code image from the current page, "
+                "uploads it to cloud storage, and saves the URL on the request record "
+                "so the client app can display the QR directly to the user.\n\n"
+                "Takes NO parameters — call it as save_qr_code({}).\n\n"
+                "Returns JSON:\n"
+                "  {\"ok\": true}  → QR uploaded. Proceed to call wait_for_human as normal.\n"
+                "  {\"ok\": false} → Upload failed. Log the error, then STILL call "
+                "wait_for_human — a QR upload failure must NEVER block the payment.\n\n"
+                "IMPORTANT: Call this at most ONCE per job. Do NOT retry on failure."
+            )
+        )
+        async def save_qr_code(browser_session: BrowserSession) -> str:
+            print(f"[{job_id}] save_qr_code called")
+
+            try:
+                cdp = await browser_session.get_or_create_cdp_session()
+                eval_result = await cdp.cdp_client.send.Runtime.evaluate(
+                    params={
+                        "expression": """
+                            (function() {
+                                // UP/HR: <img id="qrcodeImg">
+                                var img = document.getElementById('qrcodeImg');
+
+                                // RJ: <img> inside <div id="ct100_ContentPlaceHolder1_divQRCode">
+                                if (!img) {
+                                    var container = document.getElementById(
+                                        'ct100_ContentPlaceHolder1_divQRCode'
+                                    );
+                                    if (container) img = container.querySelector('img');
+                                }
+
+                                if (!img) return null;
+
+                                var src  = img.src || '';
+                                var rect = img.getBoundingClientRect();
+                                return {
+                                    src:       src,
+                                    isDataUri: src.startsWith('data:'),
+                                    x:         rect.left,
+                                    y:         rect.top,
+                                    width:     rect.width,
+                                    height:    rect.height
+                                };
+                            })()
+                        """,
+                        "returnByValue": True,
+                    },
+                    session_id=cdp.session_id,
+                )
+
+                info = eval_result.get("result", {}).get("value")
+
+                if not info:
+                    msg = (
+                        "QR code img element not found — tried #qrcodeImg (UP/HR) "
+                        "and #ct100_ContentPlaceHolder1_divQRCode img (RJ)"
+                    )
+                    print(f"[{job_id}]   ERROR: {msg}")
+                    return json.dumps({"ok": False, "error": msg})
+
+                if info.get("width", 0) <= 0 or info.get("height", 0) <= 0:
+                    msg = f"QR element found but has zero size (w={info.get('width')} h={
+                        info.get('height')})"
+                    print(f"[{job_id}]   ERROR: {msg}")
+                    return json.dumps({"ok": False, "error": msg})
+
+                print(
+                    f"[{job_id}]   QR element found: "
+                    f"isDataUri={info.get('isDataUri')} "
+                    f"x={info.get('x', 0):.1f} y={info.get('y', 0):.1f} "
+                    f"w={info.get('width', 0):.1f} h={
+                        info.get('height', 0):.1f}"
+                )
+
+                # ─── 2a. RJ path: decode base64 data URI directly ────────────
+                if info.get("isDataUri"):
+                    src = info.get("src", "")
+                    # Format: "data:image/png;base64,<base64data>"
+                    if "," not in src:
+                        msg = "data URI has unexpected format (no comma separator)"
+                        print(f"[{job_id}]   ERROR: {msg}")
+                        return json.dumps({"ok": False, "error": msg})
+
+                    b64_data = src.split(",", 1)[1]
+                    try:
+                        img_bytes = base64.b64decode(b64_data)
+                    except Exception as e:
+                        msg = f"base64 decode failed: {str(e)}"
+                        print(f"[{job_id}]   ERROR: {msg}")
+                        return json.dumps({"ok": False, "error": msg})
+
+                    print(f"[{job_id}]   QR extracted from data URI: {
+                          len(img_bytes)} bytes")
+
+                # ─── 2b. UP/HR path: CDP element screenshot ──────────────────
+                else:
+                    screenshot_result = await cdp.cdp_client.send.Page.captureScreenshot(
+                        params={
+                            "format": "png",
+                            "clip": {
+                                "x":      info["x"],
+                                "y":      info["y"],
+                                "width":  info["width"],
+                                "height": info["height"],
+                                "scale":  1,
+                            },
+                            "captureBeyondViewport": True,
+                        },
+                        session_id=cdp.session_id,
+                    )
+
+                    img_b64 = screenshot_result.get("data", "")
+                    if not img_b64:
+                        msg = "CDP captureScreenshot returned empty data for QR element"
+                        print(f"[{job_id}]   ERROR: {msg}")
+                        return json.dumps({"ok": False, "error": msg})
+
+                    img_bytes = base64.b64decode(img_b64)
+                    print(f"[{job_id}]   QR screenshot captured: {
+                          len(img_bytes)} bytes")
+
+                # ─── 3. Sanity check ─────────────────────────────────────────
+                if len(img_bytes) < 100:
+                    msg = f"QR image suspiciously small ({len(
+                        img_bytes)} bytes) — element may not have rendered yet"
+                    print(f"[{job_id}]   ERROR: {msg}")
+                    return json.dumps({"ok": False, "error": msg})
+
+            except Exception as e:
+                msg = f"CDP error while extracting QR code: {str(e)}"
+                print(f"[{job_id}]   ERROR: {msg}")
+                return json.dumps({"ok": False, "error": msg})
+
+            # ─── 4. POST PNG bytes to the API ─────────────────────────────────
+            try:
+                files = {
+                    "image": ("qr_code.png", img_bytes, "image/png"),
+                }
+                form_data = {
+                    "jobId":  job_id,
+                    "params": json.dumps(job_params),
+                }
+
+                print(
+                    f"[{job_id}]   POSTing QR PNG to "
+                    f"/api/internal/border-tax/save-qr "
+                    f"({len(img_bytes)} bytes)"
+                )
+
+                async with httpx.AsyncClient(timeout=30) as client:
+                    resp = await client.post(
+                        f"{API_URL}/api/internal/border-tax/save-qr",
+                        files=files,
+                        data=form_data,
+                    )
+
+                print(f"[{job_id}] save_qr_code response: {resp.status_code}")
+                print(f"[{job_id}]   body: {resp.text[:300]}")
+                return resp.text
+
+            except Exception as e:
+                msg = f"save_qr_code HTTP error: {str(e)}"
+                print(f"[{job_id}]   ERROR: {msg}")
+                return json.dumps({"ok": False, "error": msg})
+
         @tools.action(
             description=(
                 "Capture the currently visible receipt page as a PDF, upload "
