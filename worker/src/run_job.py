@@ -13,6 +13,7 @@ import httpx
 import redis
 
 from agent import run_agent
+from cost_calculator import fill_missing_cost
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 API_URL = os.environ.get("API_URL", "http://api:3000")
@@ -119,23 +120,20 @@ def resolve_final_status(result, job_id: str, r: redis.Redis) -> tuple[str, list
 
 
 def extract_cost_data(result) -> dict | None:
-    """Extract cost data from agent result's usage info."""
+    """Extract cost data from agent result's usage info.
+
+    Delegates to cost_calculator.fill_missing_cost, which:
+      - Passes through browser-use's numbers when total_cost > 0.
+      - Computes cost locally from per-model token counts when total_cost == 0
+        (e.g., a brand-new Gemini model not yet in browser-use's price table).
+
+    To support a new model, edit GEMINI_PRICING in worker/src/cost_calculator.py.
+    """
     try:
-        usage = result.usage
+        usage = getattr(result, "usage", None)
         if not usage:
             return None
-
-        return {
-            "totalPromptTokens": usage.total_prompt_tokens or 0,
-            "totalCompletionTokens": usage.total_completion_tokens or 0,
-            "totalTokens": usage.total_tokens or 0,
-            "totalCost": usage.total_cost or 0,
-            "totalPromptCost": usage.total_prompt_cost or 0,
-            "totalCompletionCost": usage.total_completion_cost or 0,
-            "totalCachedTokens": usage.total_prompt_cached_tokens or 0,
-            "totalCachedCost": usage.total_prompt_cached_cost or 0,
-            "entryCount": usage.entry_count or 0,
-        }
+        return fill_missing_cost(usage)
     except Exception as e:
         print(f"Warning: failed to extract cost data: {e}")
         return None
@@ -148,6 +146,7 @@ async def main():
 
     job_id = sys.argv[1]
     display = os.environ.get("DISPLAY", "?")
+
     r = redis.from_url(REDIS_URL)
 
     job_raw = r.hgetall(f"job:{job_id}")

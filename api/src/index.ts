@@ -541,13 +541,6 @@ const server = Bun.serve({
                         console.error(`[API] background releaseAgentSlot failed for requestId=${requestId}:`, e);
                     });
 
-                    // Save cost data to challanRequest (fire-and-forget)
-                    if (costData) {
-                        saveAgentCost(requestId, jobId, costData, source).catch((e) => {
-                            console.error(`[API] background saveAgentCost failed for requestId=${requestId}:`, e);
-                        });
-                    }
-
                     (async () => {
                         try {
                             const job = await redis.hgetall(`job:${jobId}`);
@@ -584,6 +577,21 @@ const server = Bun.serve({
                                     e,
                                 );
                             });
+
+                            if (costData) {
+                                saveAgentCost(
+                                    requestId,
+                                    jobId,
+                                    costData,
+                                    source || job?.source || "web",
+                                    job?.taskId,
+                                ).catch((e) => {
+                                    console.error(
+                                        `[API] background saveAgentCost failed for requestId=${requestId}:`,
+                                        e,
+                                    );
+                                });
+                            }
 
 
                         } catch (e) {
