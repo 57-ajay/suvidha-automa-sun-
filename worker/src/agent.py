@@ -534,7 +534,7 @@ async def run_agent(
     )
 
     llm = ChatGoogle(
-        model="gemini-3-flash-preview",
+        model="gemini-3.1-flash-lite",
         vertexai=True,
         # location="asia-south1",
         project="cabswale-ai",
@@ -553,4 +553,10 @@ async def run_agent(
     print(f"Token usage: {result.usage}")
     usage_summary = await agent.token_cost_service.get_usage_summary()
     print(f"Usage summary: {usage_summary}")
+    try:
+        cached = usage_summary.total_prompt_cached_tokens or 0
+        total = usage_summary.total_prompt_tokens or 1
+        print(f"Cache hit rate: {cached}/{total} = {100*cached/total:.1f}%")
+    except Exception:
+        pass
     return result
