@@ -534,7 +534,7 @@ async def run_agent(
     )
 
     llm = ChatGoogle(
-        model="gemini-3.1-flash-lite",
+        model="gemini-3-flash-preview",
         vertexai=True,
         # location="asia-south1",
         project="cabswale-ai",
