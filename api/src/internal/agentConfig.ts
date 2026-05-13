@@ -1,5 +1,5 @@
 import { FieldValue } from "firebase-admin/firestore";
-import { db, challanRequestsRef } from "../firebase";
+import { db, challanRequestsRef, borderTaxRequestsRef } from "../firebase";
 
 const agentConfigRef = db.collection("settings").doc("automationAgentConfig");
 
@@ -75,25 +75,50 @@ export async function releaseAgentSlot(jobId: string): Promise<{ ok: boolean; er
 }
 
 /**
- * Save agent cost/usage data to the challanRequest document.
+ * Save agent cost/usage data to the request document for the given task.
+ *
+ * Routes to the correct Firestore collection based on taskId:
+ *   - "challan-settlement" → challanRequests/{requestId}
+ *   - "border-tax"         → borderTaxRequests/{requestId}
+ *
+ * If taskId is omitted or unknown, falls back to challanRequests for
+ * backwards compatibility — but logs a WARN so we can spot legacy callers.
  */
 export async function saveAgentCost(
     requestId: string,
     jobId: string,
     costData: Record<string, any>,
-    source?: string
+    source?: string,
+    taskId?: string,
 ): Promise<{ ok: boolean; error?: string }> {
     if (!requestId || !costData) {
         return { ok: false, error: "requestId and costData required" };
     }
 
-    try {
-        const docRef = challanRequestsRef.doc(requestId);
-        const docSnap = await docRef.get();
+    let docRef;
+    let collectionLabel: string;
+    if (taskId === "challan-settlement") {
+        docRef = challanRequestsRef.doc(requestId);
+        collectionLabel = "challanRequests";
+    } else if (taskId === "border-tax") {
+        docRef = borderTaxRequestsRef.doc(requestId);
+        collectionLabel = "borderTaxRequests";
+    } else {
+        // Backwards compat: legacy callers don't pass taskId. Default to challan.
+        console.log(
+            `[saveAgentCost] WARN no/unknown taskId="${taskId}" — defaulting to challanRequests`
+        );
+        docRef = challanRequestsRef.doc(requestId);
+        collectionLabel = "challanRequests (default)";
+    }
 
+    try {
+        const docSnap = await docRef.get();
         if (!docSnap.exists) {
-            console.log(`[saveAgentCost] challanRequest doc not found for requestId=${requestId}`);
-            return { ok: false, error: "challanRequest not found" };
+            console.log(
+                `[saveAgentCost] ${collectionLabel} doc not found for requestId=${requestId}`
+            );
+            return { ok: false, error: `${collectionLabel} doc not found` };
         }
 
         await docRef.update({
@@ -106,7 +131,9 @@ export async function saveAgentCost(
         });
 
         console.log(
-            `[saveAgentCost] saved cost for requestId=${requestId} jobId=${jobId} totalCost=${costData.totalCost}`
+            `[saveAgentCost] saved cost taskId=${taskId} collection=${collectionLabel} ` +
+            `requestId=${requestId} jobId=${jobId} totalCost=${costData.totalCost} ` +
+            `costSource=${costData.costSource ?? "n/a"}`
         );
         return { ok: true };
     } catch (e) {

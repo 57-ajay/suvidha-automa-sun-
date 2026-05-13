@@ -8,9 +8,10 @@ import { releaseAgentSlot, saveAgentCost } from "./internal/agentConfig";
 import { saveAgentWorkSummary } from "./internal/agentWorkSummary";
 import { DASHBOARD_HTML } from "./dashboard";
 import { setAssignedPartner } from "./internal/assignedPartner";
-import { markChallansUpdatedByAgent } from "./internal/challanSettlement/markUpdated";
-
+import { setAiAgentWorkStatus } from "./internal/aiAgentWorkStatus";
 import "./firebase";
+import { handleSaveQR } from "./internal/borderTax/qr";
+import { handleSaveRunLog, type RunLogStep } from "./internal/borderTax/runLog";
 
 const redis = new Redis(process.env.REDIS_URL || "redis://localhost:6379");
 
@@ -88,6 +89,7 @@ const server = Bun.serve({
                 const pipeline = redis.pipeline();
 
                 pipeline.del(`job:${jobId}`);
+                pipeline.del(`job:${jobId}:partial_reasons`);
                 pipeline.hset(`job:${jobId}`, {
                     id: jobId,
                     taskId,
@@ -107,11 +109,21 @@ const server = Bun.serve({
                 pipeline.lpush("job:queue", jobId);
 
                 await pipeline.exec();
-
                 if (resolvedSource === "app" && params?.requestId) {
                     setAssignedPartner(params.requestId, taskId).catch((e) => {
                         console.error(
-                            `[API] background setAssignedPartner failed for requestId=${params.requestId}:`,
+                            `[API] background setAssignedPartner failed for requestId=
+                                    ${params.requestId}:`,
+                            e,
+                        );
+                    });
+                }
+
+                if (params?.requestId) {
+                    setAiAgentWorkStatus(params.requestId, taskId, "started").catch((e) => {
+                        console.error(
+                            `[API] background setAiAgentWorkStatus(started) failed for requestId=
+                                    ${params.requestId}:`,
                             e,
                         );
                     });
@@ -317,24 +329,176 @@ const server = Bun.serve({
                 }
             }
 
-            // Border tax receipt save
-            if (req.method === "POST" && url.pathname === "/api/internal/border-tax/save-receipt") {
+            if (req.method === "POST" && url.pathname === "/api/internal/border-tax/save-qr") {
                 try {
-                    const raw = await req.text();
-                    console.log(`[API] POST /api/internal/border-tax/save-receipt | body length=${raw.length}`);
-                    console.log(`[API]   body preview: ${raw.substring(0, 500)}`);
-
-                    let body: InternalRequest;
-                    try {
-                        body = JSON.parse(raw) as InternalRequest;
-                    } catch (parseErr) {
-                        console.log(`[API]   FAIL: body is not valid JSON`);
-                        return Response.json({ ok: false, error: "Request body is not valid JSON" }, { status: 400 });
+                    const contentType = req.headers.get("content-type") || "";
+                    if (!contentType.toLowerCase().includes("multipart/form-data")) {
+                        console.log(
+                            `[API] POST /api/internal/border-tax/save-qr | FAIL: wrong content-type=${contentType}`
+                        );
+                        return Response.json(
+                            { ok: false, error: `Expected multipart/form-data, got: ${contentType}` },
+                            { status: 400 }
+                        );
                     }
 
-                    console.log(`[API]   jobId=${body.jobId} params=${JSON.stringify(body.params)} dataType=${typeof body.data} isArray=${Array.isArray(body.data)}`);
+                    const formData = await req.formData();
+                    const imageFile = formData.get("image");
+                    const jobIdField = formData.get("jobId");
+                    const paramsRaw = formData.get("params");
 
-                    const result = await handleSaveReceipt(body);
+                    if (!imageFile || !(imageFile instanceof Blob)) {
+                        return Response.json(
+                            { ok: false, error: "Missing or invalid 'image' part" },
+                            { status: 400 }
+                        );
+                    }
+                    if (typeof jobIdField !== "string" || !jobIdField) {
+                        return Response.json(
+                            { ok: false, error: "Missing 'jobId' field" },
+                            { status: 400 }
+                        );
+                    }
+                    if (typeof paramsRaw !== "string") {
+                        return Response.json(
+                            { ok: false, error: "Missing 'params' field" },
+                            { status: 400 }
+                        );
+                    }
+
+                    let parsedParams: Record<string, string>;
+                    try {
+                        parsedParams = JSON.parse(paramsRaw);
+                    } catch (e: any) {
+                        return Response.json(
+                            { ok: false, error: `'params' is not valid JSON: ${e.message}` },
+                            { status: 400 }
+                        );
+                    }
+
+                    const imageBuffer = Buffer.from(await imageFile.arrayBuffer());
+
+                    console.log(
+                        `[API] POST /api/internal/border-tax/save-qr | ` +
+                        `jobId=${jobIdField} image=${imageBuffer.length} bytes ` +
+                        `params=${JSON.stringify(parsedParams)}`
+                    );
+
+                    if (imageBuffer.length < 100) {
+                        console.log(`[API]   FAIL: image too small (${imageBuffer.length} bytes)`);
+                        return Response.json(
+                            { ok: false, error: `Image too small (${imageBuffer.length} bytes), likely a blank screenshot` },
+                            { status: 400 }
+                        );
+                    }
+
+                    const result = await handleSaveQR({
+                        jobId: jobIdField,
+                        params: parsedParams,
+                        imageBuffer,
+                    });
+
+                    if (result.ok && result.qrUrl) {
+                        redis.hset(`job:${jobIdField}`, "qrCodeUrl", result.qrUrl).catch((e: any) => {
+                            console.error(`[API] save-qr: failed to write qrCodeUrl to Redis job hash:`, e);
+                        });
+                    }
+
+                    const status = result.ok ? 200 : 400;
+                    console.log(`[API]   result: ${JSON.stringify(result)}`);
+                    return Response.json(result, { status });
+                } catch (e: any) {
+                    console.error("[API] ERROR save_qr:", e);
+                    return Response.json({ ok: false, error: e.message }, { status: 500 });
+                }
+            }
+
+            // Border tax receipt save (multipart/form-data with PDF)
+            if (req.method === "POST" && url.pathname === "/api/internal/border-tax/save-receipt") {
+                try {
+                    const contentType = req.headers.get("content-type") || "";
+                    if (!contentType.toLowerCase().includes("multipart/form-data")) {
+                        console.log(`[API] POST /api/internal/border-tax/save-receipt
+                            | FAIL: wrong content-type=${contentType}`);
+                        return Response.json(
+                            { ok: false, error: `Expected multipart/form-data, got: ${contentType}` },
+                            { status: 400 }
+                        );
+                    }
+
+                    const formData = await req.formData();
+                    const pdfFile = formData.get("pdf");
+                    const jobIdField = formData.get("jobId");
+                    const paramsRaw = formData.get("params");
+                    const dataRaw = formData.get("data");
+
+                    if (!pdfFile || !(pdfFile instanceof Blob)) {
+                        return Response.json(
+                            { ok: false, error: "Missing or invalid 'pdf' part" },
+                            { status: 400 }
+                        );
+                    }
+                    if (typeof jobIdField !== "string" || !jobIdField) {
+                        return Response.json(
+                            { ok: false, error: "Missing 'jobId' field" },
+                            { status: 400 }
+                        );
+                    }
+                    if (typeof paramsRaw !== "string") {
+                        return Response.json(
+                            { ok: false, error: "Missing 'params' field" },
+                            { status: 400 }
+                        );
+                    }
+                    if (typeof dataRaw !== "string") {
+                        return Response.json(
+                            { ok: false, error: "Missing 'data' field" },
+                            { status: 400 }
+                        );
+                    }
+
+                    let parsedParams: Record<string, string>;
+                    let parsedData: unknown;
+                    try {
+                        parsedParams = JSON.parse(paramsRaw);
+                    } catch (e: any) {
+                        return Response.json(
+                            { ok: false, error: `'params' is not valid JSON: ${e.message}` },
+                            { status: 400 }
+                        );
+                    }
+                    try {
+                        parsedData = JSON.parse(dataRaw);
+                    } catch (e: any) {
+                        return Response.json(
+                            { ok: false, error: `'data' is not valid JSON: ${e.message}` },
+                            { status: 400 }
+                        );
+                    }
+
+                    const pdfBuffer = Buffer.from(await pdfFile.arrayBuffer());
+
+                    console.log(
+                        `[API] POST /api/internal/border-tax/save-receipt | ` +
+                        `jobId=${jobIdField} pdf=${pdfBuffer.length} bytes ` +
+                        `params=${JSON.stringify(parsedParams)} ` +
+                        `data=${JSON.stringify(parsedData).substring(0, 200)}`
+                    );
+
+                    if (pdfBuffer.length < 1000) {
+                        console.log(`[API]   FAIL: PDF too small (${pdfBuffer.length} bytes)`);
+                        return Response.json(
+                            { ok: false, error: `PDF too small (${pdfBuffer.length} bytes), likely corrupted or empty page` },
+                            { status: 400 }
+                        );
+                    }
+
+                    const result = await handleSaveReceipt({
+                        jobId: jobIdField,
+                        params: parsedParams,
+                        data: parsedData,
+                        pdfBuffer,
+                    });
                     const status = result.ok ? 200 : 400;
                     console.log(`[API]   result: ${JSON.stringify(result)}`);
                     return Response.json(result, { status });
@@ -350,17 +514,20 @@ const server = Bun.serve({
                     const body = await req.json() as {
                         jobId: string;
                         requestId?: string;
-                        status?: "done" | "failed";
+                        status?: "done" | "failed" | "partial";
                         summary?: string;
                         error?: string;
                         costData?: Record<string, any>;
                         source?: string;
+                        partialReasons?: string[];
+                        runLog?: RunLogStep[];
                     };
-                    const { jobId, requestId, status, summary, error, costData, source } = body;
+                    const { jobId, requestId, status, summary, error, costData, source, partialReasons } = body;
 
                     console.log(
                         `[API] POST /api/internal/job-completed | jobId=${jobId} requestId=${requestId} ` +
-                        `status=${status} hasSummary=${!!summary} hasError=${!!error} hasCost=${!!costData}`
+                        `status=${status} hasSummary=${!!summary} hasError=${!!error} ` +
+                        `hasCost=${!!costData} partialReasons=${partialReasons?.length ?? 0}`
                     );
 
                     // Refresh TTL on completion so job stays visible for 24H from now
@@ -376,24 +543,36 @@ const server = Bun.serve({
                         console.error(`[API] background releaseAgentSlot failed for requestId=${requestId}:`, e);
                     });
 
-                    // Save cost data to challanRequest (fire-and-forget)
-                    if (costData) {
-                        saveAgentCost(requestId, jobId, costData, source).catch((e) => {
-                            console.error(`[API] background saveAgentCost failed for requestId=${requestId}:`, e);
+                    if (body.runLog && body.runLog.length > 0 && body.requestId) {
+                        handleSaveRunLog({
+                            jobId: body.jobId,
+                            requestId: body.requestId,
+                            steps: body.runLog,
+                            finalStatus: body.status,
+                            abortReason: body.error,
+                            summary: body.summary,
+                            totalCostUsd:
+                                typeof body.costData?.totalCost === "number"
+                                    ? body.costData.totalCost
+                                    : undefined,
+                            partialReasons: body.partialReasons,
+                        }).catch((e) => {
+                            console.error(
+                                `[API] background handleSaveRunLog failed for `
+                                + `requestId=${body.requestId}:`,
+                                e,
+                            );
                         });
                     }
 
-                    // Persist agent work summary to Firestore (fire-and-forget).
-                    // Pull taskId / vehicleNumber / params from the Redis job hash so the
-                    // worker doesn't need to resend them.
                     (async () => {
                         try {
                             const job = await redis.hgetall(`job:${jobId}`);
                             let params: Record<string, any> = {};
                             try { params = JSON.parse(job?.params || "{}"); } catch { /* ignore */ }
 
-                            const resolvedStatus: "done" | "failed" =
-                                status === "done" || status === "failed"
+                            const resolvedStatus: "done" | "failed" | "partial" =
+                                status === "done" || status === "failed" || status === "partial"
                                     ? status
                                     : (error ? "failed" : "done");
 
@@ -408,19 +587,40 @@ const server = Bun.serve({
                                 source: source || job?.source || "web",
                                 params,
                                 costData,
+                                partialReasons,
                             });
 
-                            if (job?.taskId === "challan-settlement" && resolvedStatus === "done") {
-                                markChallansUpdatedByAgent(requestId).catch((e) => {
+                            // Map worker's "done" → frontend-facing "completed"
+                            const aiStatus =
+                                resolvedStatus === "done" ? "completed" : resolvedStatus;
+
+                            setAiAgentWorkStatus(requestId, job?.taskId, aiStatus).catch((e) => {
+                                console.error(
+                                    `[API] background setAiAgentWorkStatus(${aiStatus})
+                                    failed for requestId=${requestId}:`,
+                                    e,
+                                );
+                            });
+
+                            if (costData) {
+                                saveAgentCost(
+                                    requestId,
+                                    jobId,
+                                    costData,
+                                    source || job?.source || "web",
+                                    job?.taskId,
+                                ).catch((e) => {
                                     console.error(
-                                        `[API] background markChallansUpdatedByAgent failed for requestId=${requestId}:`,
+                                        `[API] background saveAgentCost failed for requestId=${requestId}:`,
                                         e,
                                     );
                                 });
                             }
 
+
                         } catch (e) {
-                            console.error(`[API] background saveAgentWorkSummary failed for requestId=${requestId}:`, e);
+                            console.error(`[API] background saveAgentWorkSummary
+                                          failed for requestId=${requestId}:`, e);
                         }
                     })();
 
@@ -430,7 +630,6 @@ const server = Bun.serve({
                     return Response.json({ ok: false, error: e.message }, { status: 500 });
                 }
             }
-
             // POST /api/jobs/:id/cancel
             const cancelMatch = url.pathname.match(/^\/api\/jobs\/([^/]+)\/cancel$/);
             if (req.method === "POST" && cancelMatch) {
@@ -442,7 +641,8 @@ const server = Bun.serve({
                 }
 
                 const current = job.status;
-                if (current === "done" || current === "failed" || current === "cancelled") {
+                if (current === "done" || current === "failed" || current === "cancelled"
+                    || current === "partial") {
                     return Response.json(
                         { error: `Job already ${current}` },
                         { status: 400 }
@@ -460,6 +660,19 @@ const server = Bun.serve({
                 await redis.expire(`job:${jobId}`, JOB_TTL);
 
                 await releaseAgentSlot(jobId);
+
+                let params: Record<string, any> = {};
+                try { params = JSON.parse(job.params || "{}"); } catch { /* ignore */ }
+                const requestId = typeof params.requestId === "string" ? params.requestId : undefined;
+
+                if (requestId) {
+                    setAiAgentWorkStatus(requestId, job.taskId, "failed").catch((e) => {
+                        console.error(
+                            `[API] background setAiAgentWorkStatus(failed) on cancel failed for requestId=${requestId}:`,
+                            e,
+                        );
+                    });
+                }
 
                 return Response.json({ ok: true, message: "Cancellation requested" });
             }

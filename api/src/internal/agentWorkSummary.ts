@@ -8,12 +8,13 @@ export interface SaveAgentWorkSummaryInput {
     requestId: string;
     taskId?: string;
     vehicleNumber?: string;
-    status: "done" | "failed";
+    status: "done" | "failed" | "partial";
     summary?: string;
     error?: string;
     source?: string;
     params?: Record<string, any>;
     costData?: Record<string, any>;
+    partialReasons?: string[];
 }
 
 /**
@@ -47,6 +48,9 @@ export async function saveAgentWorkSummary(
         if (input.error) payload.error = input.error;
         if (input.params) payload.params = input.params;
         if (input.costData) payload.cost = input.costData;
+        if (input.partialReasons && input.partialReasons.length > 0) {
+            payload.partialReasons = input.partialReasons;
+        }
 
         await agentWorkSummaryRef.doc(requestId).set(payload, { merge: true });
 
