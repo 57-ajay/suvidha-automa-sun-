@@ -165,7 +165,7 @@ async def wait_for_selector(
     *,
     log: StepLogger,
     name: str,
-    timeout: int = 15,
+    timeout: int = 30,
 ) -> None:
     started = time.monotonic()
     try:
@@ -339,39 +339,90 @@ async def select_by_text(
     *,
     log: StepLogger,
     name: str,
-    timeout: int = 10,
+    timeout: int = 30,
 ) -> None:
-    """Set a native <select>'s value to the option whose visible text matches
-    (exact first, case-insensitive second, contains third)."""
+    """Set a native <select>'s value to the option whose visible text matches.
+
+    Match order: exact -> case-insensitive equal -> case-insensitive contains.
+
+    Polls every 0.5s for up to `timeout` seconds. Before each option read,
+    dispatches focus + mousedown + mouseup on every matching element so
+    Angular's lazy bindings activate. Iterates ALL elements returned by
+    querySelectorAll(selector) -- the first <select> that has a matching
+    option wins.
+    """
     started = time.monotonic()
     try:
         await _wait_visible(session, selector, timeout=timeout)
+        deadline = time.monotonic() + timeout
+
+        # NOTE: the wakeup block at the top of the expression triggers any
+        # Angular bindings that lazy-load options. Then we proceed with the
+        # same match-and-dump logic from v2.
         expr = (
-            "(function(s,t){var e=document.querySelector(s);"
-            "if(!e) return {ok:false,reason:'not_found'};"
+            "(function(s,t){"
+            "var els=document.querySelectorAll(s);"
+            "for(var w=0;w<els.length;w++){"
+            "  var we=els[w];"
+            "  if(!(we instanceof HTMLSelectElement)){continue;}"
+            "  try{"
+            "    we.focus();"
+            "    we.dispatchEvent(new FocusEvent('focusin',{bubbles:true}));"
+            "    we.dispatchEvent(new MouseEvent('mousedown',{bubbles:true,cancelable:true}));"
+            "    we.dispatchEvent(new MouseEvent('mouseup',{bubbles:true,cancelable:true}));"
+            "  }catch(err){}"
+            "}"
             "var trimmed=(t||'').trim();"
             "var upper=trimmed.toUpperCase();"
-            "var match=null;"
-            "for(var i=0;i<e.options.length;i++){var o=e.options[i],ot=(o.text||'').trim();"
-            "  if(ot===trimmed){match=o;break;}}"
-            "if(!match){for(var j=0;j<e.options.length;j++){var o2=e.options[j],ot2=(o2.text||'').trim().toUpperCase();"
-            "  if(ot2===upper){match=o2;break;}}}"
-            "if(!match){for(var k=0;k<e.options.length;k++){var o3=e.options[k],ot3=(o3.text||'').trim().toUpperCase();"
-            "  if(ot3 && ot3.indexOf(upper)>=0){match=o3;break;}}}"
-            "if(!match){return {ok:false,reason:'option_not_found',"
-            "options:Array.from(e.options).map(function(o){return (o.text||'').trim();})};}"
-            "e.value=match.value;"
-            "e.dispatchEvent(new Event('input',{bubbles:true}));"
-            "e.dispatchEvent(new Event('change',{bubbles:true}));"
-            "return {ok:true,value:match.value,text:(match.text||'').trim()};"
+            "var dump=[];"
+            "for(var ei=0;ei<els.length;ei++){"
+            "  var e=els[ei];"
+            "  if(!(e instanceof HTMLSelectElement)){continue;}"
+            "  var r=e.getBoundingClientRect();"
+            "  var visible=(r.width>0 && r.height>0);"
+            "  var texts=[],values=[];"
+            "  for(var oi=0;oi<e.options.length;oi++){"
+            "    texts.push((e.options[oi].text||'').trim());"
+            "    values.push(e.options[oi].value);"
+            "  }"
+            "  dump.push({idx:ei,optionCount:e.options.length,"
+            "             optionTexts:texts,optionValues:values,"
+            "             visible:visible,classes:e.className||''});"
+            "  var match=null;"
+            "  for(var i=0;i<e.options.length;i++){"
+            "    if((e.options[i].text||'').trim()===trimmed){match=e.options[i];break;}}"
+            "  if(!match){for(var j=0;j<e.options.length;j++){"
+            "    if((e.options[j].text||'').trim().toUpperCase()===upper){"
+            "      match=e.options[j];break;}}}"
+            "  if(!match){for(var k=0;k<e.options.length;k++){"
+            "    var u=(e.options[k].text||'').trim().toUpperCase();"
+            "    if(u && u.indexOf(upper)>=0){match=e.options[k];break;}}}"
+            "  if(match){"
+            "    e.value=match.value;"
+            "    e.dispatchEvent(new Event('input',{bubbles:true}));"
+            "    e.dispatchEvent(new Event('change',{bubbles:true}));"
+            "    return {ok:true,elementIndex:ei,value:match.value,"
+            "            text:(match.text||'').trim()};"
+            "  }"
+            "}"
+            "return {ok:false,reason:'option_not_found',elements:dump};"
             "})(" + json.dumps(selector) + "," + json.dumps(text) + ")"
         )
-        res = await _cdp_eval(session, expr)
-        if not res or not res.get("ok"):
-            reason = (res or {}).get("reason", "select_failed")
-            opts = (res or {}).get("options")
-            raise RuntimeError(f"{reason}; available={opts}")
-        _log_ok(log, name, started, selector=selector, value=text)
+
+        last_dump = None
+        while True:
+            res = await _cdp_eval(session, expr)
+            if res and res.get("ok"):
+                _log_ok(log, name, started, selector=selector, value=text)
+                return
+            if res:
+                last_dump = res.get("elements")
+            if time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"option_not_found after {timeout}s polling; "
+                    f"elements_seen={last_dump}"
+                )
+            await asyncio.sleep(0.5)
     except Exception as e:
         _log_fail(log, name, started, e, selector=selector, value=text)
         raise
@@ -384,31 +435,76 @@ async def select_by_value(
     *,
     log: StepLogger,
     name: str,
-    timeout: int = 10,
+    timeout: int = 30,
 ) -> None:
-    """Set a native <select>'s value directly. Useful when option values are
-    stable codes (e.g. state code 'UP') but visible text varies."""
+    """Set a native <select>'s value directly.
+
+    Polls every 0.5s for up to `timeout` seconds. Before each read,
+    dispatches focus + mousedown + mouseup events on every matching
+    element to trigger Angular's lazy bindings. Iterates ALL elements
+    returned by querySelectorAll(selector) -- the first <select> that has
+    the requested value wins.
+    """
     started = time.monotonic()
     try:
         await _wait_visible(session, selector, timeout=timeout)
+        deadline = time.monotonic() + timeout
+
         expr = (
-            "(function(s,v){var e=document.querySelector(s);"
-            "if(!e) return {ok:false,reason:'not_found'};"
-            "var found=false;"
-            "for(var i=0;i<e.options.length;i++){if(e.options[i].value===v){found=true;break;}}"
-            "if(!found) return {ok:false,reason:'value_not_found',"
-            "values:Array.from(e.options).map(function(o){return o.value;})};"
-            "e.value=v;"
-            "e.dispatchEvent(new Event('input',{bubbles:true}));"
-            "e.dispatchEvent(new Event('change',{bubbles:true}));"
-            "return {ok:true};"
+            "(function(s,v){"
+            "var els=document.querySelectorAll(s);"
+            "for(var w=0;w<els.length;w++){"
+            "  var we=els[w];"
+            "  if(!(we instanceof HTMLSelectElement)){continue;}"
+            "  try{"
+            "    we.focus();"
+            "    we.dispatchEvent(new FocusEvent('focusin',{bubbles:true}));"
+            "    we.dispatchEvent(new MouseEvent('mousedown',{bubbles:true,cancelable:true}));"
+            "    we.dispatchEvent(new MouseEvent('mouseup',{bubbles:true,cancelable:true}));"
+            "  }catch(err){}"
+            "}"
+            "var dump=[];"
+            "for(var ei=0;ei<els.length;ei++){"
+            "  var e=els[ei];"
+            "  if(!(e instanceof HTMLSelectElement)){continue;}"
+            "  var r=e.getBoundingClientRect();"
+            "  var visible=(r.width>0 && r.height>0);"
+            "  var texts=[],values=[];"
+            "  for(var oi=0;oi<e.options.length;oi++){"
+            "    texts.push((e.options[oi].text||'').trim());"
+            "    values.push(e.options[oi].value);"
+            "  }"
+            "  dump.push({idx:ei,optionCount:e.options.length,"
+            "             optionTexts:texts,optionValues:values,"
+            "             visible:visible,classes:e.className||''});"
+            "  var found=false;"
+            "  for(var i=0;i<e.options.length;i++){"
+            "    if(e.options[i].value===v){found=true;break;}}"
+            "  if(found){"
+            "    e.value=v;"
+            "    e.dispatchEvent(new Event('input',{bubbles:true}));"
+            "    e.dispatchEvent(new Event('change',{bubbles:true}));"
+            "    return {ok:true,elementIndex:ei};"
+            "  }"
+            "}"
+            "return {ok:false,reason:'value_not_found',elements:dump};"
             "})(" + json.dumps(selector) + "," + json.dumps(value) + ")"
         )
-        res = await _cdp_eval(session, expr)
-        if not res or not res.get("ok"):
-            reason = (res or {}).get("reason", "select_failed")
-            raise RuntimeError(reason)
-        _log_ok(log, name, started, selector=selector, value=value)
+
+        last_dump = None
+        while True:
+            res = await _cdp_eval(session, expr)
+            if res and res.get("ok"):
+                _log_ok(log, name, started, selector=selector, value=value)
+                return
+            if res:
+                last_dump = res.get("elements")
+            if time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"value_not_found after {timeout}s polling; "
+                    f"elements_seen={last_dump}"
+                )
+            await asyncio.sleep(0.5)
     except Exception as e:
         _log_fail(log, name, started, e, selector=selector, value=value)
         raise
@@ -494,3 +590,19 @@ async def sleep_seconds(
     started = time.monotonic()
     await asyncio.sleep(secs)
     _log_ok(log, name, started, value=f"{secs}s")
+
+
+async def get_select_value(session, selector: str) -> str | None:
+    """Returns the currently selected value of a <select>:
+        - non-empty string if a real option is selected
+        - "" if the placeholder/empty option is selected
+        - None if the element isn't a <select> (or doesn't exist)
+    No log entry -- intended for use inside higher-level step compositions.
+    """
+    expr = (
+        "(function(s){var e=document.querySelector(s);"
+        "if(!(e instanceof HTMLSelectElement)) return null;"
+        "return e.value;"
+        "})(" + json.dumps(selector) + ")"
+    )
+    return await _cdp_eval(session, expr)

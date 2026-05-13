@@ -26,6 +26,7 @@ services:
       - API_URL=http://api:3000
       - DOMAIN=${DOMAIN}
       - MAX_SLOTS=${MAX_SLOTS:-10}
+      - SCRIPTED_BORDER_TAX_STATES=${SCRIPTED_BORDER_TAX_STATES:-}
     depends_on:
       - redis
       - api
