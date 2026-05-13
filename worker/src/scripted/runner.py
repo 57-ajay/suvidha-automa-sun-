@@ -26,7 +26,7 @@ import traceback
 from typing import Awaitable, Callable
 
 import redis
-from browser_use import Browser, BrowserProfile
+from browser_use import Browser
 from pydantic import ValidationError
 
 from .border_tax.params import BorderTaxParams
@@ -40,7 +40,7 @@ from .types import HandoffNeeded, RunOutcome, ScriptedAbort
 # Empty in the foundation branch; populated by per-state branches.
 _BORDER_TAX_STATE_MODULES: dict[str, str] = {
     "UP": "scripted.border_tax.up",
-    # "HR": "scripted.border_tax.hr",
+    "HR": "scripted.border_tax.hr",
     # "RJ": "scripted.border_tax.rj",
 }
 

@@ -12,6 +12,12 @@ The TS layer is responsible for normalization (dates -> YYYY-MM-DD,
 state code -> full name or short code, etc.). The worker just trusts the
 shapes the model declares here; ValidationError -> immediate job failure
 before the browser even starts.
+
+serviceType NOTE: this is a plain `str` (not a Literal) because each state
+uses different option labels. UP expects "Air Conditioned Service" /
+"Ordinary Service"; HR uses "NOT APPLICABLE"; RJ has its own list. The
+state-specific runner is responsible for sending an option that actually
+exists in that state's Service Type dropdown.
 """
 
 from __future__ import annotations
@@ -47,10 +53,10 @@ class BorderTaxParams(BaseModel):
     entryDistrict: str = ""
     entryCheckpoint: str = ""
 
-    serviceType: Literal[
-        "Air Conditioned Service",
-        "Ordinary Service",
-    ] = "Air Conditioned Service"
+    # Per-state Service Type label. UP: "Air Conditioned Service" /
+    # "Ordinary Service". HR: "NOT APPLICABLE". RJ: its own list. The
+    # state runner forwards whatever string the API resolved.
+    serviceType: str = "Air Conditioned Service"
 
     permitType: str = "ALL INDIA TOURIST PERMIT"
     permitTypeFallback: str = "TEMPORARY PERMIT"
