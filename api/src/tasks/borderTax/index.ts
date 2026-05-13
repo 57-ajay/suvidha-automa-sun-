@@ -1,4 +1,3 @@
-
 import type { Task } from "../types";
 import { tools } from "./tool";
 import { buildPrompt } from "./prompt";
@@ -15,6 +14,7 @@ export const borderTax: Task = {
         "entryCheckpoint",
         "serviceType",
         "permitType",
+        "permitTypeFallback",
         "distance",
         "paymentMethod",
         "bankName",
@@ -24,4 +24,3 @@ export const borderTax: Task = {
     tools: tools,
     buildPrompt: async (p, _source) => { return await buildPrompt(p) },
 };
-

@@ -1,15 +1,36 @@
-import asyncio
-import base64
+"""AI-driven agent runner.
+
+The legacy/general-purpose path. Still used for:
+  - Non-border-tax tasks (challan settlement, etc.)
+  - border-tax states/payment-methods where the scripted runner isn't
+    enabled (SCRIPTED_BORDER_TAX_STATES env var doesn't include the state,
+    or paymentMethod=net_banking which v1 scripted doesn't support).
+
+After the chunk-2 refactor:
+  - Tool decorators still register the same tools with browser-use Agent.
+  - Tool BODIES are now one-line calls into actions.py. The actual CDP /
+    Redis / HTTP logic lives there once and is shared with the scripted
+    path.
+  - Behavior on the wire is unchanged -- tools still return JSON strings
+    with the same shapes the LLM has been seeing.
+"""
+
 import json
 import os
 
 import httpx
 import redis
-from browser_use import Agent, Browser, ChatGoogle, Tools, BrowserSession
+from browser_use import Agent, Browser, BrowserSession, ChatGoogle, Tools
+
+from actions import (
+    HUMAN_WAIT_TIMEOUT,
+    save_qr_code as _save_qr_code_impl,
+    save_receipt as _save_receipt_impl,
+    wait_for_human as _wait_for_human_impl,
+)
+
 
 API_URL = os.environ.get("API_URL", "http://api:3000")
-HUMAN_WAIT_TIMEOUT = 200
-JOB_TTL = 60 * 60 * 24
 
 
 def make_tools(
@@ -21,7 +42,7 @@ def make_tools(
 ) -> Tools:
     tools = Tools()
 
-    # -- always available: wait_for_human --
+    # ─── wait_for_human (always available) ────────────────────────────
     @tools.action(
         description=(
             "Call this when you need human help. "
@@ -39,42 +60,11 @@ def make_tools(
         )
     )
     async def wait_for_human(reason: str) -> str:
-        print(f"[{job_id}] Waiting for human (timeout={
-              HUMAN_WAIT_TIMEOUT}s): {reason}")
+        return await _wait_for_human_impl(job_id, r, reason)
 
-        r.hset(f"job:{job_id}", mapping={
-            "status": "waiting_for_human",
-            "waitReason": reason,
-        })
-
-        waited = 0
-        while waited < HUMAN_WAIT_TIMEOUT:
-            human_input = r.hget(f"job:{job_id}", "humanInput")
-            if human_input:
-                human_input = human_input.decode() if isinstance(
-                    human_input, bytes) else human_input
-                r.hdel(f"job:{job_id}", "humanInput", "waitReason")
-                r.hset(f"job:{job_id}", "status", "running")
-                print(f"[{job_id}] Human done: {human_input}")
-                return human_input
-            await asyncio.sleep(1)
-            waited += 1
-
-        # Timeout — record partial reason, flip status back to running, let the agent continue
-        r.hdel(f"job:{job_id}", "waitReason")
-        r.hset(f"job:{job_id}", "status", "running")
-        r.rpush(f"job:{job_id}:partial_reasons", f"human_timeout:{reason}")
-        r.expire(f"job:{job_id}:partial_reasons", JOB_TTL)
-        print(f"[{job_id}] Human timeout after {
-              HUMAN_WAIT_TIMEOUT}s: {reason}")
-        return (
-            f"TIMEOUT: No human response after {HUMAN_WAIT_TIMEOUT} seconds. "
-            f"Reason was: {reason}. Do NOT call wait_for_human again. "
-            "Save any partial data via save_challans / save_discounts / save_receipt, "
-            "then complete with 'Status: partial'."
-        )
-
+    # ─── border-tax tools ─────────────────────────────────────────────
     if task_id == "border-tax":
+
         @tools.action(
             description=(
                 "Call this ONCE when the UPI QR code page is fully loaded and visible, "
@@ -84,165 +74,15 @@ def make_tools(
                 "so the client app can display the QR directly to the user.\n\n"
                 "Takes NO parameters — call it as save_qr_code({}).\n\n"
                 "Returns JSON:\n"
-                "  {\"ok\": true}  → QR uploaded. Proceed to call wait_for_human as normal.\n"
-                "  {\"ok\": false} → Upload failed. Log the error, then STILL call "
+                '  {"ok": true}  → QR uploaded. Proceed to call wait_for_human as normal.\n'
+                '  {"ok": false} → Upload failed. Log the error, then STILL call '
                 "wait_for_human — a QR upload failure must NEVER block the payment.\n\n"
                 "IMPORTANT: Call this at most ONCE per job. Do NOT retry on failure."
             )
         )
         async def save_qr_code(browser_session: BrowserSession) -> str:
-            print(f"[{job_id}] save_qr_code called")
-
-            try:
-                cdp = await browser_session.get_or_create_cdp_session()
-                eval_result = await cdp.cdp_client.send.Runtime.evaluate(
-                    params={
-                        "expression": """
-                            (function() {
-                                // UP/HR: <img id="qrcodeImg">
-                                var img = document.getElementById('qrcodeImg');
-
-                                // RJ: <img> inside <div id="ct100_ContentPlaceHolder1_divQRCode">
-                                if (!img) {
-                                    var container = document.getElementById(
-                                        'ct100_ContentPlaceHolder1_divQRCode'
-                                    );
-                                    if (container) img = container.querySelector('img');
-                                }
-
-                                if (!img) return null;
-
-                                var src  = img.src || '';
-                                var rect = img.getBoundingClientRect();
-                                return {
-                                    src:       src,
-                                    isDataUri: src.startsWith('data:'),
-                                    x:         rect.left,
-                                    y:         rect.top,
-                                    width:     rect.width,
-                                    height:    rect.height
-                                };
-                            })()
-                        """,
-                        "returnByValue": True,
-                    },
-                    session_id=cdp.session_id,
-                )
-
-                info = eval_result.get("result", {}).get("value")
-
-                if not info:
-                    msg = (
-                        "QR code img element not found — tried #qrcodeImg (UP/HR) "
-                        "and #ct100_ContentPlaceHolder1_divQRCode img (RJ)"
-                    )
-                    print(f"[{job_id}]   ERROR: {msg}")
-                    return json.dumps({"ok": False, "error": msg})
-
-                if info.get("width", 0) <= 0 or info.get("height", 0) <= 0:
-                    msg = f"QR element found but has zero size (w={info.get('width')} h={
-                        info.get('height')})"
-                    print(f"[{job_id}]   ERROR: {msg}")
-                    return json.dumps({"ok": False, "error": msg})
-
-                print(
-                    f"[{job_id}]   QR element found: "
-                    f"isDataUri={info.get('isDataUri')} "
-                    f"x={info.get('x', 0):.1f} y={info.get('y', 0):.1f} "
-                    f"w={info.get('width', 0):.1f} h={
-                        info.get('height', 0):.1f}"
-                )
-
-                # ─── 2a. RJ path: decode base64 data URI directly ────────────
-                if info.get("isDataUri"):
-                    src = info.get("src", "")
-                    # Format: "data:image/png;base64,<base64data>"
-                    if "," not in src:
-                        msg = "data URI has unexpected format (no comma separator)"
-                        print(f"[{job_id}]   ERROR: {msg}")
-                        return json.dumps({"ok": False, "error": msg})
-
-                    b64_data = src.split(",", 1)[1]
-                    try:
-                        img_bytes = base64.b64decode(b64_data)
-                    except Exception as e:
-                        msg = f"base64 decode failed: {str(e)}"
-                        print(f"[{job_id}]   ERROR: {msg}")
-                        return json.dumps({"ok": False, "error": msg})
-
-                    print(f"[{job_id}]   QR extracted from data URI: {
-                          len(img_bytes)} bytes")
-
-                # ─── 2b. UP/HR path: CDP element screenshot ──────────────────
-                else:
-                    screenshot_result = await cdp.cdp_client.send.Page.captureScreenshot(
-                        params={
-                            "format": "png",
-                            "clip": {
-                                "x":      info["x"],
-                                "y":      info["y"],
-                                "width":  info["width"],
-                                "height": info["height"],
-                                "scale":  1,
-                            },
-                            "captureBeyondViewport": True,
-                        },
-                        session_id=cdp.session_id,
-                    )
-
-                    img_b64 = screenshot_result.get("data", "")
-                    if not img_b64:
-                        msg = "CDP captureScreenshot returned empty data for QR element"
-                        print(f"[{job_id}]   ERROR: {msg}")
-                        return json.dumps({"ok": False, "error": msg})
-
-                    img_bytes = base64.b64decode(img_b64)
-                    print(f"[{job_id}]   QR screenshot captured: {
-                          len(img_bytes)} bytes")
-
-                # ─── 3. Sanity check ─────────────────────────────────────────
-                if len(img_bytes) < 100:
-                    msg = f"QR image suspiciously small ({len(
-                        img_bytes)} bytes) — element may not have rendered yet"
-                    print(f"[{job_id}]   ERROR: {msg}")
-                    return json.dumps({"ok": False, "error": msg})
-
-            except Exception as e:
-                msg = f"CDP error while extracting QR code: {str(e)}"
-                print(f"[{job_id}]   ERROR: {msg}")
-                return json.dumps({"ok": False, "error": msg})
-
-            # ─── 4. POST PNG bytes to the API ─────────────────────────────────
-            try:
-                files = {
-                    "image": ("qr_code.png", img_bytes, "image/png"),
-                }
-                form_data = {
-                    "jobId":  job_id,
-                    "params": json.dumps(job_params),
-                }
-
-                print(
-                    f"[{job_id}]   POSTing QR PNG to "
-                    f"/api/internal/border-tax/save-qr "
-                    f"({len(img_bytes)} bytes)"
-                )
-
-                async with httpx.AsyncClient(timeout=30) as client:
-                    resp = await client.post(
-                        f"{API_URL}/api/internal/border-tax/save-qr",
-                        files=files,
-                        data=form_data,
-                    )
-
-                print(f"[{job_id}] save_qr_code response: {resp.status_code}")
-                print(f"[{job_id}]   body: {resp.text[:300]}")
-                return resp.text
-
-            except Exception as e:
-                msg = f"save_qr_code HTTP error: {str(e)}"
-                print(f"[{job_id}]   ERROR: {msg}")
-                return json.dumps({"ok": False, "error": msg})
+            result = await _save_qr_code_impl(browser_session, job_id, job_params)
+            return json.dumps(result)
 
         @tools.action(
             description=(
@@ -258,154 +98,21 @@ def make_tools(
                 "  - amount (number, in Rs, no currency symbol)\n"
                 "  - paymentDate (string, YYYY-MM-DD)\n\n"
                 "Example data: "
-                "{\"vehicleNumber\":\"HR55AZ1101\","
-                "\"receiptNumber\":\"UPR2604280468752\","
-                "\"amount\":120,"
-                "\"paymentDate\":\"2026-04-28\"}\n\n"
-                "Returns JSON. Confirm both \"ok\": true AND "
-                "\"pdfUploaded\": true to consider the call fully successful. "
-                "If \"ok\": false, do NOT retry — record the error and complete "
+                '{"vehicleNumber":"HR55AZ1101",'
+                '"receiptNumber":"UPR2604280468752",'
+                '"amount":120,'
+                '"paymentDate":"2026-04-28"}\n\n'
+                'Returns JSON. Confirm both "ok": true AND '
+                '"pdfUploaded": true to consider the call fully successful. '
+                'If "ok": false, do NOT retry — record the error and complete '
                 "with 'Status: partial'."
             )
         )
         async def save_receipt(data, browser_session: BrowserSession) -> str:
-            print(f"[{job_id}] save_receipt called")
-            print(f"[{job_id}]   raw data type: {type(data).__name__}")
-            print(f"[{job_id}]   raw data preview: {str(data)[:300]}")
+            result = await _save_receipt_impl(browser_session, job_id, job_params, data)
+            return json.dumps(result)
 
-            # ─── 1. Normalize data: accept dict, JSON string, or single-element list ───
-            if isinstance(data, str):
-                try:
-                    data = json.loads(data.strip())
-                except json.JSONDecodeError as e:
-                    msg = f"data is a string but not valid JSON: {e}"
-                    print(f"[{job_id}]   ERROR: {msg}")
-                    return json.dumps({"ok": False, "error": msg})
-
-            if isinstance(data, list):
-                if len(data) == 1 and isinstance(data[0], dict):
-                    data = data[0]
-                else:
-                    msg = f"data must be a single object, got list of length {
-                        len(data)}"
-                    print(f"[{job_id}]   ERROR: {msg}")
-                    return json.dumps({"ok": False, "error": msg})
-
-            if not isinstance(data, dict):
-                msg = f"data must be an object, got {type(data).__name__}"
-                print(f"[{job_id}]   ERROR: {msg}")
-                return json.dumps({"ok": False, "error": msg})
-
-            # ─── 2. Validate required fields ───
-            required = ["vehicleNumber",
-                        "receiptNumber", "amount", "paymentDate"]
-            missing = [
-                f for f in required
-                if f not in data or data[f] in ("", None)
-            ]
-            if missing:
-                msg = f"Missing required fields: {', '.join(missing)}"
-                print(f"[{job_id}]   ERROR: {msg}")
-                return json.dumps({"ok": False, "error": msg})
-
-            print(
-                f"[{job_id}]   normalized data: vehicle={
-                    data['vehicleNumber']} "
-                f"receipt={data['receiptNumber']} amount={data['amount']} "
-                f"date={data['paymentDate']}"
-            )
-
-            await asyncio.sleep(1.5)
-
-            try:
-                print(f"[{job_id}]   capturing PDF via CDP Page.printToPDF")
-                cdp = await browser_session.get_or_create_cdp_session()
-
-                await cdp.cdp_client.send.Page.enable(session_id=cdp.session_id)
-
-                result = await cdp.cdp_client.send.Page.printToPDF(
-                    params={
-                        "paperWidth": 8.27,
-                        "paperHeight": 11.69,
-                        "printBackground": True,
-                        "preferCSSPageSize": True,
-                        "marginTop": 0.4,
-                        "marginBottom": 0.4,
-                        "marginLeft": 0.4,
-                        "marginRight": 0.4,
-                        "transferMode": "ReturnAsBase64",
-                    },
-                    session_id=cdp.session_id,
-                )
-            except Exception as e:
-                msg = f"CDP printToPDF failed: {str(e)}"
-                print(f"[{job_id}]   ERROR: {msg}")
-                return json.dumps({"ok": False, "error": msg})
-
-            pdf_b64 = result.get("data", "")
-            if not pdf_b64:
-                msg = "CDP printToPDF returned empty data"
-                print(f"[{job_id}]   ERROR: {msg}")
-                return json.dumps({"ok": False, "error": msg})
-
-            try:
-                pdf_bytes = base64.b64decode(pdf_b64)
-            except Exception as e:
-                msg = f"Failed to decode PDF bytes from CDP response: {e}"
-                print(f"[{job_id}]   ERROR: {msg}")
-                return json.dumps({"ok": False, "error": msg})
-
-            print(f"[{job_id}]   PDF captured: {len(pdf_bytes)} bytes")
-
-            if len(pdf_bytes) < 1000:
-                # Sanity check — a real receipt PDF is at least a few KB.
-                # If we got something tiny, the page probably wasn't rendered.
-                msg = f"PDF suspiciously small ({len(
-                    pdf_bytes)} bytes) — receipt page may not have rendered"
-                print(f"[{job_id}]   WARNING: {msg}")
-                # Continue anyway — server will validate
-
-            # ─── 5. Send PDF + metadata to API as multipart/form-data ───
-            try:
-                receipt_no = str(data.get("receiptNumber", "receipt"))
-                # Sanitize for filename
-                safe_name = "".join(
-                    c for c in receipt_no if c.isalnum() or c in "-_"
-                )
-                filename = f"{
-                    safe_name}_receipt.pdf" if safe_name else "receipt.pdf"
-
-                files = {
-                    "pdf": (filename, pdf_bytes, "application/pdf"),
-                }
-                form_data = {
-                    "jobId": job_id,
-                    "params": json.dumps(job_params),
-                    "data": json.dumps(data),
-                }
-
-                print(
-                    f"[{job_id}]   POSTing multipart to "
-                    f"/api/internal/border-tax/save-receipt "
-                    f"(pdf={len(pdf_bytes)} bytes, filename={filename})"
-                )
-
-                async with httpx.AsyncClient(timeout=60) as client:
-                    resp = await client.post(
-                        f"{API_URL}/api/internal/border-tax/save-receipt",
-                        files=files,
-                        data=form_data,
-                    )
-
-                print(f"[{job_id}] save_receipt response: {resp.status_code}")
-                print(f"[{job_id}]   body: {resp.text[:500]}")
-                return resp.text
-            except Exception as e:
-                msg = f"save_receipt HTTP error: {str(e)}"
-                print(f"[{job_id}]   ERROR: {msg}")
-                return json.dumps({"ok": False, "error": msg})
-
-    # -- dynamic tools from task definition --
+    # ─── dynamic tools from task definition ───────────────────────────
     for tool_def in tool_defs:
         _register_dynamic_tool(tools, tool_def, job_id, job_params)
 
@@ -413,22 +120,18 @@ def make_tools(
 
 
 def _normalize_data(data) -> list:
-    """
-    Ensure tool data is a proper list, handling cases where the LLM
-    passes a JSON string instead of a parsed list.
-    """
+    """Ensure tool data is a proper list, handling cases where the LLM
+    passes a JSON string instead of a parsed list."""
     parsedList = []
     if isinstance(data, list):
         parsedList = data
 
     if isinstance(data, str):
         data = data.strip()
-        # Try parsing as JSON string
         try:
             parsed = json.loads(data)
             if isinstance(parsed, list):
                 parsedList = parsed
-            # Single object wrapped in a string
             if isinstance(parsed, dict):
                 parsedList = [parsed]
         except json.JSONDecodeError:
@@ -439,7 +142,6 @@ def _normalize_data(data) -> list:
 
     seen = set()
     deduped = []
-
     for item in parsedList:
         key = item.get("challanId") if isinstance(item, dict) else None
         if key and key in seen:
@@ -474,20 +176,22 @@ def _register_dynamic_tool(
         print(f"[{job_id}]   raw data type: {type(data).__name__}")
         print(f"[{job_id}]   raw data preview: {str(data)[:500]}")
 
-        # Normalize: ensure data is always a list
         normalized = _normalize_data(data)
         print(f"[{job_id}]   normalized: {len(normalized)} items")
 
         if not normalized:
-            msg = f"Tool {_name}: no valid data after normalization (raw type={
-                type(data).__name__})"
+            msg = (
+                f"Tool {_name}: no valid data after normalization "
+                f"(raw type={type(data).__name__})"
+            )
             print(f"[{job_id}]   ERROR: {msg}")
             return json.dumps({"ok": False, "error": msg})
 
-        # Log each item for debugging
         for i, item in enumerate(normalized):
-            print(f"[{job_id}]   item[{i}]: {json.dumps(item)
-                  if isinstance(item, dict) else str(item)}")
+            print(
+                f"[{job_id}]   item[{i}]: "
+                f"{json.dumps(item) if isinstance(item, dict) else str(item)}"
+            )
 
         payload = {
             "jobId": job_id,
@@ -500,11 +204,10 @@ def _register_dynamic_tool(
                 if _method == "POST":
                     resp = await client.post(f"{API_URL}{_endpoint}", json=payload)
                 else:
-                    resp = await client.get(f"{API_URL}{_endpoint}",
-                                            params={
-                                                "payload": json.dumps(payload)}
-                                            )
-
+                    resp = await client.get(
+                        f"{API_URL}{_endpoint}",
+                        params={"payload": json.dumps(payload)},
+                    )
             print(f"[{job_id}] Tool {_name} response: {resp.status_code}")
             print(f"[{job_id}]   body: {resp.text[:500]}")
             return resp.text
@@ -526,7 +229,8 @@ async def run_agent(
     r: redis.Redis,
     task_id: str = "",
 ):
-    """Returns the raw AgentHistoryList result object (caller extracts final_result and cost)."""
+    """Returns the raw AgentHistoryList result object (caller extracts
+    final_result and cost)."""
     browser = Browser(
         headless=False,
         chromium_sandbox=False,
@@ -537,7 +241,7 @@ async def run_agent(
         model="gemini-3-flash-preview",
         vertexai=True,
         # location="asia-south1",
-        project="cabswale-ai",
+        project="nomadic-bison-481114-s4",
     )
     tools = make_tools(job_id, job_params, tool_defs, r, task_id)
 
@@ -556,7 +260,7 @@ async def run_agent(
     try:
         cached = usage_summary.total_prompt_cached_tokens or 0
         total = usage_summary.total_prompt_tokens or 1
-        print(f"Cache hit rate: {cached}/{total} = {100*cached/total:.1f}%")
+        print(f"Cache hit rate: {cached}/{total} = {100 * cached / total:.1f}%")
     except Exception:
         pass
     return result

@@ -11,6 +11,7 @@ import { setAssignedPartner } from "./internal/assignedPartner";
 import { setAiAgentWorkStatus } from "./internal/aiAgentWorkStatus";
 import "./firebase";
 import { handleSaveQR } from "./internal/borderTax/qr";
+import { handleSaveRunLog, type RunLogStep } from "./internal/borderTax/runLog";
 
 const redis = new Redis(process.env.REDIS_URL || "redis://localhost:6379");
 
@@ -519,6 +520,7 @@ const server = Bun.serve({
                         costData?: Record<string, any>;
                         source?: string;
                         partialReasons?: string[];
+                        runLog?: RunLogStep[];
                     };
                     const { jobId, requestId, status, summary, error, costData, source, partialReasons } = body;
 
@@ -540,6 +542,28 @@ const server = Bun.serve({
                     releaseAgentSlot(jobId).catch((e) => {
                         console.error(`[API] background releaseAgentSlot failed for requestId=${requestId}:`, e);
                     });
+
+                    if (body.runLog && body.runLog.length > 0 && body.requestId) {
+                        handleSaveRunLog({
+                            jobId: body.jobId,
+                            requestId: body.requestId,
+                            steps: body.runLog,
+                            finalStatus: body.status,
+                            abortReason: body.error,
+                            summary: body.summary,
+                            totalCostUsd:
+                                typeof body.costData?.totalCost === "number"
+                                    ? body.costData.totalCost
+                                    : undefined,
+                            partialReasons: body.partialReasons,
+                        }).catch((e) => {
+                            console.error(
+                                `[API] background handleSaveRunLog failed for `
+                                + `requestId=${body.requestId}:`,
+                                e,
+                            );
+                        });
+                    }
 
                     (async () => {
                         try {
