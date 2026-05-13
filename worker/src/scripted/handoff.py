@@ -22,7 +22,7 @@ from cost_calculator import fill_missing_cost
 
 # Centralized so captcha.py and runner.py share the same model/project.
 LLM_MODEL = "gemini-3-flash-preview"
-VERTEX_PROJECT = "cabswale-ai"
+VERTEX_PROJECT = "nomadic-bison-481114-s4"
 MAX_RESCUE_STEPS = 15
 
 

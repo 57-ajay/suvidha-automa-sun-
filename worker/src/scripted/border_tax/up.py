@@ -37,7 +37,7 @@ from actions import save_qr_code, save_receipt
 
 from ..captcha import (
     _wait_for_human_via_redis as wait_for_human_via_redis,
-    solve_canvas_captcha,
+    # solve_canvas_captcha,
 )
 from ..log import StepLogger
 from ..steps import (
@@ -55,8 +55,9 @@ from ..steps import (
     wait_for_selector,
     wait_for_url,
 )
-from ..types import RunOutcome, StepLog, StepStatus
+from ..types import RunOutcome, StepLog, StepStatus, ScriptedAbort
 from .params import BorderTaxParams
+from ..handoff import run_ai_rescue
 
 
 # ─── Selectors ─────────────────────────────────────────────────────────
@@ -96,7 +97,8 @@ SEL_CAPTCHA_REFRESH = "button[data-bs-original-title*='generate']"
 SEL_PG_DROPDOWN = "select#dropOperator"
 
 # Phase 8 — SBIePay UPI
-SEL_UPI_LINK = "a#paymoderadio"
+# SEL_UPI_LINK = "a#paymoderadio"
+SEL_UPI_LINK = "a[aria-label='UPI']"
 
 # Phase 8b — SBIePay confirm payment details
 SEL_SBIEPAY_CONFIRM = "input#Go.btn-Yellow"
@@ -445,118 +447,205 @@ async def run(
     )
     await sleep_seconds(PHASE_GAP_SECS, log=log, name="phase5.settle")
 
-    # ─── Phase 6: disclaimer + captcha + popups ────────────────────────
-    await wait_for_selector(
-        session,
-        SEL_CAPTCHA_CANVAS,
-        log=log,
-        name="phase6.wait_disclaimer_page",
-        timeout=60,
+    phase6_goal = (
+        "You are on (or seconds away from) the UP border tax Disclaimer page "
+        "(Step 4 of 4). Required actions, in order:\n"
+        "1. Read the captcha image — a small canvas with distorted characters "
+        "(~145x36 px), next to a blue refresh button.\n"
+        "2. Type those characters exactly into the captcha input field "
+        "(id='inputcap', case-sensitive, max 8 chars).\n"
+        "3. Tick the 'I confirm that above information are correct as per my "
+        "knowledge' checkbox.\n"
+        "4. If a popup appears with 'Receipt valid for X Days' / vehicle "
+        "summary, click its Close button.\n"
+        "5. Click the green 'Pay Online' button at the bottom-right.\n"
+        "6. A confirmation popup will appear: 'Are you sure? You want to pay "
+        "online?'. Click the green 'Yes' button.\n"
+        "7. Wait for navigation. Call done when the URL contains 'etranspgi' "
+        "or 'paymentgateway'.\n\n"
+        "Hard rules: Do NOT click 'Previous'. Do NOT navigate away. If the "
+        "captcha is rejected ('Invalid Captcha' popup), close the popup, "
+        "click the blue refresh button next to the captcha image, and retry "
+        "with the new image."
     )
 
-    async def _submit_disclaimer() -> bool:
-        await _cdp_eval(
+    phase6_started = time.monotonic()
+    rescue_summary: str = ""
+    rescue_cost: float = 0.0
+    try:
+        rescue_summary, rescue_cost = await run_ai_rescue(
             session,
-            """
-            (function() {
-                var labels = document.querySelectorAll('label');
-                for (var i = 0; i < labels.length; i++) {
-                    var t = (labels[i].textContent || '').toUpperCase();
-                    if (t.indexOf('I CONFIRM') >= 0) {
-                        labels[i].click();
-                        return true;
-                    }
-                }
-                var cbs = document.querySelectorAll('input[type=checkbox]');
-                for (var j = 0; j < cbs.length; j++) {
-                    if (!cbs[j].checked) { cbs[j].click(); return true; }
-                }
-                return false;
-            })()
-        """,
+            goal=phase6_goal,
+            reason="phase6_ai_owned",
+            page_context_hint=(
+                "UP border-tax disclaimer page. Vehicle/tax summary displayed. "
+                "Two popups expected: 'Receipt valid for X Days' (after checkbox) "
+                "and 'Are you sure?' (after Pay Online)."
+            ),
+            max_steps=15,
         )
+    except Exception as e:
+        log.record(
+            StepLog(
+                index=log.next_index(),
+                name="phase6.ai_handoff",
+                status=StepStatus.FAILED,
+                duration_ms=int((time.monotonic() - phase6_started) * 1000),
+                error=f"{type(e).__name__}: {e}",
+                handoff_reason="phase6_ai_owned",
+            )
+        )
+        raise ScriptedAbort(f"Phase 6 AI handoff crashed: {type(e).__name__}: {e}")
 
-        await asyncio.sleep(1.2)
-        await _cdp_eval(
-            session,
-            """
-            (function() {
-                var btns = document.querySelectorAll('button, .btn');
-                for (var i = 0; i < btns.length; i++) {
-                    var t = (btns[i].textContent || '').trim().toUpperCase();
-                    if (t === 'CLOSE') {
-                        var r = btns[i].getBoundingClientRect();
-                        if (r.width > 0 && r.height > 0) {
-                            btns[i].click(); return true;
-                        }
-                    }
-                }
-                return false;
-            })()
-        """,
-        )
+    # Poll for the payment gateway URL — AI may call done a moment before
+    # the navigation actually settles.
+    on_gateway = False
+    deadline = time.monotonic() + 10
+    final_url = ""
+    while time.monotonic() < deadline:
+        final_url = (await _current_url(session)).lower()
+        if (
+            "etranspgi" in final_url
+            or "vahanpgi" in final_url
+            or "paymentgateway" in final_url
+        ):
+            on_gateway = True
+            break
         await asyncio.sleep(0.5)
 
-        await _cdp_eval(
-            session,
-            """
-            (function() {
-                var btns = document.querySelectorAll('button, .btn');
-                for (var i = 0; i < btns.length; i++) {
-                    var t = (btns[i].textContent || '').trim().toUpperCase();
-                    if (t.indexOf('PAY ONLINE') >= 0) {
-                        var r = btns[i].getBoundingClientRect();
-                        if (r.width > 0 && r.height > 0) {
-                            btns[i].click(); return true;
-                        }
-                    }
-                }
-                return false;
-            })()
-        """,
+    log.record(
+        StepLog(
+            index=log.next_index(),
+            name="phase6.ai_handoff",
+            status=StepStatus.HANDED_OFF if on_gateway else StepStatus.FAILED,
+            duration_ms=int((time.monotonic() - phase6_started) * 1000),
+            url=final_url,
+            handoff_reason="phase6_ai_owned",
+            handoff_summary=rescue_summary,
+            handoff_cost_usd=rescue_cost,
         )
-
-        await asyncio.sleep(1.2)
-        await _cdp_eval(
-            session,
-            """
-            (function() {
-                var btns = document.querySelectorAll('button, .btn');
-                for (var i = 0; i < btns.length; i++) {
-                    var t = (btns[i].textContent || '').trim().toUpperCase();
-                    if (t === 'YES') {
-                        var r = btns[i].getBoundingClientRect();
-                        if (r.width > 0 && r.height > 0) {
-                            btns[i].click(); return true;
-                        }
-                    }
-                }
-                return false;
-            })()
-        """,
-        )
-
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline:
-            url = (await _current_url(session)).lower()
-            if "etranspgi" in url or "vahanpgi" in url or "paymentgateway" in url:
-                return True
-            await asyncio.sleep(0.5)
-        return False
-
-    await solve_canvas_captcha(
-        session,
-        canvas_selector=SEL_CAPTCHA_CANVAS,
-        input_selector=SEL_CAPTCHA_INPUT,
-        refresh_selector=SEL_CAPTCHA_REFRESH,
-        submit_action=_submit_disclaimer,
-        job_id=job_id,
-        r=r,
-        source=params.source,
-        log=log,
-        name="phase6.solve_captcha",
-        max_ai_attempts=5,
     )
+
+    if not on_gateway:
+        raise ScriptedAbort(
+            f"Phase 6 AI handoff did not reach payment gateway. "
+            f"Final URL: {final_url or '<empty>'}. AI summary: {rescue_summary}"
+        )
+
+    await sleep_seconds(PHASE_GAP_SECS, log=log, name="phase6.settle_after_handoff")
+
+    # ─── Phase 6: disclaimer + captcha + popups ────────────────────────
+    # await wait_for_selector(
+    #     session,
+    #     SEL_CAPTCHA_CANVAS,
+    #     log=log,
+    #     name="phase6.wait_disclaimer_page",
+    #     timeout=60,
+    # )
+    #
+    # async def _submit_disclaimer() -> bool:
+    #     await _cdp_eval(
+    #         session,
+    #         """
+    #         (function() {
+    #             var labels = document.querySelectorAll('label');
+    #             for (var i = 0; i < labels.length; i++) {
+    #                 var t = (labels[i].textContent || '').toUpperCase();
+    #                 if (t.indexOf('I CONFIRM') >= 0) {
+    #                     labels[i].click();
+    #                     return true;
+    #                 }
+    #             }
+    #             var cbs = document.querySelectorAll('input[type=checkbox]');
+    #             for (var j = 0; j < cbs.length; j++) {
+    #                 if (!cbs[j].checked) { cbs[j].click(); return true; }
+    #             }
+    #             return false;
+    #         })()
+    #     """,
+    #     )
+    #
+    #     await asyncio.sleep(1.2)
+    #     await _cdp_eval(
+    #         session,
+    #         """
+    #         (function() {
+    #             var btns = document.querySelectorAll('button, .btn');
+    #             for (var i = 0; i < btns.length; i++) {
+    #                 var t = (btns[i].textContent || '').trim().toUpperCase();
+    #                 if (t === 'CLOSE') {
+    #                     var r = btns[i].getBoundingClientRect();
+    #                     if (r.width > 0 && r.height > 0) {
+    #                         btns[i].click(); return true;
+    #                     }
+    #                 }
+    #             }
+    #             return false;
+    #         })()
+    #     """,
+    #     )
+    #     await asyncio.sleep(0.5)
+    #
+    #     await _cdp_eval(
+    #         session,
+    #         """
+    #         (function() {
+    #             var btns = document.querySelectorAll('button, .btn');
+    #             for (var i = 0; i < btns.length; i++) {
+    #                 var t = (btns[i].textContent || '').trim().toUpperCase();
+    #                 if (t.indexOf('PAY ONLINE') >= 0) {
+    #                     var r = btns[i].getBoundingClientRect();
+    #                     if (r.width > 0 && r.height > 0) {
+    #                         btns[i].click(); return true;
+    #                     }
+    #                 }
+    #             }
+    #             return false;
+    #         })()
+    #     """,
+    #     )
+    #
+    #     await asyncio.sleep(1.2)
+    #     await _cdp_eval(
+    #         session,
+    #         """
+    #         (function() {
+    #             var btns = document.querySelectorAll('button, .btn');
+    #             for (var i = 0; i < btns.length; i++) {
+    #                 var t = (btns[i].textContent || '').trim().toUpperCase();
+    #                 if (t === 'YES') {
+    #                     var r = btns[i].getBoundingClientRect();
+    #                     if (r.width > 0 && r.height > 0) {
+    #                         btns[i].click(); return true;
+    #                     }
+    #                 }
+    #             }
+    #             return false;
+    #         })()
+    #     """,
+    #     )
+    #
+    #     deadline = time.monotonic() + 15
+    #     while time.monotonic() < deadline:
+    #         url = (await _current_url(session)).lower()
+    #         if "etranspgi" in url or "vahanpgi" in url or "paymentgateway" in url:
+    #             return True
+    #         await asyncio.sleep(0.5)
+    #     return False
+    #
+    # await solve_canvas_captcha(
+    #     session,
+    #     canvas_selector=SEL_CAPTCHA_CANVAS,
+    #     input_selector=SEL_CAPTCHA_INPUT,
+    #     refresh_selector=SEL_CAPTCHA_REFRESH,
+    #     submit_action=_submit_disclaimer,
+    #     job_id=job_id,
+    #     r=r,
+    #     source=params.source,
+    #     log=log,
+    #     name="phase6.solve_captcha",
+    #     max_ai_attempts=5,
+    # )
 
     # ─── Phase 7: payment gateway ──────────────────────────────────────
     await wait_for_selector(
@@ -584,13 +673,14 @@ async def run(
         })()
     """,
     )
-    await click_by_text(
+
+    await click(
         session,
-        "Submit",
+        "input#sendSubmit",
         log=log,
         name="phase7.click_submit",
-        tag="button",
     )
+
     await sleep_seconds(2, log=log, name="phase7.settle")
 
     # ─── Phase 8: SBIePay Lite welcome -> click UPI ────────────────────

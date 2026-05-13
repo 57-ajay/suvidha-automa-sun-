@@ -26,7 +26,7 @@ import traceback
 from typing import Awaitable, Callable
 
 import redis
-from browser_use import Browser
+from browser_use import Browser, BrowserProfile
 from pydantic import ValidationError
 
 from .border_tax.params import BorderTaxParams
@@ -124,6 +124,7 @@ async def run_border_tax(
         headless=False,
         chromium_sandbox=False,
         args=["--disable-dev-shm-usage", "--disable-gpu"],
+        keep_alive=True,
     )
     log = StepLogger(job_id=job_id, r=r)
 
