@@ -41,7 +41,7 @@ from .types import HandoffNeeded, RunOutcome, ScriptedAbort
 _BORDER_TAX_STATE_MODULES: dict[str, str] = {
     "UP": "scripted.border_tax.up",
     "HR": "scripted.border_tax.hr",
-    # "RJ": "scripted.border_tax.rj",
+    "RJ": "scripted.border_tax.rj",
 }
 
 

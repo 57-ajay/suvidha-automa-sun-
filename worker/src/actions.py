@@ -98,9 +98,8 @@ _QR_LOCATE_JS = """
 
     // RJ: <img> inside <div id="ct100_ContentPlaceHolder1_divQRCode">
     if (!img) {
-        var container = document.getElementById(
-            'ct100_ContentPlaceHolder1_divQRCode'
-        );
+        var container = document.getElementById('ctl00_ContentPlaceHolder1_divQRCode')
+        || document.getElementById('ct100_ContentPlaceHolder1_divQRCode');
         if (container) img = container.querySelector('img');
     }
 
