@@ -90,17 +90,43 @@ async def wait_for_human(
 
 # ─── save_qr_code ──────────────────────────────────────────────────────────
 
-
 _QR_LOCATE_JS = """
 (function() {
-    // UP/HR: <img id="qrcodeImg">
+    // UP/HR/PB: <img id="qrcodeImg"> (SBIePay Lite)
     var img = document.getElementById('qrcodeImg');
 
-    // RJ: <img> inside <div id="ct100_ContentPlaceHolder1_divQRCode">
+    // RJ: <img> inside <div id="ctl00_ContentPlaceHolder1_divQRCode"> (ASP.NET WebForms)
     if (!img) {
         var container = document.getElementById('ctl00_ContentPlaceHolder1_divQRCode')
         || document.getElementById('ct100_ContentPlaceHolder1_divQRCode');
         if (container) img = container.querySelector('img');
+    }
+
+    // MP (and generic fallback): epay.sbi.bank.in/secure/upiQRWait.jsp
+    // The QR <img> has no id and sits inside a generic <div>. This branch
+    // is ONLY reached when neither of the two known primary selectors
+    // matched -- which by definition means we're NOT on a UP/HR/PB/RJ
+    // QR page. We further constrain the match to images that look like
+    // QR codes: at least 200x200 px, square-ish aspect ratio (0.85-1.15),
+    // base64-encoded PNG data URI. Among matches, we pick the LARGEST by
+    // area so a small logo/icon can never win over the real QR.
+    if (!img) {
+        var candidates = document.querySelectorAll("img[src^='data:image/png;base64']");
+        var best = null;
+        var bestArea = 0;
+        for (var i = 0; i < candidates.length; i++) {
+            var c = candidates[i];
+            var r = c.getBoundingClientRect();
+            if (r.width < 200 || r.height < 200) continue;
+            var aspect = r.width / r.height;
+            if (aspect < 0.85 || aspect > 1.15) continue;
+            var area = r.width * r.height;
+            if (area > bestArea) {
+                best = c;
+                bestArea = area;
+            }
+        }
+        if (best) img = best;
     }
 
     if (!img) return null;
@@ -117,6 +143,34 @@ _QR_LOCATE_JS = """
     };
 })()
 """
+
+#
+# _QR_LOCATE_JS = """
+# (function() {
+#     // UP/HR: <img id="qrcodeImg">
+#     var img = document.getElementById('qrcodeImg');
+#
+#     // RJ: <img> inside <div id="ct100_ContentPlaceHolder1_divQRCode">
+#     if (!img) {
+#         var container = document.getElementById('ctl00_ContentPlaceHolder1_divQRCode')
+#         || document.getElementById('ct100_ContentPlaceHolder1_divQRCode');
+#         if (container) img = container.querySelector('img');
+#     }
+#
+#     if (!img) return null;
+#
+#     var src  = img.src || '';
+#     var rect = img.getBoundingClientRect();
+#     return {
+#         src:       src,
+#         isDataUri: src.startsWith('data:'),
+#         x:         rect.left,
+#         y:         rect.top,
+#         width:     rect.width,
+#         height:    rect.height
+#     };
+# })()
+# """
 
 
 async def save_qr_code(
@@ -139,8 +193,9 @@ async def save_qr_code(
         info = (eval_result.get("result", {}) or {}).get("value")
         if not info:
             msg = (
-                "QR code img element not found -- tried #qrcodeImg (UP/HR) "
-                "and #ct100_ContentPlaceHolder1_divQRCode img (RJ)"
+                "QR code img element not found -- tried #qrcodeImg (UP/HR/PB), "
+                "#ctl00_ContentPlaceHolder1_divQRCode img (RJ), and "
+                "large square base64 data-URI img (MP fallback)"
             )
             print(f"[{job_id}]   ERROR: {msg}")
             return {"ok": False, "error": msg}
