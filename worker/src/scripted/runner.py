@@ -42,6 +42,7 @@ _BORDER_TAX_STATE_MODULES: dict[str, str] = {
     "UP": "scripted.border_tax.up",
     "HR": "scripted.border_tax.hr",
     "RJ": "scripted.border_tax.rj",
+    "PB": "scripted.border_tax.pb",
 }
 
 
@@ -54,6 +55,8 @@ _STATE_TO_CODE: dict[str, str] = {
     "HARYANA": "HR",
     "RJ": "RJ",
     "RAJASTHAN": "RJ",
+    "PUNJAB": "PB",
+    "PB": "PB",
 }
 
 
