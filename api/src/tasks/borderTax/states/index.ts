@@ -1,6 +1,7 @@
 import { buildPrompt as buildUP } from "./up";
 import { buildPrompt as buildHR } from "./hr";
 import { buildPrompt as buildRJ } from "./rj";
+import { buildPrompt as buildPB } from "./pb";
 
 export type StateBuilder = (p: Record<string, string>) => Promise<string>;
 
@@ -8,6 +9,7 @@ export const STATE_BUILDERS: Record<string, StateBuilder> = {
     "UTTAR PRADESH": buildUP,
     "HARYANA": buildHR,
     "RAJASTHAN": buildRJ,
+    "PUNJAB": buildPB,
 };
 
 export const STATE_ALIASES: Record<string, string> = {
@@ -15,6 +17,7 @@ export const STATE_ALIASES: Record<string, string> = {
     "U.P.": "UTTAR PRADESH",
     "HR": "HARYANA",
     "RJ": "RAJASTHAN",
+    "PB": "PUNJAB",
 };
 
 export function resolveStateKey(input: string | undefined | null): string {

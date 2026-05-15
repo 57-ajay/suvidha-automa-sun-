@@ -43,9 +43,11 @@ class BorderTaxParams(BaseModel):
         "UP",
         "HR",
         "RJ",
+        "PB",
         "UTTAR PRADESH",
         "HARYANA",
         "RAJASTHAN",
+        "PUNJAB",
     ] = "UP"
 
     taxMode: Literal["DAYS", "MONTHLY", "QUARTERLY"] = "DAYS"
