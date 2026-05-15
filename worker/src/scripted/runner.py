@@ -43,6 +43,7 @@ _BORDER_TAX_STATE_MODULES: dict[str, str] = {
     "HR": "scripted.border_tax.hr",
     "RJ": "scripted.border_tax.rj",
     "PB": "scripted.border_tax.pb",
+    "MP": "scripted.border_tax.mp",
 }
 
 
@@ -57,6 +58,9 @@ _STATE_TO_CODE: dict[str, str] = {
     "RAJASTHAN": "RJ",
     "PUNJAB": "PB",
     "PB": "PB",
+    "MP": "MP",
+    "M.P.": "MP",
+    "MADHYA PRADESH": "MP",
 }
 
 

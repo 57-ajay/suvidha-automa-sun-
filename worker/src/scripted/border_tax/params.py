@@ -15,9 +15,10 @@ before the browser even starts.
 
 serviceType NOTE: this is a plain `str` (not a Literal) because each state
 uses different option labels. UP expects "Air Conditioned Service" /
-"Ordinary Service"; HR uses "NOT APPLICABLE"; RJ has its own list. The
-state-specific runner is responsible for sending an option that actually
-exists in that state's Service Type dropdown.
+"Ordinary Service"; HR/PB use "NOT APPLICABLE"; RJ has its own list; MP
+expects "Air Conditioned Service" (matches UP). The state-specific runner
+is responsible for sending an option that actually exists in that state's
+Service Type dropdown.
 """
 
 from __future__ import annotations
@@ -44,20 +45,25 @@ class BorderTaxParams(BaseModel):
         "HR",
         "RJ",
         "PB",
+        "MP",
         "UTTAR PRADESH",
         "HARYANA",
         "RAJASTHAN",
         "PUNJAB",
+        "MADHYA PRADESH",
     ] = "UP"
 
+    # Tax modes supported across all states. Per-state validity is
+    # enforced inside the state runner (e.g. PB rejects MONTHLY, MP
+    # rejects everything except DAYS).
     taxMode: Literal["DAYS", "MONTHLY", "QUARTERLY"] = "DAYS"
 
     entryDistrict: str = ""
     entryCheckpoint: str = ""
 
-    # Per-state Service Type label. UP: "Air Conditioned Service" /
-    # "Ordinary Service". HR: "NOT APPLICABLE". RJ: its own list. The
-    # state runner forwards whatever string the API resolved.
+    # Per-state Service Type label. UP/MP: "Air Conditioned Service" /
+    # "Ordinary Service". HR/PB: "NOT APPLICABLE". RJ: its own list.
+    # The state runner forwards whatever string the API resolved.
     serviceType: str = "Air Conditioned Service"
 
     permitType: str = "ALL INDIA TOURIST PERMIT"
