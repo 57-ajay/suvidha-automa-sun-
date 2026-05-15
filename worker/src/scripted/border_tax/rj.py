@@ -4,7 +4,10 @@
 Walks the 9 phases mapped against api/src/tasks/borderTax/states/rj.ts:
 
     Phase 1  - parivahan.gov.in/en/node/579, select RAJASTHAN
-    Phase 2  - Service Name select + Go (e-Vahan landing)
+    Phase 2  - Service Name select + Go (e-Vahan landing).
+               v3: AI handoff ONLY. Scripted attempts trigger
+               server-side session rejection on this portal (likely
+               isTrusted=false detection). See run() Phase 2 comment.
     Phase 3  - Mega-form: Vehicle, Get Details, Permit Type, District,
                Checkpost, Tax From/Upto, Calculate Tax. ONE big page,
                NO wizard / Next buttons between rows.
@@ -20,7 +23,14 @@ UPI-only. Net banking falls back to the AI agent path (run_job.py decides).
 
 DIFFERENCES vs UP/HR
 ====================
-1. No CAPTCHA anywhere on RJ -- fully scripted, no run_ai_rescue calls.
+1. Phase 2 (service selection + Go) is AI-only. The PrimeFaces JSF
+   page on this portal rejects synthesized JS events (isTrusted=false)
+   by killing the session and redirecting to a "Direct access not
+   allowed" page. Scripted attempts therefore break the session beyond
+   recovery. AI rescue uses CDP Input.dispatchMouseEvent which produces
+   isTrusted=true events that the portal accepts. UP/HR (Angular SPA on
+   services.parivahan.gov.in) do NOT have this restriction; they remain
+   pure scripted.
 2. Different portal stack: checkpost.parivahan.gov.in/checkpost/faces/
    runs a PrimeFaces JSF form (NOT Angular like UP/HR). Payment pages
    are ASP.NET WebForms (ctl00 prefixes). Note: rj.ts referred to this
@@ -31,8 +41,7 @@ DIFFERENCES vs UP/HR
 5. Receipt date label is "Payment Initiation Date" (not "Confirmation"),
    receipt-no prefix is "RJT...", Grand Total has a leading rupee symbol.
 6. UPI QR page initially shows the UPI ID radio active; we MUST click the
-   QR CODE radio to trigger an ASP.NET postback that renders the QR. The
-   rj.ts AI prompt incorrectly claimed QR was pre-selected.
+   QR CODE radio to trigger an ASP.NET postback that renders the QR.
 
 PRIMEFACES ID NOTE
 ==================
@@ -45,6 +54,7 @@ shift on portal redeploys:
   - Gateway dropdown on the e-Vahan PG page:  j_idt13:j_idt42_input
   - Terms checkbox on the PG page:  j_idt13:b_input
   - Continue button on the PG page:  j_idt13:bt_payment
+  - Go button on the landing page (Phase 2):  j_idt61
 
 For unstable SELECTS we use option-content matching: select_by_text /
 select_by_value already iterate every <select> matching the CSS selector
@@ -57,6 +67,11 @@ across redeploys, IDs are not.
 
 For unstable INPUTS we use attribute-based fallback selectors when the
 primary ID query fails.
+
+For the Phase 2 Go button specifically (Phase 2 is the bottleneck on RJ),
+we resolve its id at runtime by scanning for the <button> whose onclick
+contains 'PrimeFaces.ab' AND 'PAYMENT_TYPE' -- the signature is stable
+even when j_idt61 drifts.
 
 NOTE on the QR container ID
 ===========================
@@ -79,6 +94,7 @@ from actions import save_qr_code, save_receipt
 from ..captcha import (
     _wait_for_human_via_redis as wait_for_human_via_redis,
 )
+from ..handoff import run_ai_rescue
 from ..log import StepLogger
 from ..steps import (
     _cdp_eval,
@@ -108,7 +124,6 @@ SEL_STATE_DROPDOWN = "select.select-css-check-post-services"
 # Underlying PrimeFaces select; option value "5003" = VEHICLE TAX COLLECTION (OTHER STATE)
 SEL_SERVICE_DROPDOWN = "select#operation_code_input"
 SEL_SERVICE_WIDGET = "#operation_code"
-SEL_SERVICE_DROPDOWN = "select#operation_code_input"
 
 # Phase 3 — mega-form
 # Vehicle No input: PrimeFaces auto-id (j_idt57). Fallback is
@@ -141,9 +156,8 @@ SEL_DISTRICT = "select#j_idt540_input"
 SEL_DISTRICT_FALLBACK = "select"
 # Note: the Checkpost dropdown also lives on an unstable j_idt id (was
 # j_idt551, observed drifted to j_idt114). We handle it differently —
-# _select_checkpost_option identifies the right <select> by scanning
-# for the stable placeholder text 'checkpost' / 'barrier'. No selector
-# constant needed.
+# _pf_select_first_checkpoint_by_label identifies the right <select> by
+# scanning for the stable label text. No selector constant needed.
 
 # Phase 4 — confirmation modal
 SEL_PAYMENT_DIALOG = "div#payment_dialog"
@@ -176,6 +190,19 @@ PAYMENT_GATEWAY_NAV_TIMEOUT = 45  # Confirm click -> e-Vahan PG page
 EGRAS_SPLASH_NAV_TIMEOUT = 45  # PG Continue -> eGRAS splash
 QR_PAGE_NAV_TIMEOUT = 45  # Proceed -> QR page (UPI ID radio visible)
 CALCULATE_TAX_TIMEOUT_SECS = 15  # Calculate Tax click -> Total Amount populated
+
+# Phase 2 — AI-handoff tuning.
+PHASE2_MEGAFORM_TIMEOUT = 15  # post-handoff: verify mega-form rendered
+PHASE2_AI_RESCUE_MAX_STEPS = 4  # 2 actions, plus headroom for slow loads
+
+# Legacy tuning constants from the v2 scripted-retry approach.
+# The scripted path in run() Phase 2 was removed (see Phase 2 comment in
+# run() for why). These constants are kept ONLY because the helpers
+# _fire_go_with_completion and _phase2_attempt still reference them and
+# could be wired back up if/when the scripted path is rebuilt on top of
+# CDP Input.dispatchMouseEvent instead of element.click() / dispatchEvent.
+PHASE2_MAX_ATTEMPTS = 3
+PHASE2_GO_RESPONSE_TIMEOUT = 25
 
 
 # ─── Helpers ───────────────────────────────────────────────────────────
@@ -314,133 +341,541 @@ async def _pf_calendar_pick_date(
     ) or {"ok": False, "reason": "pick_eval_failed"}
 
 
+# ── Phase 2: PrimeFaces SelectOneMenu helpers ──────────────────────────
+
+
+async def _verify_pf_selection(
+    session,
+    target_value: str,
+    target_text: str,
+) -> dict:
+    """Read the operation_code SelectOneMenu's three state surfaces and
+    confirm they all agree the target option is selected.
+
+    Returns {ok: bool, ...state}. ok=True iff:
+      - select.value == target_value
+      - label.textContent (trimmed, uppercased) contains target_text
+
+    aria-activedescendant is read for debugging but not gated on, since
+    the brute-patch layer may not update it.
+    """
+    result = await _cdp_eval(
+        session,
+        """
+        (function(){
+          var sel = document.getElementById('operation_code_input');
+          var label = document.getElementById('operation_code_label');
+          return {
+            selValue: sel ? sel.value : null,
+            selectedIndex: sel ? sel.selectedIndex : null,
+            labelText: label ? (label.textContent||'').trim() : null,
+            ariaActiveDescendant: label
+              ? label.getAttribute('aria-activedescendant')
+              : null,
+            ariaExpanded: label
+              ? label.getAttribute('aria-expanded')
+              : null
+          };
+        })()
+        """,
+    )
+    if not result:
+        return {"ok": False, "reason": "eval_failed"}
+    sel_ok = result.get("selValue") == target_value
+    label_text = (result.get("labelText") or "").upper()
+    label_ok = target_text.upper() in label_text
+    ok = sel_ok and label_ok
+    result["ok"] = ok
+    if not ok:
+        result["reason"] = (
+            f"sel_value={result.get('selValue')!r} "
+            f"(want {target_value!r}), "
+            f"label={result.get('labelText')!r} "
+            f"(want contains {target_text!r})"
+        )
+    return result
+
+
 async def _pf_select_service_option(session) -> dict:
-    """Select 'VEHICLE TAX COLLECTION (OTHER STATE)' by simulating a real
-    user click sequence on the PrimeFaces SelectOneMenu:
+    """Select 'VEHICLE TAX COLLECTION (OTHER STATE)' on the RJ PrimeFaces
+    SelectOneMenu, with three layers of robustness.
 
-        1. Click the dropdown trigger (this opens the panel and lazily
-           renders the <li> items into #operation_code_panel).
-        2. Wait for the panel items to be present.
-        3. Click the <li> that contains the target text.
+    Layer 1 -- PrimeFaces widget API:
+        PF('widget_operation_code').selectValue('5003')
+        This is the same method PF's own internal code calls on a real
+        click. Sets select.value, label.textContent, aria-activedescendant,
+        widget.selectedOption, and dispatches change -- ALL synchronously,
+        no DOM-event race surface.
 
-    This lets PrimeFaces handle ALL its own state sync (widget.selectedOption,
-    aria-activedescendant, label text, hidden <select>.value, etc.) — the
-    same way it does when a human clicks the dropdown. Patching the state
-    directly via JS races and misses internal book-keeping.
+    Layer 2 -- DOM click sequence:
+        mousedown on the trigger, wait for panel + items, then a full
+        mouseover/mousedown/mouseup/click sequence on the target <li>.
+        Fallback for the rare case the widget isn't registered on window.
+
+    Layer 3 -- brute state patch:
+        Directly set select.value + label text + aria, dispatch change.
+        Last resort; semantically equivalent to layer 1 but bypasses PF
+        entirely. Used when both layers above fail their verification.
+
+    Verification (run after every layer):
+        select.value === '5003' AND label.textContent matches the option
+        text. We don't gate on aria-activedescendant since layer 3 only
+        sets it best-effort.
     """
     TARGET_TEXT = "VEHICLE TAX COLLECTION (OTHER STATE)"
+    TARGET_VALUE = "5003"
 
-    # Step 1: click the trigger
+    # ───── Layer 1: PrimeFaces widget API ─────
+    layer1 = await _cdp_eval(
+        session,
+        """
+        (function(){
+          if (typeof PF !== 'function') {
+            return {ok:false, reason:'PF_global_missing'};
+          }
+          var w = PF('widget_operation_code');
+          if (!w) {
+            if (window.PrimeFaces && PrimeFaces.widgets) {
+              w = PrimeFaces.widgets['widget_operation_code'];
+            }
+          }
+          if (!w) return {ok:false, reason:'widget_not_registered'};
+          if (typeof w.selectValue !== 'function') {
+            return {ok:false, reason:'selectValue_missing'};
+          }
+          try {
+            w.selectValue('5003');
+            return {ok:true};
+          } catch (e) {
+            return {ok:false, reason:'selectValue_threw', err: String(e)};
+          }
+        })()
+        """,
+    )
+
+    if layer1 and layer1.get("ok"):
+        await asyncio.sleep(0.1)
+        verify = await _verify_pf_selection(session, TARGET_VALUE, TARGET_TEXT)
+        if verify.get("ok"):
+            return {"ok": True, "method": "widget_api", "verify": verify}
+
+    # ───── Layer 2: DOM click ─────
     open_result = await _cdp_eval(
         session,
         """
         (function(){
           var wrapper = document.getElementById('operation_code');
-          if (!wrapper) return {ok: false, reason: 'wrapper_not_found'};
+          if (!wrapper) return {ok:false, reason:'wrapper_not_found'};
           var trigger = wrapper.querySelector('.ui-selectonemenu-trigger');
-          if (!trigger) return {ok: false, reason: 'trigger_not_found'};
-          // PrimeFaces binds on mousedown for the trigger, not click —
-          // fire both to be safe.
+          if (!trigger) return {ok:false, reason:'trigger_not_found'};
           var r = trigger.getBoundingClientRect();
-          var opts = {bubbles: true, cancelable: true,
-                      clientX: r.left + r.width/2,
-                      clientY: r.top + r.height/2,
-                      button: 0};
+          var opts = {bubbles:true, cancelable:true,
+                      clientX:r.left+r.width/2, clientY:r.top+r.height/2,
+                      button:0};
+          // PF binds the toggle on mousedown only -- one event is enough.
+          // Sending click after mousedown CAN bubble to the document-body
+          // outside-click handler and inadvertently hide the panel.
           trigger.dispatchEvent(new MouseEvent('mousedown', opts));
-          trigger.dispatchEvent(new MouseEvent('mouseup',   opts));
-          trigger.click();
-          return {ok: true};
+          return {ok:true};
         })()
         """,
     )
     if not open_result or not open_result.get("ok"):
-        return open_result or {"ok": False, "reason": "open_eval_failed"}
+        return {
+            "ok": False,
+            "reason": "open_failed",
+            "details": open_result,
+            "layer1": layer1,
+        }
 
-    # Step 2: poll for the panel items to render (lazy)
+    # Poll for panel + items to render
     items_ready = False
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
-        count = await _cdp_eval(
+        info = await _cdp_eval(
             session,
             """
             (function(){
               var panel = document.getElementById('operation_code_panel');
-              if (!panel) return 0;
-              var items = panel.querySelectorAll('li');
-              return items.length;
+              if (!panel) return {ready:false, reason:'panel_missing'};
+              var items = panel.querySelectorAll('li.ui-selectonemenu-item');
+              return {ready: items.length > 0, count: items.length};
             })()
             """,
         )
-        if count and int(count) > 0:
+        if info and info.get("ready"):
             items_ready = True
             break
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.15)
 
     if not items_ready:
-        return {"ok": False, "reason": "panel_items_never_rendered"}
+        return {"ok": False, "reason": "panel_items_never_rendered", "layer1": layer1}
 
-    # Step 3: click the <li> with the target text
+    await asyncio.sleep(0.15)
+
     click_result = await _cdp_eval(
         session,
         """
         (function(target){
           var panel = document.getElementById('operation_code_panel');
-          if (!panel) return {ok: false, reason: 'panel_gone'};
-          var items = panel.querySelectorAll('li');
+          if (!panel) return {ok:false, reason:'panel_gone'};
+          var items = panel.querySelectorAll('li.ui-selectonemenu-item');
           var upper = target.toUpperCase();
-          for (var i = 0; i < items.length; i++){
+          for (var i=0; i<items.length; i++){
             var t = (items[i].textContent || '').trim();
             if (t.toUpperCase().indexOf(upper) >= 0){
               var r = items[i].getBoundingClientRect();
-              var opts = {bubbles: true, cancelable: true,
-                          clientX: r.left + r.width/2,
-                          clientY: r.top + r.height/2,
-                          button: 0};
+              var opts = {bubbles:true, cancelable:true,
+                          clientX:r.left+r.width/2,
+                          clientY:r.top+r.height/2, button:0};
+              items[i].dispatchEvent(new MouseEvent('mouseover', opts));
               items[i].dispatchEvent(new MouseEvent('mousedown', opts));
               items[i].dispatchEvent(new MouseEvent('mouseup',   opts));
-              items[i].click();
-              return {ok: true, method: 'click', itemText: t,
-                      itemIndex: i, itemId: items[i].id || ''};
+              items[i].dispatchEvent(new MouseEvent('click',     opts));
+              return {ok:true, itemId: items[i].id||'', itemText: t};
             }
           }
           var seen = [];
-          for (var j = 0; j < items.length; j++){
-            seen.push((items[j].textContent || '').trim());
+          for (var j=0; j<items.length; j++){
+            seen.push((items[j].textContent||'').trim());
           }
-          return {ok: false, reason: 'item_not_found', itemsSeen: seen};
+          return {ok:false, reason:'item_not_found', itemsSeen: seen};
         })("""
         + json.dumps(TARGET_TEXT)
         + """)
         """,
     )
 
-    if not click_result or not click_result.get("ok"):
-        return click_result or {"ok": False, "reason": "click_eval_failed"}
+    if click_result and click_result.get("ok"):
+        await asyncio.sleep(0.2)
+        verify = await _verify_pf_selection(session, TARGET_VALUE, TARGET_TEXT)
+        if verify.get("ok"):
+            return {
+                "ok": True,
+                "method": "dom_click",
+                "click": click_result,
+                "verify": verify,
+            }
 
-    # Verify the selection actually stuck — read the underlying <select>
-    verify = await _cdp_eval(
+    # ───── Layer 3: brute state patch ─────
+    brute = await _cdp_eval(
         session,
         """
         (function(){
-          var sel = document.querySelector('select#operation_code_input');
-          if (!sel) return {value: null};
-          return {
-            value: sel.value,
-            selectedIndex: sel.selectedIndex,
-            labelText: (document.getElementById('operation_code_label')
-                         || {}).textContent || ''
-          };
+          var sel = document.getElementById('operation_code_input');
+          var label = document.getElementById('operation_code_label');
+          if (!sel || !label) return {ok:false, reason:'missing_elements'};
+          var idx = -1;
+          for (var i=0; i<sel.options.length; i++){
+            if (sel.options[i].value === '5003'){ idx = i; break; }
+          }
+          if (idx < 0) return {ok:false, reason:'option_5003_missing'};
+          sel.selectedIndex = idx;
+          sel.value = '5003';
+          label.textContent = sel.options[idx].text;
+          label.setAttribute('aria-activedescendant', 'operation_code_1');
+          label.setAttribute('aria-disabled', 'false');
+          sel.dispatchEvent(new Event('input',  {bubbles:true}));
+          sel.dispatchEvent(new Event('change', {bubbles:true}));
+          // Best-effort PF widget state sync
+          try {
+            var w = (typeof PF === 'function') ? PF('widget_operation_code') : null;
+            if (w && w.preShowValue !== undefined) {
+              w.preShowValue = sel.options[idx].text;
+            }
+            if (w && w.value !== undefined) {
+              w.value = '5003';
+            }
+          } catch(e){}
+          return {ok:true};
         })()
         """,
     )
-    click_result["verify"] = verify
-    if not verify or verify.get("value") != "5003":
-        click_result["ok"] = False
-        click_result["reason"] = (
-            f"selection_didnt_stick: select.value={verify.get('value') if verify else None}"
-        )
+    verify = await _verify_pf_selection(session, TARGET_VALUE, TARGET_TEXT)
+    if verify.get("ok"):
+        return {"ok": True, "method": "brute_patch", "brute": brute, "verify": verify}
 
-    return click_result
+    return {
+        "ok": False,
+        "reason": "all_layers_failed",
+        "layer1": layer1,
+        "open": open_result,
+        "click": click_result,
+        "brute": brute,
+        "verify": verify,
+    }
+
+
+async def _wait_for_megaform_strict(session, timeout: int) -> dict:
+    """Strict mega-form readiness check.
+
+    The mega-form is ONLY considered ready when ALL of the following are
+    true and visible (bounding rect > 0):
+
+      A. A text input with maxlength=10 + onkeyup containing 'makeCaps'
+         exists. This is the Vehicle No. input. It does NOT exist on
+         the landing page.
+      B. A <button> whose visible text contains 'GET DETAILS' exists.
+         This button is unique to the mega-form.
+
+    A previous version (`input#j_idt57 OR makeCaps input`) could return
+    true on the landing page if any element happened to be tagged j_idt57
+    -- JSF auto-ids drift, so that selector is unreliable across views.
+
+    Returns {ok: bool, ...details}.
+    """
+    expr = """
+    (function(){
+      function visible(el){
+        var r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      }
+
+      var inputs = document.querySelectorAll(
+        "input[type='text'][maxlength='10'][onkeyup*='makeCaps']"
+      );
+      var hasVehicleInput = false;
+      var vehicleInputId = null;
+      for (var i=0; i<inputs.length; i++){
+        if (visible(inputs[i])){
+          hasVehicleInput = true;
+          vehicleInputId = inputs[i].id || '';
+          break;
+        }
+      }
+
+      var buttons = document.querySelectorAll('button');
+      var hasGetDetails = false;
+      for (var j=0; j<buttons.length; j++){
+        var t = (buttons[j].textContent || '').trim().toUpperCase();
+        if (t.indexOf('GET DETAILS') >= 0 && visible(buttons[j])){
+          hasGetDetails = true;
+          break;
+        }
+      }
+
+      return {
+        ok: hasVehicleInput && hasGetDetails,
+        hasVehicleInput: hasVehicleInput,
+        vehicleInputId: vehicleInputId,
+        hasGetDetails: hasGetDetails
+      };
+    })()
+    """
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        result = await _cdp_eval(session, expr)
+        if result and result.get("ok"):
+            return result
+        last = result
+        await asyncio.sleep(0.4)
+    return last or {"ok": False, "reason": "eval_failed"}
+
+
+async def _fire_go_with_completion(session) -> dict:
+    """Fire PrimeFaces.ab for the Go button and wait for the AJAX to
+    actually complete.
+
+    Sets four window flags inside PF.ab's lifecycle callbacks:
+      __rj_go_started   (onst)
+      __rj_go_succeeded (onsu)
+      __rj_go_errored   (oner) — set to a string error message
+      __rj_go_completed (oncl)
+
+    Then polls __rj_go_completed for up to PHASE2_GO_RESPONSE_TIMEOUT.
+
+    Returns:
+      {ok: True, method: 'ab_direct'}   if completed AND succeeded
+      {ok: False, reason: <why>, ...}   otherwise
+
+    Does NOT verify the mega-form actually rendered -- that's the caller's
+    job via _wait_for_megaform_strict. This function only tells you
+    whether PF.ab's network call round-tripped successfully.
+    """
+    # Step 1: clear leftover flags, resolve button id, fire PF.ab.
+    fire_result = await _cdp_eval(
+        session,
+        """
+        (function(){
+          // Clear flags from any previous attempt
+          window.__rj_go_started   = false;
+          window.__rj_go_succeeded = false;
+          window.__rj_go_errored   = null;
+          window.__rj_go_completed = false;
+
+          // Resolve the Go button by its onclick signature, not its id.
+          // The button id (j_idt61 today) is PF-generated and may drift.
+          var buttons = document.querySelectorAll('button[onclick]');
+          var btn = null;
+          for (var i=0; i<buttons.length; i++){
+            var oc = buttons[i].getAttribute('onclick') || '';
+            if (oc.indexOf('PrimeFaces.ab') >= 0
+                && oc.indexOf('PAYMENT_TYPE') >= 0){
+              btn = buttons[i];
+              break;
+            }
+          }
+          if (!btn) return {ok:false, reason:'go_button_not_found'};
+          var sourceId = btn.id || btn.getAttribute('name') || '';
+          if (!sourceId) return {ok:false, reason:'button_has_no_id'};
+
+          if (typeof PrimeFaces !== 'object'
+              || typeof PrimeFaces.ab !== 'function'){
+            return {ok:false, reason:'PrimeFaces_ab_missing'};
+          }
+
+          try {
+            PrimeFaces.ab({
+              s: sourceId,
+              f: 'master_Layout_form',
+              onst: function(cfg){
+                window.__rj_go_started = true;
+                try { if (PF('masterLayoutVar')) PF('masterLayoutVar').show(); } catch(e){}
+              },
+              onsu: function(data, status, xhr){
+                window.__rj_go_succeeded = true;
+              },
+              oner: function(xhr, status, error){
+                var msg = '';
+                try {
+                  msg = String(error || status || 'unknown');
+                  if (xhr && xhr.status){ msg += ' [http ' + xhr.status + ']'; }
+                } catch(e){ msg = 'oner_handler_threw'; }
+                window.__rj_go_errored = msg;
+              },
+              oncl: function(){
+                try { if (PF('masterLayoutVar')) PF('masterLayoutVar').hide(); } catch(e){}
+                window.__rj_go_completed = true;
+              },
+              pa: [{name:'PAYMENT_TYPE', value:'ONLINE'}]
+            });
+            return {ok:true, sourceId: sourceId};
+          } catch(e){
+            return {ok:false, reason:'ab_call_threw', err:String(e)};
+          }
+        })()
+        """,
+    )
+    if not fire_result or not fire_result.get("ok"):
+        return fire_result or {"ok": False, "reason": "fire_eval_failed"}
+
+    # Step 2: poll for completion
+    deadline = time.monotonic() + PHASE2_GO_RESPONSE_TIMEOUT
+    last_state = None
+    while time.monotonic() < deadline:
+        state = await _cdp_eval(
+            session,
+            """
+            ({
+              started:   !!window.__rj_go_started,
+              succeeded: !!window.__rj_go_succeeded,
+              errored:   window.__rj_go_errored,
+              completed: !!window.__rj_go_completed
+            })
+            """,
+        )
+        last_state = state
+        if state and state.get("completed"):
+            if state.get("errored"):
+                return {
+                    "ok": False,
+                    "reason": "ab_errored",
+                    "error": state.get("errored"),
+                    "sourceId": fire_result.get("sourceId"),
+                    "state": state,
+                }
+            if state.get("succeeded"):
+                return {
+                    "ok": True,
+                    "method": "ab_direct",
+                    "sourceId": fire_result.get("sourceId"),
+                    "state": state,
+                }
+            return {
+                "ok": False,
+                "reason": "ab_completed_without_success_or_error",
+                "state": state,
+            }
+        await asyncio.sleep(0.3)
+
+    return {
+        "ok": False,
+        "reason": "ab_response_timeout",
+        "state": last_state,
+        "timeout": PHASE2_GO_RESPONSE_TIMEOUT,
+    }
+
+
+async def _phase2_attempt(session, attempt_num: int, log: StepLogger) -> dict:
+    """One full Phase 2 attempt: re-verify (or re-select) the dropdown,
+    fire Go with completion signaling, then wait for the strict mega-form.
+
+    Logs two sub-steps with the attempt number folded into the name.
+    Returns {ok: bool, ...details}.
+    """
+    # Sub-step A: make sure the dropdown is still selected as 5003.
+    # Between attempts the page may have partially re-rendered.
+    verify = await _verify_pf_selection(
+        session, "5003", "VEHICLE TAX COLLECTION (OTHER STATE)"
+    )
+    if not verify.get("ok"):
+        sel_result = await _pf_select_service_option(session)
+        if not (sel_result and sel_result.get("ok")):
+            return {
+                "ok": False,
+                "reason": "reselect_failed",
+                "sel_result": sel_result,
+            }
+
+    # Beat for PF internal state. Longer than v1's 1.5s — slow connections need more.
+    await asyncio.sleep(2.0)
+
+    # Sub-step B: fire Go with completion signaling
+    fire_started = time.monotonic()
+    fire_result = await _fire_go_with_completion(session)
+    log.record(
+        StepLog(
+            index=log.next_index(),
+            name=f"phase2.fire_go.attempt{attempt_num}",
+            status=StepStatus.OK
+            if (fire_result and fire_result.get("ok"))
+            else StepStatus.FAILED,
+            duration_ms=int((time.monotonic() - fire_started) * 1000),
+            value=str(fire_result)[:200],
+            error=None
+            if (fire_result and fire_result.get("ok"))
+            else (fire_result.get("reason") if fire_result else "no_result"),
+        )
+    )
+    if not (fire_result and fire_result.get("ok")):
+        return {"ok": False, "reason": "fire_failed", "fire_result": fire_result}
+
+    # Sub-step C: confirm the mega-form actually rendered (strict check)
+    wait_started = time.monotonic()
+    mf_result = await _wait_for_megaform_strict(session, PHASE2_MEGAFORM_TIMEOUT)
+    log.record(
+        StepLog(
+            index=log.next_index(),
+            name=f"phase2.wait_megaform.attempt{attempt_num}",
+            status=StepStatus.OK
+            if (mf_result and mf_result.get("ok"))
+            else StepStatus.FAILED,
+            duration_ms=int((time.monotonic() - wait_started) * 1000),
+            value=str(mf_result)[:200],
+            error=None
+            if (mf_result and mf_result.get("ok"))
+            else "megaform_not_visible",
+        )
+    )
+    if not (mf_result and mf_result.get("ok")):
+        return {
+            "ok": False,
+            "reason": "megaform_not_visible_after_go",
+            "mf_result": mf_result,
+        }
+
+    return {"ok": True, "method": "scripted", "attempt": attempt_num}
 
 
 def _dd_mm_yyyy(iso: str) -> str:
@@ -498,132 +933,6 @@ async def _wait_for_get_details_filled(
     return ""
 
 
-async def _select_checkpost_option(
-    session,
-    target_text: str | None,
-    *,
-    log: StepLogger,
-    name: str,
-    timeout: int = 15,
-) -> str | None:
-    """Select an option in the Check Post Name Through Entering dropdown.
-
-    Handles both modes:
-      - target_text is None  -> pick the first non-placeholder option
-                                (auto-pick fallback for when no
-                                 entryCheckpoint param was provided).
-      - target_text is a str -> pick the option whose text matches
-                                (exact / ci-equal / ci-contains).
-
-    Identifies the checkpost <select> via its placeholder text — the
-    placeholder '---Select CheckpostName/Barrier---' is stable across
-    portal renders, while the PrimeFaces j_idt* id of the wrapping
-    element drifts between deploys (we've now confirmed it has moved
-    from j_idt551 -> j_idt114 on at least one run).
-
-    Polls every 500ms for up to `timeout` seconds. The District ->
-    Checkpost AJAX cascade can take a few seconds, so the dropdown may
-    have only the placeholder when we first query it; we keep retrying
-    until either a matching option appears or the timeout fires.
-
-    EARLIER BUG (now fixed): a previous version identified the checkpost
-    select by scanning all <select>s for any option whose text contained
-    the district name (e.g. 'ALWAR'). That false-matched the District
-    dropdown itself (which contains ALWAR among its options), so the
-    helper "succeeded" by re-selecting the district -- silently leaving
-    the actual Checkpost field empty. Placeholder-based identification
-    avoids that whole class of false match.
-
-    Returns the option text that was selected, or None on timeout.
-    Logs option-list dumps on failure for debuggability.
-    """
-    started = time.monotonic()
-    target_json = json.dumps(target_text)  # python None -> JS null
-    expr = (
-        "(function(target){"
-        "function isCheckpost(e){"
-        "  if(!(e instanceof HTMLSelectElement)) return false;"
-        "  for(var i=0;i<e.options.length;i++){"
-        "    var t=(e.options[i].text||'').toLowerCase();"
-        "    if(t.indexOf('checkpost')>=0||t.indexOf('barrier')>=0){return true;}"
-        "  }"
-        "  return false;"
-        "}"
-        "function pickMatching(e, t){"
-        "  if(!(e instanceof HTMLSelectElement)) return null;"
-        "  var tLower = t ? t.toLowerCase() : null;"
-        "  for(var i=0;i<e.options.length;i++){"
-        "    var opt=e.options[i];"
-        "    var v=(opt.value||'').trim();"
-        "    if(!v || v==='-1' || v==='0') continue;"
-        "    var oText=(opt.text||'').trim();"
-        "    if(t===null){"
-        "      e.value=opt.value;"
-        "      e.dispatchEvent(new Event('input',{bubbles:true}));"
-        "      e.dispatchEvent(new Event('change',{bubbles:true}));"
-        "      return oText;"
-        "    }"
-        "    var oLower=oText.toLowerCase();"
-        "    if(oText===t || oLower===tLower || oLower.indexOf(tLower)>=0){"
-        "      e.value=opt.value;"
-        "      e.dispatchEvent(new Event('input',{bubbles:true}));"
-        "      e.dispatchEvent(new Event('change',{bubbles:true}));"
-        "      return oText;"
-        "    }"
-        "  }"
-        "  return null;"
-        "}"
-        "var sels = document.querySelectorAll('select');"
-        "var checkpostSeen = [];"
-        "for (var si=0; si<sels.length; si++){"
-        "  var e = sels[si];"
-        "  if (!isCheckpost(e)) continue;"
-        "  var opts = [];"
-        "  for (var i=0; i<e.options.length; i++){"
-        "    opts.push((e.options[i].text||'').trim());"
-        "  }"
-        "  checkpostSeen.push({id:e.id||'', options:opts});"
-        "  var picked = pickMatching(e, target);"
-        "  if (picked) return {ok:true, text:picked, elementId:e.id||''};"
-        "}"
-        "return {ok:false, checkpostSelects:checkpostSeen};"
-        "})(" + target_json + ")"
-    )
-    deadline = time.monotonic() + timeout
-    last_dump = None
-    while time.monotonic() < deadline:
-        result = await _cdp_eval(session, expr)
-        if result and result.get("ok"):
-            log.record(
-                StepLog(
-                    index=log.next_index(),
-                    name=name,
-                    status=StepStatus.OK,
-                    duration_ms=int((time.monotonic() - started) * 1000),
-                    value=(f"{result.get('text')} (el=#{result.get('elementId')})"),
-                )
-            )
-            return result.get("text")
-        if result:
-            last_dump = result.get("checkpostSelects")
-        await asyncio.sleep(0.5)
-
-    log.record(
-        StepLog(
-            index=log.next_index(),
-            name=name,
-            status=StepStatus.FAILED,
-            duration_ms=int((time.monotonic() - started) * 1000),
-            value=(target_text or "<first non-placeholder>"),
-            error=(
-                f"checkpost option not found within {timeout}s; "
-                f"checkpost_selects_seen={last_dump}"
-            ),
-        )
-    )
-    return None
-
-
 async def _click_first_unchecked_checkbox(session) -> bool:
     """Click the first unchecked checkbox in the document. Returns whether
     a click was made. Same pattern UP uses for the PG terms checkbox."""
@@ -648,7 +957,7 @@ async def _wait_for_checkpost_options(
 
     The checkpost dropdown is populated by a PrimeFaces.ab cascade
     fired from District's onchange. On a loaded portal this can take
-    2–5s, so the old `await asyncio.sleep(1.5)` is sometimes a race.
+    2-5s, so the old `await asyncio.sleep(1.5)` is sometimes a race.
     """
     expr = """
     (function(){
@@ -734,7 +1043,7 @@ async def _pf_select_first_checkpoint_by_label(session) -> dict:
             } catch (e) { /* fall through */ }
           }
 
-          // 4) Manual sync — same pattern that fixed Phase 2.
+          // 4) Manual sync.
           var proto = window.HTMLSelectElement.prototype;
           var d = Object.getOwnPropertyDescriptor(proto, 'value');
           if (d && d.set) { d.set.call(sel, target.value); }
@@ -771,7 +1080,7 @@ async def _pf_select_first_checkpoint_by_label(session) -> dict:
     )
 
 
-# ── PrimeFaces-aware select helpers ────────────────────────────────────
+# ── PrimeFaces-aware generic select helpers ────────────────────────────
 #
 # RJ's mega-form is rendered by PrimeFaces JSF. Every native <select> is
 # wrapped inside <div class="ui-helper-hidden-accessible"> which applies
@@ -992,9 +1301,6 @@ async def run(
     )
     # RJ navigates to checkpost.parivahan.gov.in/checkpost/faces/.../TaxCollection.xhtml
     # (DIFFERENT host than UP/HR's services.parivahan.gov.in/checkpostv4).
-    # We match on 'checkpost.parivahan.gov.in/checkpost' which is unique
-    # to the destination -- the source URL (parivahan.gov.in/en/node/579)
-    # does not contain '/checkpost'.
     await wait_for_url(
         session,
         "checkpost.parivahan.gov.in/checkpost",
@@ -1004,96 +1310,141 @@ async def run(
     )
     await sleep_seconds(PHASE_GAP_SECS, log=log, name="phase1.settle")
 
-    # ─── Phase 2: service selection + Go ───────────────────────────────
+    # ─── Phase 2: service selection + Go (AI handoff only) ────────────
+    #
+    # WHY AI-ONLY: We attempted scripted interaction with this page's
+    # PrimeFaces SelectOneMenu + JSF AJAX submit using every flavor of
+    # synthesized event (widget.selectValue, dispatchEvent mousedown/click,
+    # PrimeFaces.ab direct invocation). All of them produce the same
+    # destructive failure mode: the page hangs in a "Loading" overlay for
+    # ~60s, then the server redirects to /faces/login.xhtml with
+    #   "Direct access to Checkpost portal not allowed.
+    #    Please visit via parivahan.gov.in>>Online Service>>Checkpost Tax"
+    # -- a session-invalidation page. Once we're there, the session is
+    # gone and no recovery (including AI rescue) can get us back to the
+    # mega-form.
+    #
+    # ROOT CAUSE (most likely): the RJ portal validates that form-submit
+    # events came from real user input. Events synthesized via JS have
+    # event.isTrusted === false; real mouse clicks have isTrusted === true.
+    # JSF anti-bot heuristics on this portal evidently check this and
+    # invalidate the session when they don't see trusted events.
+    #
+    # WHY AI WORKS (we believe): browser_use's Agent issues clicks via
+    # CDP Input.dispatchMouseEvent, which goes through Chromium's input
+    # pipeline and produces isTrusted=true events. So the AI rescue does
+    # not trip the portal's check.
+    #
+    # All the scripted Phase 2 helpers (_pf_select_service_option,
+    # _verify_pf_selection, _fire_go_with_completion, _phase2_attempt,
+    # _wait_for_megaform_strict) are kept in this file for two reasons:
+    #   1. _wait_for_megaform_strict is still useful for verifying the
+    #      AI got us to the mega-form.
+    #   2. If we ever rework the scripted path to use CDP Input directly
+    #      (instead of dispatchEvent / element.click()), the helpers are
+    #      a useful starting point.
+
     await wait_for_selector(
         session,
         SEL_SERVICE_WIDGET,
-        # SEL_SERVICE_DROPDOWN,
         log=log,
         name="phase2.wait_service_widget",
         timeout=30,
     )
 
-    sel_started = time.monotonic()
-    result = await _pf_select_service_option(session)
-    log.record(
-        StepLog(
-            index=log.next_index(),
-            name="phase2.select_service",
-            status=StepStatus.OK
-            if (result and result.get("ok"))
-            else StepStatus.FAILED,
-            duration_ms=int((time.monotonic() - sel_started) * 1000),
-            selector=SEL_SERVICE_DROPDOWN,
-            value=str(result)[:200],
-            error=None
-            if (result and result.get("ok"))
-            else (result.get("reason") if result else "no_result"),
-        )
-    )
-    if not result or not result.get("ok"):
-        return RunOutcome(
-            status="failed",
-            summary=(
-                f"RJ Phase 2: could not select VEHICLE TAX COLLECTION "
-                f"(OTHER STATE) — {result}"
-            ),
-            abort_reason="phase2_service_select_failed",
-            run_log=log.dump(),
-        )
-
-    # Let PrimeFaces register the selection internally before we trigger
-    # the AJAX. Without this beat, some PF builds reject the submit.
-    await asyncio.sleep(1.5)
-
-    await click_by_text(
-        session,
-        "Go",
-        log=log,
-        name="phase2.click_go",
-        tag="button",
-    )
-
-    # PrimeFaces.ab does an AJAX panel update — URL may not change.
-    # Wait on the mega-form's vehicle input as the real readiness signal.
-    megaform_ready = False
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline:
-        ready = await _cdp_eval(
+    handoff_started = time.monotonic()
+    try:
+        rescue_summary, rescue_cost = await run_ai_rescue(
             session,
-            """
-            (function(){
-              if (document.querySelector('input#j_idt57')) return true;
-              var fb = document.querySelectorAll(
-                "input[type='text'][maxlength='10'][onkeyup*='makeCaps']"
-              );
-              return fb.length > 0;
-            })()
-            """,
+            goal=(
+                "On the BORDER TAX PAYMENT page (heading 'BORDER TAX PAYMENT'): "
+                "1) Click the down-arrow/triangle on the right side of the "
+                "'Service Name' dropdown (it currently shows "
+                "'---Select Service Name---') to open the option list. "
+                "2) Click 'VEHICLE TAX COLLECTION (OTHER STATE)' in the dropdown. "
+                "3) Click the small blue '>> Go' button beneath the dropdowns. "
+                "4) After clicking Go, the page may show a 'Loading' overlay "
+                "for a few seconds. Wait for it to finish. "
+                "5) Once the page changes to show a 'BORDER TAX PAYMENT FOR "
+                "ENTRY INTO RAJASTHAN' heading with a 'Vehicle No.' input field "
+                "and a 'Get Details' button, call done. "
+                "IMPORTANT: Do NOT use JavaScript or evaluate(). Use real "
+                "browser clicks only."
+            ),
+            reason=(
+                "RJ Phase 2 uses AI handoff exclusively. Scripted interaction "
+                "with this PrimeFaces page triggers server-side session "
+                "rejection (page redirects to '/faces/login.xhtml' with "
+                "'Direct access to Checkpost portal not allowed')."
+            ),
+            page_context_hint=(
+                "PrimeFaces JSF page on checkpost.parivahan.gov.in. The "
+                "'Service Name' dropdown is a custom widget -- click the "
+                "down-arrow on its RIGHT EDGE (not the dropdown text itself) "
+                "to open the option list. The Go button below it submits the "
+                "form and triggers a slow page transition."
+            ),
+            max_steps=PHASE2_AI_RESCUE_MAX_STEPS,
         )
-        if ready:
-            megaform_ready = True
-            break
-        await asyncio.sleep(0.5)
+    except Exception as e:
+        rescue_summary = f"AI rescue threw: {type(e).__name__}: {e}"
+        rescue_cost = 0.0
 
     log.record(
         StepLog(
             index=log.next_index(),
-            name="phase2.wait_megaform",
-            status=StepStatus.OK if megaform_ready else StepStatus.FAILED,
+            name="phase2.ai_handoff",
+            status=StepStatus.HANDED_OFF,
+            duration_ms=int((time.monotonic() - handoff_started) * 1000),
+            handoff_reason="phase2_pf_interaction",
+            handoff_summary=(rescue_summary or "")[:300],
+            handoff_cost_usd=float(rescue_cost or 0.0),
         )
     )
-    if not megaform_ready:
+
+    # Verify the AI actually got us to the mega-form. The strict check
+    # requires both the Vehicle No input AND a 'Get Details' button to
+    # be visible -- guarantees we're on the mega-form, not back on the
+    # landing page or on the session-killed login redirect.
+    post_handoff_mf = await _wait_for_megaform_strict(session, PHASE2_MEGAFORM_TIMEOUT)
+    log.record(
+        StepLog(
+            index=log.next_index(),
+            name="phase2.post_handoff_verify",
+            status=StepStatus.OK
+            if (post_handoff_mf and post_handoff_mf.get("ok"))
+            else StepStatus.FAILED,
+            value=str(post_handoff_mf)[:200],
+        )
+    )
+    if not (post_handoff_mf and post_handoff_mf.get("ok")):
+        # If the page redirected to the "Direct access not allowed" /
+        # login page, the URL will reflect it. Surface that in the
+        # failure summary so the cause is obvious from the run log.
+        current_url = ""
+        try:
+            current_url = await _current_url(session)
+        except Exception:
+            pass
         return RunOutcome(
             status="failed",
             summary=(
-                "RJ Phase 2: clicked Go but the mega-form (Vehicle No input) "
-                "did not appear within 30s. PrimeFaces AJAX likely never fired "
-                "or the dropdown selection didn't stick."
+                f"RJ Phase 2: AI rescue could not reach the mega-form. "
+                f"Current URL: {current_url or '<unknown>'}. "
+                f"AI summary: {rescue_summary}"
             ),
-            abort_reason="phase2_megaform_not_appeared",
+            abort_reason="phase2_ai_handoff_failed",
             run_log=log.dump(),
         )
+
+    log.record(
+        StepLog(
+            index=log.next_index(),
+            name="phase2.complete",
+            status=StepStatus.OK,
+            value="method=ai_handoff",
+        )
+    )
     await sleep_seconds(PHASE_GAP_SECS, log=log, name="phase2.settle")
 
     # ─── Phase 3: mega-form (Vehicle No -> Calculate Tax) ──────────────
@@ -1166,8 +1517,6 @@ async def run(
         )
     )
     if not owner_value:
-        # Possibly a validity popup is blocking. Let abort_if_popup_text
-        # surface a clearer reason if it finds one.
         await abort_if_popup_text(
             session,
             [
@@ -1329,12 +1678,8 @@ async def run(
     # in practice.
 
     # 3g. Check Post Name Through Entering — always auto-pick first option.
-    # (params.entryCheckpoint is intentionally ignored per the new spec:
+    # (params.entryCheckpoint is intentionally ignored per the spec:
     #  District comes from params, Checkpost is whatever's first under it.)
-    #
-    # First wait for the cascade from District to actually populate the
-    # checkpost options. The old `await asyncio.sleep(1.5)` above was racy
-    # on slow days.
     opt_count = await _wait_for_checkpost_options(session, timeout=15)
     log.record(
         StepLog(
@@ -1484,8 +1829,6 @@ async def run(
         tax_mode_val = await get_select_value(session, SEL_TAX_MODE)
 
     if not tax_mode_val or tax_mode_val == "-1":
-        # Soft warning -- Calculate Tax might still work, or it'll fail
-        # with a clearer message we'll catch below.
         log.record(
             StepLog(
                 index=log.next_index(),
@@ -1508,9 +1851,7 @@ async def run(
         tag="button",
     )
 
-    # Poll for Total Amount to be populated. The Particulars table
-    # renders along with the value -- a non-empty/non-zero value is the
-    # canonical success signal.
+    # Poll for Total Amount to be populated.
     total_amount = ""
     deadline = time.monotonic() + CALCULATE_TAX_TIMEOUT_SECS
     while time.monotonic() < deadline:
@@ -1563,8 +1904,6 @@ async def run(
         name="phase4.wait_confirmation_dialog",
         timeout=10,
     )
-    # click_by_text finds the first visible button with the text. The
-    # dialog's Confirm is the only visible Confirm button at this point.
     await click_by_text(
         session,
         "Confirm",
@@ -1575,10 +1914,6 @@ async def run(
     await sleep_seconds(PHASE_GAP_SECS, log=log, name="phase4.settle")
 
     # ─── Phase 5: e-Vahan Payment Gateway ──────────────────────────────
-    # Wait until a checkbox appears (the terms-and-conditions one) --
-    # a stable signal that we've landed on the PG page. The page also
-    # contains a "Payment ID" beginning with "RJL..." but the checkbox
-    # is the cheapest readiness probe.
     pg_ready = False
     deadline = time.monotonic() + PAYMENT_GATEWAY_NAV_TIMEOUT
     while time.monotonic() < deadline:
@@ -1601,10 +1936,6 @@ async def run(
             run_log=log.dump(),
         )
 
-    # Select E-GRAS in the gateway dropdown. _pf_select_by_value scans all
-    # <select> elements and picks the first one with value="EGRAS" -- the
-    # unstable j_idt id of the dropdown is irrelevant, and the underlying
-    # select is PrimeFaces-hidden so we bypass the visibility check.
     await _pf_select_by_value(
         session,
         SEL_PG_DROPDOWN,
@@ -1614,7 +1945,6 @@ async def run(
         timeout=10,
     )
 
-    # Tick the terms checkbox.
     cb_started = time.monotonic()
     cb_clicked = await _click_first_unchecked_checkbox(session)
     log.record(
@@ -1638,7 +1968,6 @@ async def run(
             run_log=log.dump(),
         )
 
-    # Continue button has unstable id (j_idt13:bt_payment) -- click by text.
     await click_by_text(
         session,
         "Continue",
@@ -1649,8 +1978,6 @@ async def run(
     await sleep_seconds(PHASE_GAP_SECS, log=log, name="phase5.settle")
 
     # ─── Phase 6: eGRAS Rajasthan splash ───────────────────────────────
-    # The single big CONTINUE is an <input type="image" id="txtGo">, not
-    # a <button>, so click_by_text won't match it. Use direct CSS click.
     await wait_for_selector(
         session,
         SEL_EGRAS_SPLASH_CONTINUE,
@@ -1680,7 +2007,6 @@ async def run(
         log=log,
         name="phase7.click_upi_tab",
     )
-    # Let the right-side UPI panel render before clicking Proceed.
     await asyncio.sleep(1.0)
     await click(
         session,
@@ -1691,9 +2017,6 @@ async def run(
     await sleep_seconds(PHASE_GAP_SECS, log=log, name="phase7.settle")
 
     # ─── Phase 8: QR page (UPI ID -> postback -> QR CODE visible) ──────
-    # IMPORTANT: the page initially shows the UPI ID radio active. We
-    # must click the QR CODE radio (rblUpi_1), which fires an ASP.NET
-    # __doPostBack and re-renders the page with the QR <img>.
     await wait_for_selector(
         session,
         SEL_QR_RADIO,
@@ -1716,7 +2039,6 @@ async def run(
     )
     await sleep_seconds(1.0, log=log, name="phase8.qr_settle")
 
-    # Save QR. actions.save_qr_code already knows the RJ container id.
     qr_started = time.monotonic()
     qr_result = await save_qr_code(session, job_id, job_params)
     log.record(
@@ -1728,9 +2050,7 @@ async def run(
             error=None if qr_result.get("ok") else qr_result.get("error"),
         )
     )
-    # Non-blocking: even if upload failed, we still wait for the human.
 
-    # Wait for human payment confirmation.
     human_started = time.monotonic()
     payment_reason = (
         f"UPI payment required for border tax of vehicle "
@@ -1768,11 +2088,6 @@ async def run(
         )
 
     # ─── Phase 9: poll for receipt, extract, save PDF ──────────────────
-    # RJ receipt markers (from a confirmed receipt sample):
-    #   - "GOVERNMENT OF RAJASTHAN" heading
-    #   - "Checkpost Tax e-Receipt" subheading
-    #   - "Receipt No." with an "RJT..." value
-    #   - "Grand Total :" near the bottom
     receipt_ready = False
     deadline = time.monotonic() + RECEIPT_POLL_TIMEOUT_SECS
     while time.monotonic() < deadline:
@@ -1907,14 +2222,6 @@ async def _extract_receipt_fields(
         Receipt No.              : RJT2605145702835
         Grand Total : ₹ 224/- ( TWO HUNDRED TWENTY FOUR ONLY)
         Payment Initiation Date  : 14-MAY-2026 12:42 AM
-
-    Differences vs UP/HR's receipt regexes:
-      - prefix "RJT..." (the generic [A-Z0-9]+ pattern still captures it)
-      - Grand Total has a leading ₹ symbol (not present in UP/HR);
-        we add ₹? to allow it.
-      - date label is "Payment Initiation Date" (not "Payment Confirmation
-        Date" like UP/HR); we accept either word so the same parser
-        survives a future portal rename in either direction.
     """
     text = await _cdp_eval(session, "document.body.innerText || ''")
     if not text:
