@@ -137,6 +137,10 @@ SEL_CHECKPOINT = "select#floatingCheckpost"
 SEL_VEHICLE_CATEGORY = "select#floatingVecCat"
 SEL_PERMIT_TYPE = "select#floatingPrmit"
 SEL_SERVICE_TYPE = "select#floatingService"
+# Server-populated (disabled in DOM) — the canary signal for "RC AJAX has
+# landed". Until this has a non-empty .value, dependent dropdowns can't
+# be filled correctly.
+SEL_VEHICLE_CLASS = "select#floatingVehicletype"
 # (No SEL_DISTANCE on MP — like PB.)
 
 # Phase 5 — tax info
@@ -190,7 +194,7 @@ SBIEPAY_UPI_PANEL_TIMEOUT = 20  # click UPI tab -> UPI QR radio mounts
 SBIEPAY_PAY_NOW_TIMEOUT = 15  # click UPI QR radio -> Pay Now button enabled
 QR_PAGE_NAV_TIMEOUT = 45  # click Pay Now -> QR page mounts
 CHECKPOINT_POPULATE_TIMEOUT = 10  # district -> checkpost options populated
-
+RC_DATA_TIMEOUT_SECS = 30
 
 # ─── Helpers ───────────────────────────────────────────────────────────
 
@@ -428,6 +432,7 @@ async def run(
             run_log=log.dump(),
         )
 
+    await sleep_seconds(3, log=log, name="phase3.settle")
     await click_by_text(
         session,
         "Next",
@@ -469,6 +474,62 @@ async def run(
         log=log,
         name="phase4.wait_vehicle_info_page",
         timeout=30,
+    )
+
+    rc_data_loaded = False
+    rc_started = time.monotonic()
+    rc_deadline = rc_started + RC_DATA_TIMEOUT_SECS
+    veh_class_val = ""
+    while time.monotonic() < rc_deadline:
+        veh_class_val = (
+            await _cdp_eval(
+                session,
+                "(function(){var e=document.querySelector("
+                "'select#floatingVehicletype');return e?(e.value||''):'';})()",
+            )
+            or ""
+        )
+        if veh_class_val and veh_class_val not in ("0", "-1"):
+            rc_data_loaded = True
+            break
+        await asyncio.sleep(0.5)
+
+    log.record(
+        StepLog(
+            index=log.next_index(),
+            name="phase4.wait_rc_data_loaded",
+            status=StepStatus.OK if rc_data_loaded else StepStatus.FAILED,
+            duration_ms=int((time.monotonic() - rc_started) * 1000),
+            value=f"vehicleClass={veh_class_val!r}",
+        )
+    )
+
+    if not rc_data_loaded:
+        return RunOutcome(
+            status="failed",
+            summary=(
+                f"Vehicle {params.vehicleNumber} RC data did not load on "
+                f"Phase 4 within {RC_DATA_TIMEOUT_SECS}s (Vehicle Class "
+                f"field stayed empty). Usually means parivahan's central "
+                f"RC service was slow or returned no data for this "
+                f"vehicle. Retry the job — this is typically transient."
+            ),
+            abort_reason="rc_data_not_loaded",
+            run_log=log.dump(),
+        )
+
+    # Re-check for validity popup that may have surfaced together with
+    # the RC data (rare, but parivahan does this when fitness/insurance/
+    # PUCC has expired AND the data lookup succeeded).
+    await abort_if_popup_text(
+        session,
+        _validity_keywords,
+        _validity_abort,
+        log=log,
+        name="phase4.check_validity_after_rc_load",
+        close_selector=(
+            "button.swal2-confirm, .modal-footer button, .swal-button--confirm"
+        ),
     )
 
     # 4a. Vehicle Category — usually pre-filled from RC ("LIGHT PASSENGER

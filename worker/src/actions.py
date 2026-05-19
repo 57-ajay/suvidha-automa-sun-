@@ -1,4 +1,3 @@
-# worker/src/actions.py
 """Pure-function implementations of the actions that today live as tool
 closures inside agent.py's make_tools().
 
@@ -89,27 +88,120 @@ async def wait_for_human(
 
 
 # ─── save_qr_code ──────────────────────────────────────────────────────────
+#
+# Per-state QR locators
+# =====================
+# Each constant below is a self-contained CDP-evaluated JS expression that
+# returns either:
+#   - { src, isDataUri, x, y, width, height }  ← QR found
+#   - null                                      ← no QR found
+#
+# Adding a new state? Add a `_QR_LOCATE_<STATE>` constant here, then register
+# it in `_QR_LOCATORS_BY_STATE` below. The return-shape contract is the only
+# thing each locator MUST honor; everything else (decode, screenshot fallback,
+# upload) is shared logic in save_qr_code() further down.
+#
+# When the portal changes selectors? Edit ONLY the matching constant. The
+# other states' extractors are untouched.
 
-_QR_LOCATE_JS = """
+# UP / HR / PB — SBIePay Lite
+# All three use the same SBIePay Lite payment gateway and the QR <img> always
+# has id="qrcodeImg". One constant covers them.
+_QR_LOCATE_UP_HR_PB = """
 (function() {
-    // UP/HR/PB: <img id="qrcodeImg"> (SBIePay Lite)
+    var img = document.getElementById('qrcodeImg');
+    if (!img) return null;
+    var src  = img.src || '';
+    var rect = img.getBoundingClientRect();
+    return {
+        src: src,
+        isDataUri: src.startsWith('data:'),
+        x: rect.left, y: rect.top,
+        width: rect.width, height: rect.height
+    };
+})()
+"""
+
+# RJ — eGRAS Rajasthan (ASP.NET WebForms)
+# The QR <img> has no id but lives inside a container div with an
+# ASP.NET-prefixed id. Older actions.py had a 'ct100' typo fallback; we keep
+# both spellings because some early jobs still reference the typoed one.
+_QR_LOCATE_RJ = """
+(function() {
+    var container = document.getElementById('ctl00_ContentPlaceHolder1_divQRCode')
+        || document.getElementById('ct100_ContentPlaceHolder1_divQRCode');
+    if (!container) return null;
+    var img = container.querySelector('img');
+    if (!img) return null;
+    var src  = img.src || '';
+    var rect = img.getBoundingClientRect();
+    return {
+        src: src,
+        isDataUri: src.startsWith('data:'),
+        x: rect.left, y: rect.top,
+        width: rect.width, height: rect.height
+    };
+})()
+"""
+
+# MP — SBIePay (NOT SBIePay Lite) at epay.sbi.bank.in/secure/upiQRWait.jsp
+# The QR <img> has NO id and sits inside a generic <div>. We identify it by:
+#   - data:image/png;base64 src (the QR is embedded inline, not a remote URL)
+#   - >= 200x200 px (filters out logos/icons)
+#   - aspect ratio 0.85-1.15 (QR codes are square)
+#   - LARGEST area among matches (defeats accidental small-image matches)
+# This pattern is also a sensible fallback for any future state that embeds
+# an inline data-URI QR with no convenient selector.
+_QR_LOCATE_MP = """
+(function() {
+    var candidates = document.querySelectorAll("img[src^='data:image/png;base64']");
+    var best = null;
+    var bestArea = 0;
+    for (var i = 0; i < candidates.length; i++) {
+        var c = candidates[i];
+        var r = c.getBoundingClientRect();
+        if (r.width < 200 || r.height < 200) continue;
+        var aspect = r.width / r.height;
+        if (aspect < 0.85 || aspect > 1.15) continue;
+        var area = r.width * r.height;
+        if (area > bestArea) {
+            best = c;
+            bestArea = area;
+        }
+    }
+    if (!best) return null;
+    var src  = best.src || '';
+    var rect = best.getBoundingClientRect();
+    return {
+        src: src,
+        isDataUri: src.startsWith('data:'),
+        x: rect.left, y: rect.top,
+        width: rect.width, height: rect.height
+    };
+})()
+"""
+
+# GENERIC — used when:
+#   1. The AI agent path calls save_qr_code (params may not include `state`).
+#   2. A new state hits save_qr_code before its per-state locator is added.
+# This is a defensive cascade of all known patterns above. Order matters:
+# try precise selectors first, generic data-URI search last. If you find
+# yourself relying on this in a NEW scripted state, add a dedicated locator
+# above and register it in _QR_LOCATORS_BY_STATE instead.
+_QR_LOCATE_GENERIC = """
+(function() {
+    // 1. SBIePay Lite (UP/HR/PB)
     var img = document.getElementById('qrcodeImg');
 
-    // RJ: <img> inside <div id="ctl00_ContentPlaceHolder1_divQRCode"> (ASP.NET WebForms)
+    // 2. eGRAS Rajasthan (RJ)
     if (!img) {
         var container = document.getElementById('ctl00_ContentPlaceHolder1_divQRCode')
-        || document.getElementById('ct100_ContentPlaceHolder1_divQRCode');
+            || document.getElementById('ct100_ContentPlaceHolder1_divQRCode');
         if (container) img = container.querySelector('img');
     }
 
-    // MP (and generic fallback): epay.sbi.bank.in/secure/upiQRWait.jsp
-    // The QR <img> has no id and sits inside a generic <div>. This branch
-    // is ONLY reached when neither of the two known primary selectors
-    // matched -- which by definition means we're NOT on a UP/HR/PB/RJ
-    // QR page. We further constrain the match to images that look like
-    // QR codes: at least 200x200 px, square-ish aspect ratio (0.85-1.15),
-    // base64-encoded PNG data URI. Among matches, we pick the LARGEST by
-    // area so a small logo/icon can never win over the real QR.
+    // 3. Generic large-square data-URI fallback (MP and any future
+    //    state that embeds a base64 QR with no convenient selector).
     if (!img) {
         var candidates = document.querySelectorAll("img[src^='data:image/png;base64']");
         var best = null;
@@ -121,56 +213,58 @@ _QR_LOCATE_JS = """
             var aspect = r.width / r.height;
             if (aspect < 0.85 || aspect > 1.15) continue;
             var area = r.width * r.height;
-            if (area > bestArea) {
-                best = c;
-                bestArea = area;
-            }
+            if (area > bestArea) { best = c; bestArea = area; }
         }
         if (best) img = best;
     }
 
     if (!img) return null;
-
     var src  = img.src || '';
     var rect = img.getBoundingClientRect();
     return {
-        src:       src,
+        src: src,
         isDataUri: src.startsWith('data:'),
-        x:         rect.left,
-        y:         rect.top,
-        width:     rect.width,
-        height:    rect.height
+        x: rect.left, y: rect.top,
+        width: rect.width, height: rect.height
     };
 })()
 """
 
-#
-# _QR_LOCATE_JS = """
-# (function() {
-#     // UP/HR: <img id="qrcodeImg">
-#     var img = document.getElementById('qrcodeImg');
-#
-#     // RJ: <img> inside <div id="ct100_ContentPlaceHolder1_divQRCode">
-#     if (!img) {
-#         var container = document.getElementById('ctl00_ContentPlaceHolder1_divQRCode')
-#         || document.getElementById('ct100_ContentPlaceHolder1_divQRCode');
-#         if (container) img = container.querySelector('img');
-#     }
-#
-#     if (!img) return null;
-#
-#     var src  = img.src || '';
-#     var rect = img.getBoundingClientRect();
-#     return {
-#         src:       src,
-#         isDataUri: src.startsWith('data:'),
-#         x:         rect.left,
-#         y:         rect.top,
-#         width:     rect.width,
-#         height:    rect.height
-#     };
-# })()
-# """
+# Per-state dispatch table. Keys are upper-cased state codes / names.
+# When job_params['state'] matches a key, the corresponding JS runs ALONE.
+# When it doesn't, _QR_LOCATE_GENERIC runs (the cascade) so the AI path and
+# any unregistered state still works.
+_QR_LOCATORS_BY_STATE: dict[str, str] = {
+    # SBIePay Lite trio
+    "UP": _QR_LOCATE_UP_HR_PB,
+    "U.P.": _QR_LOCATE_UP_HR_PB,
+    "UTTAR PRADESH": _QR_LOCATE_UP_HR_PB,
+    "HR": _QR_LOCATE_UP_HR_PB,
+    "HARYANA": _QR_LOCATE_UP_HR_PB,
+    "PB": _QR_LOCATE_UP_HR_PB,
+    "PUNJAB": _QR_LOCATE_UP_HR_PB,
+    # eGRAS RJ (ASP.NET WebForms)
+    "RJ": _QR_LOCATE_RJ,
+    "RAJASTHAN": _QR_LOCATE_RJ,
+    # SBIePay (epay.sbi.bank.in)
+    "MP": _QR_LOCATE_MP,
+    "M.P.": _QR_LOCATE_MP,
+    "MADHYA PRADESH": _QR_LOCATE_MP,
+}
+
+
+def _pick_qr_locator(job_params: dict) -> tuple[str, str]:
+    """Return (locator_name, js_expression) based on job_params['state'].
+
+    Falls back to the generic cascade if state is missing or unrecognized.
+    The locator_name is logged so it's obvious from the job log which
+    extractor ran -- useful when a portal changes its selectors.
+    """
+    state = (job_params.get("state") or "").strip().upper()
+    js = _QR_LOCATORS_BY_STATE.get(state)
+    if js is not None:
+        return (f"state={state}", js)
+    return ("generic_cascade", _QR_LOCATE_GENERIC)
 
 
 async def save_qr_code(
@@ -179,30 +273,36 @@ async def save_qr_code(
     job_params: dict,
 ) -> dict:
     """Capture the visible UPI QR-code image and POST it to
-    /api/internal/border-tax/save-qr. Returns the parsed API response."""
-    print(f"[{job_id}] save_qr_code called")
+    /api/internal/border-tax/save-qr. Returns the parsed API response.
+
+    QR location is picked per-state from `_QR_LOCATORS_BY_STATE` using
+    `job_params['state']`; falls back to a generic cascade for the AI
+    agent path or unregistered states.
+    """
+    locator_name, locate_js = _pick_qr_locator(job_params)
+    print(f"[{job_id}] save_qr_code called (locator: {locator_name})")
 
     try:
         cdp = await session.get_or_create_cdp_session()
 
         # 1. Locate the QR <img> via CDP eval.
         eval_result = await cdp.cdp_client.send.Runtime.evaluate(
-            params={"expression": _QR_LOCATE_JS, "returnByValue": True},
+            params={"expression": locate_js, "returnByValue": True},
             session_id=cdp.session_id,
         )
         info = (eval_result.get("result", {}) or {}).get("value")
         if not info:
             msg = (
-                "QR code img element not found -- tried #qrcodeImg (UP/HR/PB), "
-                "#ctl00_ContentPlaceHolder1_divQRCode img (RJ), and "
-                "large square base64 data-URI img (MP fallback)"
+                f"QR code img element not found by locator '{locator_name}'. "
+                f"If this is a new state portal, add a _QR_LOCATE_<STATE> "
+                f"entry in actions.py and register it in _QR_LOCATORS_BY_STATE."
             )
             print(f"[{job_id}]   ERROR: {msg}")
             return {"ok": False, "error": msg}
 
         if info.get("width", 0) <= 0 or info.get("height", 0) <= 0:
             msg = (
-                f"QR element found but has zero size "
+                f"QR element found by '{locator_name}' but has zero size "
                 f"(w={info.get('width')} h={info.get('height')})"
             )
             print(f"[{job_id}]   ERROR: {msg}")
