@@ -26,10 +26,31 @@ from __future__ import annotations
 import re
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+# Default entry district per state, used when the caller doesn't supply one.
+# Mirrors the defaults in api/src/tasks/borderTax/states/*.ts.
+_DEFAULT_ENTRY_DISTRICT: dict[str, str] = {
+    "UP": "GHAZIABAD",
+    "HR": "FARIDABAD",
+    "RJ": "CHITTORGARH",
+    "PB": "MOHALI",
+    "MP": "GWALIOR",
+}
+
+# Inline alias map — avoids a circular import with runner.py.
+_STATE_ALIAS: dict[str, str] = {
+    "UTTAR PRADESH": "UP",
+    "U.P.": "UP",
+    "HARYANA": "HR",
+    "RAJASTHAN": "RJ",
+    "PUNJAB": "PB",
+    "MADHYA PRADESH": "MP",
+    "M.P.": "MP",
+}
 
 
 class BorderTaxParams(BaseModel):
@@ -100,6 +121,15 @@ class BorderTaxParams(BaseModel):
     @classmethod
     def _trim_upper(cls, v: str) -> str:
         return (v or "").strip().upper()
+
+        @model_validator(mode="after")
+        def _apply_district_default(self) -> "BorderTaxParams":
+            """Set entryDistrict to the state-specific default when not provided."""
+            if not self.entryDistrict:
+                raw = (self.state or "").strip().upper()
+                code = _STATE_ALIAS.get(raw, raw)
+                self.entryDistrict = _DEFAULT_ENTRY_DISTRICT.get(code, "")
+            return self
 
     def is_upi(self) -> bool:
         return self.paymentMethod == "upi"

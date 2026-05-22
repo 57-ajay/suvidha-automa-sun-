@@ -27,8 +27,8 @@ export function driverBorderTaxUsageRef(driverId: string) {
     return db
         .collection("driverUtilitiesRequests")
         .doc("borderTaxSummary")
-        .collection(driverId)
-        .doc("borderTaxUsage");
+        .collection("driverUsage")
+        .doc(driverId);
 }
 
 console.log("[FIREBASE] Initialized successfully (Firestore + Storage)");

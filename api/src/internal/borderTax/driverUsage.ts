@@ -5,7 +5,7 @@
 //
 // Firestore shape
 // ───────────────
-//   driverUtilitiesRequests/borderTaxSummary/{driverId}/borderTaxUsage
+// driverUtilitiesRequests/borderTaxSummary/driverUsage/{driverId}
 //   {
 //     dailyCount:        number,          // resets each IST calendar day
 //     monthlyCount:      number,          // resets each IST calendar month
