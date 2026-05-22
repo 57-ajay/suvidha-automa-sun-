@@ -799,8 +799,7 @@ async def run(
         return RunOutcome(
             status="partial",
             summary=(
-                "Payment confirmed but receipt page did not render within "
-                f"{RECEIPT_POLL_TIMEOUT_SECS}s. Money was deducted; "
+                f"{RECEIPT_POLL_TIMEOUT_SECS}s. unsuccessful Payment  "
                 "receipt PDF was not captured."
             ),
             partial_reasons=["receipt_page_timeout"],

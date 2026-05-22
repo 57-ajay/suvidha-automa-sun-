@@ -3,6 +3,7 @@ import {
     getStateBuilder,
     listSupportedStates,
 } from "./states";
+import { applyStateDefaults } from "./states/defaults";
 
 export const buildPrompt = async (
     p: Record<string, string>,
@@ -17,6 +18,7 @@ export const buildPrompt = async (
             `Supported: ${listSupportedStates().join(", ")}.`,
         );
     }
+    const resolved = applyStateDefaults(stateKey, p);
 
-    return builder(p);
+    return builder(resolved);
 };

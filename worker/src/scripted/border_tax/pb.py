@@ -175,7 +175,7 @@ SEL_QR_IMG = "img#qrcodeImg"
 # ─── Tuning ────────────────────────────────────────────────────────────
 
 PHASE_GAP_SECS = 1.5
-HUMAN_PAYMENT_TIMEOUT = 600          # 10 minutes for UPI payment
+HUMAN_PAYMENT_TIMEOUT = 210          # 3.5 minutes for UPI payment
 RECEIPT_POLL_TIMEOUT_SECS = 90       # wait up to 90s for receipt after payment
 PERMIT_SET_TIMEOUT_SECS = 15         # per-attempt timeout when setting permit type
 IFMS_BANK_PAGE_TIMEOUT = 45          # post-submit -> IFMS bank-selection page mount
@@ -300,6 +300,8 @@ async def run(
 
     job_id = log.job_id
     r = log.r
+    # params.serviceType = "NOT APPLICABLE"
+    # params.permitType = "NOT APPLICABLE"
     job_params = params.model_dump()
 
     # ─── Phase 1: parivahan landing ────────────────────────────────────
@@ -1017,10 +1019,9 @@ async def run(
 
     if not receipt_ready:
         return RunOutcome(
-            status="partial",
+            status="failed",
             summary=(
-                "Payment confirmed but receipt page did not render within "
-                f"{RECEIPT_POLL_TIMEOUT_SECS}s. Money was deducted; "
+                f"{RECEIPT_POLL_TIMEOUT_SECS}s. unsuccessful Payment  "
                 "receipt PDF was not captured."
             ),
             partial_reasons=["receipt_page_timeout"],
