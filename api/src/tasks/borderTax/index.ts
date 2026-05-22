@@ -5,9 +5,8 @@ import { buildPrompt } from "./prompt";
 export const borderTax: Task = {
     id: "border-tax",
     name: "Border Tax Payment",
-    requiredParams: ["vehicleNumber", "requestId", "taxFrom", "taxUpto"],
+    requiredParams: ["vehicleNumber", "driverId", "requestId", "taxFrom", "taxUpto"],
     optionalParams: [
-        "driverId",
         "state",
         "taxMode",
         "entryDistrict",
