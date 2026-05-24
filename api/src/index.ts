@@ -75,7 +75,7 @@ const server = Bun.serve({
                 const jobId = params?.requestId || crypto.randomUUID();
 
                 const existingStatus = await redis.hget(`job:${jobId}`, "status");
-                if (existingStatus && ["queued", "running", "waiting_for_human"].includes(existingStatus)) {
+                if (existingStatus && ["queued", "running", "waiting_for_human", "verifyingPayment"].includes(existingStatus)) {
                     console.log(
                         `[API] /api/run dedup: jobId=${jobId} already ${existingStatus}, returning existing`
                     );
