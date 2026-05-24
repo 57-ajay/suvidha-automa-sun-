@@ -102,6 +102,7 @@ from ..steps import (
 from ..types import RunOutcome, StepLog, StepStatus, ScriptedAbort
 from .params import BorderTaxParams
 from ..handoff import run_ai_rescue
+from ._extract_amount import extract_and_save_border_tax_amount
 from ._payment_wait import PaymentCaptureConfig, wait_for_payment_and_capture_receipt
 
 # ─── Selectors ─────────────────────────────────────────────────────────
@@ -709,6 +710,7 @@ async def run(
             run_log=log.dump(),
         )
 
+    await sleep_seconds(1, log=log, name="phase5.wait_calculation")
     await click_by_text(
         session,
         "Calculate Fee/Tax",
@@ -717,6 +719,13 @@ async def run(
         tag="button",
     )
     await sleep_seconds(4, log=log, name="phase5.wait_calculation")
+
+    await extract_and_save_border_tax_amount(
+        session,
+        log=log,
+        name="phase5.extract_border_tax_amount",
+    )
+
     await click_by_text(
         session,
         "Next",
