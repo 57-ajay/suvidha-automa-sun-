@@ -177,15 +177,23 @@ function applyRollover(summary: DriverUsageSummary): DriverUsageSummary {
 // ─── Block reason strings ─────────────────────────────────────────────────────
 
 function humanBlockReason(type: BlockType, expiresAt: Date): string {
+    const formattedTime = new Date(expiresAt).toLocaleString("en-IN", {
+        hour: "numeric",
+        minute: "2-digit",
+        hour12: true,
+        day: "2-digit",
+        month: "2-digit",
+        year: "numeric",
+    });
     switch (type) {
         case "process_failed":
-            return `Your previous border tax request failed during processing (document issue or government portal was unavailable). You can try again after ${expiresAt.toISOString()}.`;
+            return `Your previous border tax request failed during processing (document issue or government portal was unavailable). You can try again after ${formattedTime}.`;
         case "qr_generated":
-            return `A QR code was generated for your previous border tax request but payment was not completed. You can try again after ${expiresAt.toISOString()}.`;
+            return `A QR code was generated for your previous border tax request but payment was not completed. You can try again after ${formattedTime}.`;
         case "paid_today":
-            return `You have already paid your border tax today. You can request again after midnight (${expiresAt.toISOString()}).`;
+            return `You have already paid your border tax today. You can request again after midnight (${formattedTime}).`;
         default:
-            return `You are temporarily blocked until ${expiresAt.toISOString()}.`;
+            return `You are temporarily blocked until ${formattedTime}.`;
     }
 }
 
