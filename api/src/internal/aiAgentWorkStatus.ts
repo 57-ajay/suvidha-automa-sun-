@@ -17,7 +17,8 @@ export async function setAiAgentWorkStatus(
     }
 
     if (!source) {
-        source = "web";
+        console.log(`[aiAgentWorkStatus] no source received, setting it to app`);
+        source = "app";
     }
 
     let docRef;

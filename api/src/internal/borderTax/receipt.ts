@@ -145,6 +145,7 @@ export async function handleSaveReceipt(input: SaveReceiptInput) {
             status: "completed",
             borderTaxUpdatedBy: "agent",
             receiptUpdatedAt: FieldValue.serverTimestamp(),
+            paymentDate: FieldValue.serverTimestamp(),
             ...(pdfUrl ? { receiptDocumentUrl: pdfUrl } : {}),
         });
         console.log(

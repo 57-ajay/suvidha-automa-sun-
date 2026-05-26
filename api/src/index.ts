@@ -122,7 +122,7 @@ const server = Bun.serve({
                 }
 
                 if (params?.requestId) {
-                    setAiAgentWorkStatus(params.requestId, taskId, "started", source).catch((e) => {
+                    setAiAgentWorkStatus(params.requestId, taskId, "started", resolvedSource).catch((e) => {
                         console.error(
                             `[API] background setAiAgentWorkStatus(started) failed for requestId=
                                     ${params.requestId}:`,
