@@ -54,6 +54,12 @@ const server = Bun.serve({
                     return Response.json({ error: "source can be either web or app" }, { status: 400 });
                 }
 
+                if (
+                    params?.taxFrom === params?.taxUpto &&
+                    params?.duration == null
+                ) {
+                    params.duration = '1';
+                }
 
                 const task = getTask(taskId);
                 if (!task) {
@@ -636,7 +642,7 @@ const server = Bun.serve({
                                 const driverId =
                                     typeof params?.driverId === "string" ? params.driverId.trim() : null;
 
-                                if (driverId) {
+                                if (driverId && (source === 'app' || job?.source === 'app')) {
                                     updateBorderTaxUsageOnCompletion({
                                         driverId,
                                         requestId,

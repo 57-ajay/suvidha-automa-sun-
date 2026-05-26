@@ -1,6 +1,5 @@
 import { FieldValue } from "firebase-admin/firestore";
 import { challanRequestsRef, borderTaxRequestsRef } from "../firebase";
-import { addTransactionSupport } from "ioredis/built/transaction";
 
 export type AiAgentWorkStatus = "started" | "completed" | "partial" | "failed";
 
@@ -17,7 +16,6 @@ export async function setAiAgentWorkStatus(
         return { ok: false, error: "taskId required" };
     }
 
-    console.log("[source from inside setAiAgentWorkStatus] -> ", source);
 
     if (!source) {
         console.log(`[aiAgentWorkStatus] no source received, setting it to app`);
@@ -37,20 +35,11 @@ export async function setAiAgentWorkStatus(
     }
 
     try {
-        if (status === 'failed' || status === 'partial') {
-            await docRef.update({
-                aiAgentWorkStatus: status,
-                aiAgentWorkStatusUpdatedAt: FieldValue.serverTimestamp(),
-                agentSource: source,
-                isVisibleTovendor: true
-            });
-        } else {
-            await docRef.update({
-                aiAgentWorkStatus: status,
-                aiAgentWorkStatusUpdatedAt: FieldValue.serverTimestamp(),
-                agentSource: source,
-            });
-        }
+        await docRef.update({
+            aiAgentWorkStatus: status,
+            aiAgentWorkStatusUpdatedAt: FieldValue.serverTimestamp(),
+            agentSource: source,
+        });
         console.log(
             `[aiAgentWorkStatus] set "${status}" for taskId=${taskId} requestId=${requestId}`,
         );

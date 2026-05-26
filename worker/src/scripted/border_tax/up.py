@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+import json
 
 from actions import save_qr_code, save_receipt
 from ._payment_wait import PaymentCaptureConfig, wait_for_payment_and_capture_receipt
@@ -110,6 +111,7 @@ SEL_QR_IMG = "img#qrcodeImg"
 
 PHASE_GAP_SECS = 1.5  # polite breath between phases
 PERMIT_SET_TIMEOUT_SECS = 15  # per-attempt timeout when setting permit type
+CHECKPOINT_POPULATE_TIMEOUT = 10
 
 _UP_PAYMENT_CONFIG = PaymentCaptureConfig(
     state_name="Uttar Pradesh",
@@ -129,6 +131,112 @@ _UP_PAYMENT_CONFIG = PaymentCaptureConfig(
         r"checkpost\s*tax\s*e-?receipt",
     ],
 )
+
+
+# ─── Helpers ───────────────────────────────────────────────────────────
+
+
+async def _select_checkpoint_with_fallback(
+    session,
+    selector: str,
+    desired: str,
+    *,
+    log: StepLogger,
+    name: str,
+    populate_timeout: int = CHECKPOINT_POPULATE_TIMEOUT,
+) -> dict:
+    """Select an Entry Checkpost option.
+
+    Logic:
+      1. Wait until the dropdown has at least one non-placeholder option
+         (Angular populates these after the district is chosen).
+      2. If `desired` is provided and matches an option's text (exact ->
+         case-insensitive equal), select it.
+      3. Otherwise pick the FIRST non-empty option.
+
+    Returns {"ok": True, "selected": "<text>", "value": "<v>",
+             "fallback_used": bool} on success, {"ok": False, "reason": "..."}
+    on failure.
+
+    UP's district and checkpoint share the same name (e.g. GHAZIABAD →
+    GHAZIABAD), so the desired value typically matches. The fallback
+    covers edge cases where the checkpoint list has renamed entries.
+    """
+    started = time.monotonic()
+    deadline = time.monotonic() + populate_timeout
+
+    expr_template = (
+        "(function(s, d) {"
+        "  var e = document.querySelector(s);"
+        "  if (!(e instanceof HTMLSelectElement)) return {ok:false, reason:'not_a_select'};"
+        "  var trimmed = (d || '').trim();"
+        "  var upper = trimmed.toUpperCase();"
+        "  var nonEmptyCount = 0;"
+        "  for (var c = 0; c < e.options.length; c++) {"
+        "    if (e.options[c].value && e.options[c].value !== '') nonEmptyCount++;"
+        "  }"
+        "  if (nonEmptyCount === 0) return {ok:false, reason:'not_populated_yet'};"
+        "  var matchedIdx = -1;"
+        "  if (trimmed) {"
+        "    for (var i = 0; i < e.options.length; i++) {"
+        "      if ((e.options[i].text || '').trim() === trimmed) { matchedIdx = i; break; }"
+        "    }"
+        "    if (matchedIdx < 0) {"
+        "      for (var j = 0; j < e.options.length; j++) {"
+        "        if ((e.options[j].text || '').trim().toUpperCase() === upper) { matchedIdx = j; break; }"
+        "      }"
+        "    }"
+        "  }"
+        "  var fallbackUsed = false;"
+        "  if (matchedIdx < 0) {"
+        "    fallbackUsed = true;"
+        "    for (var k = 0; k < e.options.length; k++) {"
+        "      if (e.options[k].value && e.options[k].value !== '') { matchedIdx = k; break; }"
+        "    }"
+        "  }"
+        "  if (matchedIdx < 0) return {ok:false, reason:'no_options'};"
+        "  var opt = e.options[matchedIdx];"
+        "  e.value = opt.value;"
+        "  e.dispatchEvent(new Event('input', {bubbles:true}));"
+        "  e.dispatchEvent(new Event('change', {bubbles:true}));"
+        "  return {ok:true, selected:(opt.text||'').trim(), value:opt.value, fallback_used:fallbackUsed};"
+        "})(" + json.dumps(selector) + ", " + json.dumps(desired or "") + ")"
+    )
+
+    last_reason = "no_result"
+    while True:
+        res = await _cdp_eval(session, expr_template)
+        if res and res.get("ok"):
+            log.record(
+                StepLog(
+                    index=log.next_index(),
+                    name=name,
+                    status=StepStatus.OK,
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                    selector=selector,
+                    value=(
+                        f"{res.get('selected')!r} (value={res.get('value')!r}, "
+                        f"fallback={res.get('fallback_used')})"
+                    ),
+                )
+            )
+            return res
+        if res:
+            last_reason = res.get("reason") or "unknown"
+        if time.monotonic() > deadline:
+            log.record(
+                StepLog(
+                    index=log.next_index(),
+                    name=name,
+                    status=StepStatus.FAILED,
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                    selector=selector,
+                    error=f"checkpoint_select_timeout: {last_reason}",
+                )
+            )
+            return {"ok": False, "reason": last_reason}
+        await asyncio.sleep(0.5)
+
 
 # ─── Public entrypoint ─────────────────────────────────────────────────
 
@@ -247,14 +355,26 @@ async def run(
         name="phase3.select_district",
     )
 
-    if params.entryCheckpoint:
-        await asyncio.sleep(1.0)
-        await select_by_text(
-            session,
-            SEL_CHECKPOINT,
-            params.entryCheckpoint,
-            log=log,
-            name="phase3.select_checkpoint",
+    await asyncio.sleep(1.0)
+
+    desired_checkpoint = params.entryCheckpoint or params.entryDistrict
+    cp_result = await _select_checkpoint_with_fallback(
+        session,
+        SEL_CHECKPOINT,
+        desired_checkpoint,
+        log=log,
+        name="phase3.select_checkpoint",
+    )
+    if not cp_result.get("ok"):
+        return RunOutcome(
+            status="failed",
+            summary=(
+                f"Could not select an Entry Checkpost for district "
+                f"{params.entryDistrict!r}: {cp_result.get('reason')}. "
+                f"The checkpost dropdown was empty or never populated."
+            ),
+            abort_reason="checkpoint_select_failed",
+            run_log=log.dump(),
         )
 
     await click_by_text(
