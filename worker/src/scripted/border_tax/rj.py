@@ -113,7 +113,8 @@ from ..steps import (
 )
 from ..types import RunOutcome, StepLog, StepStatus, ScriptedAbort
 from .params import BorderTaxParams
-
+from ._web_handover import web_handover_and_capture
+from ._payment_wait import PaymentCaptureConfig
 
 # ─── Selectors ─────────────────────────────────────────────────────────
 
@@ -204,6 +205,33 @@ PHASE2_AI_RESCUE_MAX_STEPS = 4  # 2 actions, plus headroom for slow loads
 PHASE2_MAX_ATTEMPTS = 3
 PHASE2_GO_RESPONSE_TIMEOUT = 25
 
+# Used by web_handover_and_capture only (app path uses inline polling).
+_RJ_PAYMENT_CONFIG = PaymentCaptureConfig(
+    state_name="Rajasthan",
+    qr_selector=SEL_QR_CONTAINER,
+    receipt_markers=[
+        "GOVERNMENT OF RAJASTHAN",
+        "CHECKPOST TAX E-RECEIPT",
+        "RECEIPT NO",
+        "GRAND TOTAL",
+    ],
+    positive_markers_regex=[
+        r"payment\s*successful",
+        r"transaction\s*successful",
+        r"successfully\s*paid",
+        r"transaction\s*status\s*[:\-]?\s*success",
+        r"government\s*of\s*rajasthan",
+        r"checkpost\s*tax\s*e-?receipt",
+    ],
+    negative_markers_regex=[
+        r"transaction\s*status\s*[:\-]?\s*pending",
+        r"your\s*transaction\s*status\s*is\s*pending",
+        r"transaction\s*confirmation\s*pending",
+        r"transaction\s*status\s*[:\-]?\s*failed",
+        r"transaction\s*failed",
+        r"payment\s*failed",
+    ],
+)
 
 # ─── Helpers ───────────────────────────────────────────────────────────
 
@@ -1888,6 +1916,14 @@ async def run(
         )
     )
     await sleep_seconds(PHASE_GAP_SECS, log=log, name="phase3.settle")
+
+    if params.source == "web":
+        return await web_handover_and_capture(
+            session, log, r, job_id, job_params,
+            vehicle_number=params.vehicleNumber,
+            config=_RJ_PAYMENT_CONFIG,
+            extract_receipt_fields=_extract_receipt_fields,
+        )
 
     # ─── Phase 4: Pay Tax + Confirmation modal ─────────────────────────
     await click_by_text(

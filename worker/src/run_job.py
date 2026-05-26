@@ -211,6 +211,7 @@ async def _run_scripted(
     so the downstream notify code is identical:
       (status, summary, partial_reasons, cost_data, run_log_dump)
     """
+    job_params["source"] = source
     if task_id == "fetch-receipt":
         outcome = await run_fetch_receipt(job_params, source, job_id, r)
     else:

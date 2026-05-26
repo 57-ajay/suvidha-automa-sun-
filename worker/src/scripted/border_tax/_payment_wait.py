@@ -138,6 +138,7 @@ class PaymentCaptureConfig:
     # case-insensitive. Defaults work for PB; other states may extend.
     positive_markers_regex: list[str] = field(default_factory=lambda: list(DEFAULT_POSITIVE_PATTERNS))
     negative_markers_regex: list[str] = field(default_factory=lambda: list(DEFAULT_NEGATIVE_PATTERNS))
+    web_poll_qr: bool | None = None
 
 
 # ─── JS probes ─────────────────────────────────────────────────────────

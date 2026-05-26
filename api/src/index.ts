@@ -43,7 +43,7 @@ const server = Bun.serve({
             // POST /api/run
             if (req.method === "POST" && url.pathname === "/api/run") {
                 const body = await req.json();
-                const { taskId, params, source } = body as
+                let { taskId, params, source } = body as
                     { taskId: string; params: Record<string, string>; source?: string };
 
                 if (!taskId) {
@@ -54,12 +54,24 @@ const server = Bun.serve({
                     return Response.json({ error: "source can be either web or app" }, { status: 400 });
                 }
 
+
                 const task = getTask(taskId);
                 if (!task) {
                     return Response.json(
                         { error: `Unknown task: ${taskId}`, available: listTasks() },
                         { status: 400 }
                     );
+                }
+
+                if (task.preprocessParams && params) {
+                    try {
+                        params = task.preprocessParams(params);
+                    } catch (e: any) {
+                        return Response.json(
+                            { error: e.message || "preprocessParams failed" },
+                            { status: 400 }
+                        );
+                    }
                 }
 
                 const missing = task.requiredParams.filter(
@@ -120,6 +132,7 @@ const server = Bun.serve({
                         );
                     });
                 }
+
 
                 if (params?.requestId) {
                     setAiAgentWorkStatus(params.requestId, taskId, "started", resolvedSource).catch((e) => {
@@ -596,7 +609,7 @@ const server = Bun.serve({
                             const aiStatus =
                                 resolvedStatus === "done" ? "completed" : resolvedStatus;
 
-                            setAiAgentWorkStatus(requestId, job?.taskId, aiStatus).catch((e) => {
+                            setAiAgentWorkStatus(requestId, job?.taskId, aiStatus, source).catch((e) => {
                                 console.error(
                                     `[API] background setAiAgentWorkStatus(${aiStatus})
                                     failed for requestId=${requestId}:`,
@@ -691,9 +704,11 @@ const server = Bun.serve({
                 let params: Record<string, any> = {};
                 try { params = JSON.parse(job.params || "{}"); } catch { /* ignore */ }
                 const requestId = typeof params.requestId === "string" ? params.requestId : undefined;
+                const source = job?.source || "app";
+                console.log("[source from cancel api]", job?.source);
 
                 if (requestId) {
-                    setAiAgentWorkStatus(requestId, job.taskId, "failed").catch((e) => {
+                    setAiAgentWorkStatus(requestId, job.taskId, "failed", source).catch((e) => {
                         console.error(
                             `[API] background setAiAgentWorkStatus(failed) on cancel failed for requestId=${requestId}:`,
                             e,

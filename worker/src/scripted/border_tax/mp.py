@@ -117,6 +117,7 @@ from ..types import RunOutcome, StepLog, StepStatus, ScriptedAbort
 from .params import BorderTaxParams
 from ._extract_amount import extract_and_save_border_tax_amount
 from ..handoff import run_ai_rescue
+from ._web_handover import web_handover_and_capture
 
 
 # ─── Selectors ─────────────────────────────────────────────────────────
@@ -805,6 +806,14 @@ async def run(
         tag="button",
     )
     await sleep_seconds(PHASE_GAP_SECS, log=log, name="phase5.settle")
+
+    if params.source == "web":
+        return await web_handover_and_capture(
+            session, log, r, job_id, job_params,
+            vehicle_number=params.vehicleNumber,
+            config=_MP_PAYMENT_CONFIG,
+            extract_receipt_fields=_extract_receipt_fields,
+        )
 
     # ─── Phase 6: disclaimer (AI handoff) ──────────────────────────────
     # Same surface as UP/HR/PB — captcha, checkbox, "Receipt valid for X

@@ -27,6 +27,7 @@ services:
       - DOMAIN=${DOMAIN}
       - MAX_SLOTS=${MAX_SLOTS:-10}
       - SCRIPTED_BORDER_TAX_STATES=${SCRIPTED_BORDER_TAX_STATES:-}
+      - WEB_HANDOVER_POLL_QR=${WEB_HANDOVER_POLL_QR}
     depends_on:
       - redis
       - api

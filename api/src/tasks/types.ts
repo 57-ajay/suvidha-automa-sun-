@@ -20,4 +20,5 @@ export interface Task {
     optionalParams?: string[];
     tools?: TaskTool[];
     buildPrompt: (params: Record<string, string>, source?: JobSource) => Promise<string>;
+    preprocessParams?: (params: Record<string, string>) => Record<string, string>;
 }
