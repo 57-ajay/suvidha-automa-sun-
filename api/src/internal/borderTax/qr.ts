@@ -73,6 +73,7 @@ export async function handleSaveQR(input: SaveQRInput) {
         await borderTaxRequestsRef.doc(requestId).update({
             qrCodeUrl: qrUrl,
             qrUploadedAt: FieldValue.serverTimestamp(),
+            aiAgentWorkStatus: "qrUrlAdded",
         });
         console.log(
             `[save_qr] borderTaxRequests/${requestId} updated with qrCodeUrl`

@@ -34,11 +34,8 @@ import re
 import time
 
 from actions import save_qr_code, save_receipt
+from ._payment_wait import PaymentCaptureConfig, wait_for_payment_and_capture_receipt
 
-from ..captcha import (
-    _wait_for_human_via_redis as wait_for_human_via_redis,
-    # solve_canvas_captcha,
-)
 from ..log import StepLogger
 from ..steps import (
     _cdp_eval,
@@ -57,6 +54,7 @@ from ..steps import (
 )
 from ..types import RunOutcome, StepLog, StepStatus, ScriptedAbort
 from .params import BorderTaxParams
+from ._extract_amount import extract_and_save_border_tax_amount
 from ..handoff import run_ai_rescue
 
 
@@ -110,10 +108,26 @@ SEL_QR_IMG = "img#qrcodeImg"
 # ─── Tuning ────────────────────────────────────────────────────────────
 
 PHASE_GAP_SECS = 1.5  # polite breath between phases
-HUMAN_PAYMENT_TIMEOUT = 600  # 10 minutes for UPI payment
-RECEIPT_POLL_TIMEOUT_SECS = 90  # wait up to 90s for receipt after payment
 PERMIT_SET_TIMEOUT_SECS = 15  # per-attempt timeout when setting permit type
 
+_UP_PAYMENT_CONFIG = PaymentCaptureConfig(
+    state_name="Uttar Pradesh",
+    qr_selector=SEL_QR_IMG,
+    receipt_markers=[
+        "GOVERNMENT OF UTTAR PRADESH",
+        "CHECKPOST TAX E-RECEIPT",
+        "RECEIPT NO",
+        "GRAND TOTAL",
+    ],
+    positive_markers_regex=[
+        r"payment\s*successful",
+        r"transaction\s*successful",
+        r"successfully\s*paid",
+        r"transaction\s*status\s*[:\-]?\s*success",
+        r"government\s*of\s*uttar\s*pradesh",
+        r"checkpost\s*tax\s*e-?receipt",
+    ],
+)
 
 # ─── Public entrypoint ─────────────────────────────────────────────────
 
@@ -430,6 +444,9 @@ async def run(
         log=log,
         name="phase5.fill_tax_upto",
     )
+
+    await sleep_seconds(1, log=log, name="phase5.wait_calculation")
+
     await click_by_text(
         session,
         "Calculate Fee/Tax",
@@ -438,6 +455,13 @@ async def run(
         tag="button",
     )
     await sleep_seconds(4, log=log, name="phase5.wait_calculation")
+
+    await extract_and_save_border_tax_amount(
+        session,
+        log=log,
+        name="phase5.extract_border_tax_amount",
+    )
+
     await click_by_text(
         session,
         "Next",
@@ -534,119 +558,6 @@ async def run(
 
     await sleep_seconds(PHASE_GAP_SECS, log=log, name="phase6.settle_after_handoff")
 
-    # ─── Phase 6: disclaimer + captcha + popups ────────────────────────
-    # await wait_for_selector(
-    #     session,
-    #     SEL_CAPTCHA_CANVAS,
-    #     log=log,
-    #     name="phase6.wait_disclaimer_page",
-    #     timeout=60,
-    # )
-    #
-    # async def _submit_disclaimer() -> bool:
-    #     await _cdp_eval(
-    #         session,
-    #         """
-    #         (function() {
-    #             var labels = document.querySelectorAll('label');
-    #             for (var i = 0; i < labels.length; i++) {
-    #                 var t = (labels[i].textContent || '').toUpperCase();
-    #                 if (t.indexOf('I CONFIRM') >= 0) {
-    #                     labels[i].click();
-    #                     return true;
-    #                 }
-    #             }
-    #             var cbs = document.querySelectorAll('input[type=checkbox]');
-    #             for (var j = 0; j < cbs.length; j++) {
-    #                 if (!cbs[j].checked) { cbs[j].click(); return true; }
-    #             }
-    #             return false;
-    #         })()
-    #     """,
-    #     )
-    #
-    #     await asyncio.sleep(1.2)
-    #     await _cdp_eval(
-    #         session,
-    #         """
-    #         (function() {
-    #             var btns = document.querySelectorAll('button, .btn');
-    #             for (var i = 0; i < btns.length; i++) {
-    #                 var t = (btns[i].textContent || '').trim().toUpperCase();
-    #                 if (t === 'CLOSE') {
-    #                     var r = btns[i].getBoundingClientRect();
-    #                     if (r.width > 0 && r.height > 0) {
-    #                         btns[i].click(); return true;
-    #                     }
-    #                 }
-    #             }
-    #             return false;
-    #         })()
-    #     """,
-    #     )
-    #     await asyncio.sleep(0.5)
-    #
-    #     await _cdp_eval(
-    #         session,
-    #         """
-    #         (function() {
-    #             var btns = document.querySelectorAll('button, .btn');
-    #             for (var i = 0; i < btns.length; i++) {
-    #                 var t = (btns[i].textContent || '').trim().toUpperCase();
-    #                 if (t.indexOf('PAY ONLINE') >= 0) {
-    #                     var r = btns[i].getBoundingClientRect();
-    #                     if (r.width > 0 && r.height > 0) {
-    #                         btns[i].click(); return true;
-    #                     }
-    #                 }
-    #             }
-    #             return false;
-    #         })()
-    #     """,
-    #     )
-    #
-    #     await asyncio.sleep(1.2)
-    #     await _cdp_eval(
-    #         session,
-    #         """
-    #         (function() {
-    #             var btns = document.querySelectorAll('button, .btn');
-    #             for (var i = 0; i < btns.length; i++) {
-    #                 var t = (btns[i].textContent || '').trim().toUpperCase();
-    #                 if (t === 'YES') {
-    #                     var r = btns[i].getBoundingClientRect();
-    #                     if (r.width > 0 && r.height > 0) {
-    #                         btns[i].click(); return true;
-    #                     }
-    #                 }
-    #             }
-    #             return false;
-    #         })()
-    #     """,
-    #     )
-    #
-    #     deadline = time.monotonic() + 15
-    #     while time.monotonic() < deadline:
-    #         url = (await _current_url(session)).lower()
-    #         if "etranspgi" in url or "vahanpgi" in url or "paymentgateway" in url:
-    #             return True
-    #         await asyncio.sleep(0.5)
-    #     return False
-    #
-    # await solve_canvas_captcha(
-    #     session,
-    #     canvas_selector=SEL_CAPTCHA_CANVAS,
-    #     input_selector=SEL_CAPTCHA_INPUT,
-    #     refresh_selector=SEL_CAPTCHA_REFRESH,
-    #     submit_action=_submit_disclaimer,
-    #     job_id=job_id,
-    #     r=r,
-    #     source=params.source,
-    #     log=log,
-    #     name="phase6.solve_captcha",
-    #     max_ai_attempts=5,
-    # )
-
     # ─── Phase 7: payment gateway ──────────────────────────────────────
     await wait_for_selector(
         session,
@@ -736,132 +647,11 @@ async def run(
             error=None if qr_result.get("ok") else qr_result.get("error"),
         )
     )
-
-    human_started = time.monotonic()
-    payment_reason = (
-        f"UPI payment required for border tax of vehicle "
-        f"{params.vehicleNumber}. A QR code is displayed on screen -- "
-        f"please scan with your UPI app and complete the payment. "
-        f"After payment is successful, reply 'done' to continue."
-    )
-    human_reply = await wait_for_human_via_redis(
-        job_id,
-        r,
-        payment_reason,
-        timeout=HUMAN_PAYMENT_TIMEOUT,
-    )
-    log.record(
-        StepLog(
-            index=log.next_index(),
-            name="phase9.wait_for_human_payment",
-            status=(StepStatus.HANDED_OFF if human_reply else StepStatus.FAILED),
-            duration_ms=int((time.monotonic() - human_started) * 1000),
-            value=human_reply[:80] if human_reply else None,
-            handoff_reason="upi_payment",
-            handoff_summary=(human_reply[:300] if human_reply else "human_timeout"),
-        )
-    )
-    if not human_reply:
-        return RunOutcome(
-            status="partial",
-            summary=(
-                "UPI payment wait timed out. Money may have been deducted; "
-                "receipt was not captured. Manual reconciliation needed."
-            ),
-            partial_reasons=["human_timeout:upi_payment"],
-            run_log=log.dump(),
-        )
-
-    # ─── Phase 10: poll for receipt, extract, save PDF ─────────────────
-    receipt_ready = False
-    deadline = time.monotonic() + RECEIPT_POLL_TIMEOUT_SECS
-    while time.monotonic() < deadline:
-        markers = await _cdp_eval(
-            session,
-            """
-            (function() {
-                var text = (document.body.innerText || '').toUpperCase();
-                return {
-                    govHeader:     text.indexOf('GOVERNMENT OF UTTAR PRADESH') >= 0,
-                    receiptHeader: text.indexOf('CHECKPOST TAX E-RECEIPT') >= 0,
-                    receiptNo:     text.indexOf('RECEIPT NO') >= 0,
-                    grandTotal:    text.indexOf('GRAND TOTAL') >= 0
-                };
-            })()
-        """,
-        )
-        if markers and all(markers.values()):
-            receipt_ready = True
-            break
-        await asyncio.sleep(3)
-
-    if not receipt_ready:
-        return RunOutcome(
-            status="partial",
-            summary=(
-                "Payment confirmed but receipt page did not render within "
-                f"{RECEIPT_POLL_TIMEOUT_SECS}s. Money was deducted; "
-                "receipt PDF was not captured."
-            ),
-            partial_reasons=["receipt_page_timeout"],
-            run_log=log.dump(),
-        )
-
-    receipt_data = await _extract_receipt_fields(session, params.vehicleNumber)
-    if not receipt_data:
-        return RunOutcome(
-            status="partial",
-            summary=(
-                "Receipt page rendered but key fields could not be parsed. "
-                "Money was deducted; receipt PDF was not captured."
-            ),
-            partial_reasons=["receipt_parse_failed"],
-            run_log=log.dump(),
-        )
-
-    save_started = time.monotonic()
-    save_result = await save_receipt(
-        session,
-        job_id,
-        job_params,
-        receipt_data,
-    )
-    log.record(
-        StepLog(
-            index=log.next_index(),
-            name="phase10.save_receipt",
-            status=(StepStatus.OK if save_result.get("ok") else StepStatus.FAILED),
-            duration_ms=int((time.monotonic() - save_started) * 1000),
-            value=receipt_data.get("receiptNumber"),
-            error=None if save_result.get("ok") else save_result.get("error"),
-        )
-    )
-
-    if save_result.get("ok") and save_result.get("pdfUploaded", True):
-        return RunOutcome(
-            status="done",
-            summary=(
-                f"Border tax paid for vehicle {params.vehicleNumber} into "
-                f"Uttar Pradesh. Receipt {receipt_data['receiptNumber']}, "
-                f"amount ₹{receipt_data['amount']}, "
-                f"payment date {receipt_data['paymentDate']}."
-            ),
-            receipt_number=receipt_data["receiptNumber"],
-            amount=float(receipt_data["amount"]),
-            run_log=log.dump(),
-        )
-
-    return RunOutcome(
-        status="partial",
-        summary=(
-            f"Payment successful but receipt PDF upload failed: "
-            f"{save_result.get('error', 'unknown error')}. "
-            f"Receipt number {receipt_data['receiptNumber']} captured."
-        ),
-        partial_reasons=["receipt_pdf_upload_failed"],
-        receipt_number=receipt_data["receiptNumber"],
-        amount=float(receipt_data["amount"]),
-        run_log=log.dump(),
+    return await wait_for_payment_and_capture_receipt(
+        session, log, r, job_id, job_params,
+        vehicle_number=params.vehicleNumber,
+        config=_UP_PAYMENT_CONFIG,
+        extract_receipt_fields=_extract_receipt_fields,
     )
 
 

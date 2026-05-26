@@ -83,9 +83,6 @@ import time
 
 from actions import save_qr_code, save_receipt
 
-from ..captcha import (
-    _wait_for_human_via_redis as wait_for_human_via_redis,
-)
 from ..log import StepLogger
 from ..steps import (
     _cdp_eval,
@@ -105,7 +102,8 @@ from ..steps import (
 from ..types import RunOutcome, StepLog, StepStatus, ScriptedAbort
 from .params import BorderTaxParams
 from ..handoff import run_ai_rescue
-
+from ._extract_amount import extract_and_save_border_tax_amount
+from ._payment_wait import PaymentCaptureConfig, wait_for_payment_and_capture_receipt
 
 # ─── Selectors ─────────────────────────────────────────────────────────
 
@@ -175,13 +173,30 @@ SEL_QR_IMG = "img#qrcodeImg"
 # ─── Tuning ────────────────────────────────────────────────────────────
 
 PHASE_GAP_SECS = 1.5
-HUMAN_PAYMENT_TIMEOUT = 600          # 10 minutes for UPI payment
-RECEIPT_POLL_TIMEOUT_SECS = 90       # wait up to 90s for receipt after payment
 PERMIT_SET_TIMEOUT_SECS = 15         # per-attempt timeout when setting permit type
 IFMS_BANK_PAGE_TIMEOUT = 45          # post-submit -> IFMS bank-selection page mount
 SBIEPAY_REDIRECT_TIMEOUT = 60        # IFMS Continue -> SBIePay redirect
 CHECKPOINT_POPULATE_TIMEOUT = 10     # district -> checkpost options populated
 
+_PB_PAYMENT_CONFIG = PaymentCaptureConfig(
+    state_name="Punjab",
+    qr_selector=SEL_QR_IMG,
+    receipt_markers=[
+        "GOVERNMENT",
+        "GOVERNMENT OF PUNJAB",
+        "CHECKPOST TAX E-RECEIPT",
+        "RECEIPT NO",
+        "GRAND TOTAL",
+    ],
+    positive_markers_regex=[
+        r"payment\s*successful",
+        r"transaction\s*successful",
+        r"successfully\s*paid",
+        r"transaction\s*status\s*[:\-]?\s*success",
+        r"government\s*of\s*punjab",
+        r"checkpost\s*tax\s*e-?receipt",
+    ],
+)
 
 # ─── Helpers ───────────────────────────────────────────────────────────
 
@@ -300,6 +315,8 @@ async def run(
 
     job_id = log.job_id
     r = log.r
+    # params.serviceType = "NOT APPLICABLE"
+    # params.permitType = "NOT APPLICABLE"
     job_params = params.model_dump()
 
     # ─── Phase 1: parivahan landing ────────────────────────────────────
@@ -693,6 +710,7 @@ async def run(
             run_log=log.dump(),
         )
 
+    await sleep_seconds(1, log=log, name="phase5.wait_calculation")
     await click_by_text(
         session,
         "Calculate Fee/Tax",
@@ -701,6 +719,13 @@ async def run(
         tag="button",
     )
     await sleep_seconds(4, log=log, name="phase5.wait_calculation")
+
+    await extract_and_save_border_tax_amount(
+        session,
+        log=log,
+        name="phase5.extract_border_tax_amount",
+    )
+
     await click_by_text(
         session,
         "Next",
@@ -949,139 +974,11 @@ async def run(
         )
     )
 
-    human_started = time.monotonic()
-    payment_reason = (
-        f"UPI payment required for border tax of vehicle "
-        f"{params.vehicleNumber} entering Punjab. A QR code is displayed "
-        f"on screen — please scan with your UPI app and complete the "
-        f"payment. After payment is successful, reply 'done' to continue."
-    )
-    human_reply = await wait_for_human_via_redis(
-        job_id,
-        r,
-        payment_reason,
-        timeout=HUMAN_PAYMENT_TIMEOUT,
-    )
-    log.record(
-        StepLog(
-            index=log.next_index(),
-            name="phase10.wait_for_human_payment",
-            status=(StepStatus.HANDED_OFF if human_reply else StepStatus.FAILED),
-            duration_ms=int((time.monotonic() - human_started) * 1000),
-            value=human_reply[:80] if human_reply else None,
-            handoff_reason="upi_payment",
-            handoff_summary=(human_reply[:300] if human_reply else "human_timeout"),
-        )
-    )
-    if not human_reply:
-        return RunOutcome(
-            status="partial",
-            summary=(
-                "UPI payment wait timed out. Money may have been deducted; "
-                "receipt was not captured. Manual reconciliation needed."
-            ),
-            partial_reasons=["human_timeout:upi_payment"],
-            run_log=log.dump(),
-        )
-
-    # ─── Phase 11: poll for receipt, extract, save PDF ─────────────────
-    # PB receipt markers (generic — we don't have a confirmed PB receipt
-    # sample yet to pin a specific receipt-number prefix):
-    #   - "GOVERNMENT OF PUNJAB" heading
-    #   - "Checkpost Tax e-Receipt" subheading
-    #   - "Receipt No." somewhere on the page
-    #   - "Grand Total :" near the bottom
-    # Same Angular checkpostv4 portal as UP/HR — the receipt template is
-    # nearly identical, just with Punjab branding.
-    receipt_ready = False
-    deadline = time.monotonic() + RECEIPT_POLL_TIMEOUT_SECS
-    while time.monotonic() < deadline:
-        markers = await _cdp_eval(
-            session,
-            """
-            (function() {
-                var text = (document.body.innerText || '').toUpperCase();
-                return {
-                    govHeader:     text.indexOf('GOVERNMENT OF PUNJAB') >= 0,
-                    receiptHeader: text.indexOf('CHECKPOST TAX E-RECEIPT') >= 0,
-                    receiptNo:     text.indexOf('RECEIPT NO') >= 0,
-                    grandTotal:    text.indexOf('GRAND TOTAL') >= 0
-                };
-            })()
-            """,
-        )
-        if markers and all(markers.values()):
-            receipt_ready = True
-            break
-        await asyncio.sleep(3)
-
-    if not receipt_ready:
-        return RunOutcome(
-            status="partial",
-            summary=(
-                "Payment confirmed but receipt page did not render within "
-                f"{RECEIPT_POLL_TIMEOUT_SECS}s. Money was deducted; "
-                "receipt PDF was not captured."
-            ),
-            partial_reasons=["receipt_page_timeout"],
-            run_log=log.dump(),
-        )
-
-    receipt_data = await _extract_receipt_fields(session, params.vehicleNumber)
-    if not receipt_data:
-        return RunOutcome(
-            status="partial",
-            summary=(
-                "Receipt page rendered but key fields could not be parsed. "
-                "Money was deducted; receipt PDF was not captured."
-            ),
-            partial_reasons=["receipt_parse_failed"],
-            run_log=log.dump(),
-        )
-
-    save_started = time.monotonic()
-    save_result = await save_receipt(
-        session,
-        job_id,
-        job_params,
-        receipt_data,
-    )
-    log.record(
-        StepLog(
-            index=log.next_index(),
-            name="phase11.save_receipt",
-            status=(StepStatus.OK if save_result.get("ok") else StepStatus.FAILED),
-            duration_ms=int((time.monotonic() - save_started) * 1000),
-            value=receipt_data.get("receiptNumber"),
-            error=None if save_result.get("ok") else save_result.get("error"),
-        )
-    )
-
-    if save_result.get("ok") and save_result.get("pdfUploaded", True):
-        return RunOutcome(
-            status="done",
-            summary=(
-                f"Border tax paid for vehicle {params.vehicleNumber} into "
-                f"Punjab. Receipt {receipt_data['receiptNumber']}, "
-                f"amount ₹{receipt_data['amount']}, "
-                f"payment date {receipt_data['paymentDate']}."
-            ),
-            receipt_number=receipt_data["receiptNumber"],
-            amount=float(receipt_data["amount"]),
-            run_log=log.dump(),
-        )
-
-    return RunOutcome(
-        status="partial",
-        summary=(
-            f"Payment successful but receipt PDF upload failed: "
-            f"{save_result.get('error', 'unknown error')}. "
-            f"Receipt number {receipt_data['receiptNumber']} captured."
-        ),
-        partial_reasons=["receipt_pdf_upload_failed"],
-        receipt_number=receipt_data["receiptNumber"],
-        amount=float(receipt_data["amount"]),
-        run_log=log.dump(),
+    return await wait_for_payment_and_capture_receipt(
+        session, log, r, job_id, job_params,
+        vehicle_number=params.vehicleNumber,
+        config=_PB_PAYMENT_CONFIG,
+        extract_receipt_fields=_extract_receipt_fields,
     )
 
 

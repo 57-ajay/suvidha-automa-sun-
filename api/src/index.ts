@@ -12,6 +12,8 @@ import { setAiAgentWorkStatus } from "./internal/aiAgentWorkStatus";
 import "./firebase";
 import { handleSaveQR } from "./internal/borderTax/qr";
 import { handleSaveRunLog, type RunLogStep } from "./internal/borderTax/runLog";
+import { updateBorderTaxUsageOnCompletion } from "./internal/borderTax/driverUsage";
+import { handleCheckEligibility } from "./internal/borderTax/checkEligibility";
 
 const redis = new Redis(process.env.REDIS_URL || "redis://localhost:6379");
 
@@ -73,7 +75,7 @@ const server = Bun.serve({
                 const jobId = params?.requestId || crypto.randomUUID();
 
                 const existingStatus = await redis.hget(`job:${jobId}`, "status");
-                if (existingStatus && ["queued", "running", "waiting_for_human"].includes(existingStatus)) {
+                if (existingStatus && ["queued", "running", "waiting_for_human", "verifyingPayment"].includes(existingStatus)) {
                     console.log(
                         `[API] /api/run dedup: jobId=${jobId} already ${existingStatus}, returning existing`
                     );
@@ -120,7 +122,7 @@ const server = Bun.serve({
                 }
 
                 if (params?.requestId) {
-                    setAiAgentWorkStatus(params.requestId, taskId, "started").catch((e) => {
+                    setAiAgentWorkStatus(params.requestId, taskId, "started", resolvedSource).catch((e) => {
                         console.error(
                             `[API] background setAiAgentWorkStatus(started) failed for requestId=
                                     ${params.requestId}:`,
@@ -617,6 +619,31 @@ const server = Bun.serve({
                                 });
                             }
 
+                            if (job?.taskId === "border-tax" && requestId) {
+                                const driverId =
+                                    typeof params?.driverId === "string" ? params.driverId.trim() : null;
+
+                                if (driverId) {
+                                    updateBorderTaxUsageOnCompletion({
+                                        driverId,
+                                        requestId,
+                                        jobId,
+                                        status: resolvedStatus,
+                                    }).catch((e) => {
+                                        console.error(
+                                            `[API] background updateBorderTaxUsageOnCompletion failed ` +
+                                            `driverId=${driverId} requestId=${requestId}:`,
+                                            e,
+                                        );
+                                    });
+                                } else {
+                                    console.warn(
+                                        `[API] job-completed: border-tax job ${jobId} has no driverId — ` +
+                                        `skipping driver usage update.`
+                                    );
+                                }
+                            }
+
 
                         } catch (e) {
                             console.error(`[API] background saveAgentWorkSummary
@@ -682,6 +709,11 @@ const server = Bun.serve({
                 return new Response(DASHBOARD_HTML, {
                     headers: { "Content-Type": "text/html" },
                 });
+            }
+
+            // POST /api/border-tax/check-eligibility
+            if (req.method === "POST" && url.pathname === "/api/border-tax/check-eligibility") {
+                return await handleCheckEligibility(req);
             }
 
             return Response.json({ error: "not found" }, { status: 404 });

@@ -95,10 +95,8 @@ import re
 import time
 
 from actions import save_qr_code, save_receipt
+from ._payment_wait import PaymentCaptureConfig, wait_for_payment_and_capture_receipt
 
-from ..captcha import (
-    _wait_for_human_via_redis as wait_for_human_via_redis,
-)
 from ..log import StepLogger
 from ..steps import (
     _cdp_eval,
@@ -117,6 +115,7 @@ from ..steps import (
 )
 from ..types import RunOutcome, StepLog, StepStatus, ScriptedAbort
 from .params import BorderTaxParams
+from ._extract_amount import extract_and_save_border_tax_amount
 from ..handoff import run_ai_rescue
 
 
@@ -137,6 +136,10 @@ SEL_CHECKPOINT = "select#floatingCheckpost"
 SEL_VEHICLE_CATEGORY = "select#floatingVecCat"
 SEL_PERMIT_TYPE = "select#floatingPrmit"
 SEL_SERVICE_TYPE = "select#floatingService"
+# Server-populated (disabled in DOM) — the canary signal for "RC AJAX has
+# landed". Until this has a non-empty .value, dependent dropdowns can't
+# be filled correctly.
+SEL_VEHICLE_CLASS = "select#floatingVehicletype"
 # (No SEL_DISTANCE on MP — like PB.)
 
 # Phase 5 — tax info
@@ -182,15 +185,44 @@ SEL_QR_IMG_FALLBACK = "img[src^='data:image/png;base64']"
 
 PHASE_GAP_SECS = 1.5
 # MP QR has ~3:40 expiry (similar to RJ). Shorter than UP/HR/PB's 600s.
-HUMAN_PAYMENT_TIMEOUT = 200
-RECEIPT_POLL_TIMEOUT_SECS = 90
 PERMIT_SET_TIMEOUT_SECS = 15
 SBIEPAY_REDIRECT_TIMEOUT = 60  # gateway submit -> epay.sbi.bank.in
 SBIEPAY_UPI_PANEL_TIMEOUT = 20  # click UPI tab -> UPI QR radio mounts
 SBIEPAY_PAY_NOW_TIMEOUT = 15  # click UPI QR radio -> Pay Now button enabled
 QR_PAGE_NAV_TIMEOUT = 45  # click Pay Now -> QR page mounts
 CHECKPOINT_POPULATE_TIMEOUT = 10  # district -> checkpost options populated
+RC_DATA_TIMEOUT_SECS = 30
 
+
+_MP_PAYMENT_CONFIG = PaymentCaptureConfig(
+    state_name="Madhya Pradesh",
+    qr_selector=SEL_QR_TIMER,  # div#countDownTimer — disappears w/ QR
+    receipt_markers=[
+        "GOVERNMENT OF MADHYA PRADESH",
+        "CHECKPOST TAX E-RECEIPT",
+        "RECEIPT NO",
+        "GRAND TOTAL",
+    ],
+    positive_markers_regex=[
+        r"payment\s*successful",
+        r"transaction\s*successful",
+        r"successfully\s*paid",
+        r"transaction\s*status\s*[:\-]?\s*success",
+        r"government\s*of\s*madhya\s*pradesh",
+        r"checkpost\s*tax\s*e-?receipt",
+    ],
+    negative_markers_regex=[
+        r"transaction\s*status\s*[:\-]?\s*pending",
+        r"your\s*transaction\s*status\s*is\s*pending",
+        r"transaction\s*confirmation\s*pending",
+        r"transaction\s*status\s*[:\-]?\s*failed",
+        r"transaction\s*failed",
+        r"payment\s*failed",
+        r"payment\s*timeout",
+        r"session\s*(?:has\s*)?expired",
+        r"qr\s*(?:code\s*)?expired",
+    ],
+)
 
 # ─── Helpers ───────────────────────────────────────────────────────────
 
@@ -428,6 +460,7 @@ async def run(
             run_log=log.dump(),
         )
 
+    await sleep_seconds(3, log=log, name="phase3.settle")
     await click_by_text(
         session,
         "Next",
@@ -469,6 +502,62 @@ async def run(
         log=log,
         name="phase4.wait_vehicle_info_page",
         timeout=30,
+    )
+
+    rc_data_loaded = False
+    rc_started = time.monotonic()
+    rc_deadline = rc_started + RC_DATA_TIMEOUT_SECS
+    veh_class_val = ""
+    while time.monotonic() < rc_deadline:
+        veh_class_val = (
+            await _cdp_eval(
+                session,
+                "(function(){var e=document.querySelector("
+                "'select#floatingVehicletype');return e?(e.value||''):'';})()",
+            )
+            or ""
+        )
+        if veh_class_val and veh_class_val not in ("0", "-1"):
+            rc_data_loaded = True
+            break
+        await asyncio.sleep(0.5)
+
+    log.record(
+        StepLog(
+            index=log.next_index(),
+            name="phase4.wait_rc_data_loaded",
+            status=StepStatus.OK if rc_data_loaded else StepStatus.FAILED,
+            duration_ms=int((time.monotonic() - rc_started) * 1000),
+            value=f"vehicleClass={veh_class_val!r}",
+        )
+    )
+
+    if not rc_data_loaded:
+        return RunOutcome(
+            status="failed",
+            summary=(
+                f"Vehicle {params.vehicleNumber} RC data did not load on "
+                f"Phase 4 within {RC_DATA_TIMEOUT_SECS}s (Vehicle Class "
+                f"field stayed empty). Usually means parivahan's central "
+                f"RC service was slow or returned no data for this "
+                f"vehicle. Retry the job — this is typically transient."
+            ),
+            abort_reason="rc_data_not_loaded",
+            run_log=log.dump(),
+        )
+
+    # Re-check for validity popup that may have surfaced together with
+    # the RC data (rare, but parivahan does this when fitness/insurance/
+    # PUCC has expired AND the data lookup succeeded).
+    await abort_if_popup_text(
+        session,
+        _validity_keywords,
+        _validity_abort,
+        log=log,
+        name="phase4.check_validity_after_rc_load",
+        close_selector=(
+            "button.swal2-confirm, .modal-footer button, .swal-button--confirm"
+        ),
     )
 
     # 4a. Vehicle Category — usually pre-filled from RC ("LIGHT PASSENGER
@@ -691,6 +780,8 @@ async def run(
             run_log=log.dump(),
         )
 
+    await sleep_seconds(1, log=log, name="phase5.wait_calculation")
+
     await click_by_text(
         session,
         "Calculate Fee/Tax",
@@ -699,6 +790,13 @@ async def run(
         tag="button",
     )
     await sleep_seconds(4, log=log, name="phase5.wait_calculation")
+
+    await extract_and_save_border_tax_amount(
+        session,
+        log=log,
+        name="phase5.extract_border_tax_amount",
+    )
+
     await click_by_text(
         session,
         "Next",
@@ -942,139 +1040,11 @@ async def run(
         )
     )
 
-    human_started = time.monotonic()
-    payment_reason = (
-        f"UPI payment required for border tax of vehicle "
-        f"{params.vehicleNumber} entering Madhya Pradesh. A QR code is "
-        f"displayed on screen — please scan with your UPI app and complete "
-        f"the payment within ~3 minutes (MP's QR has a short expiry). "
-        f"After payment is successful, reply 'done' to continue."
-    )
-    human_reply = await wait_for_human_via_redis(
-        job_id,
-        r,
-        payment_reason,
-        timeout=HUMAN_PAYMENT_TIMEOUT,
-    )
-    log.record(
-        StepLog(
-            index=log.next_index(),
-            name="phase9.wait_for_human_payment",
-            status=(StepStatus.HANDED_OFF if human_reply else StepStatus.FAILED),
-            duration_ms=int((time.monotonic() - human_started) * 1000),
-            value=human_reply[:80] if human_reply else None,
-            handoff_reason="upi_payment",
-            handoff_summary=(human_reply[:300] if human_reply else "human_timeout"),
-        )
-    )
-    if not human_reply:
-        return RunOutcome(
-            status="partial",
-            summary=(
-                "UPI payment wait timed out. Money may have been deducted; "
-                "receipt was not captured. Manual reconciliation needed."
-            ),
-            partial_reasons=["human_timeout:upi_payment"],
-            run_log=log.dump(),
-        )
-
-    # ─── Phase 10: poll for receipt, extract, save PDF ─────────────────
-    # MP receipt markers (generic — no confirmed MP receipt sample yet):
-    #   - "GOVERNMENT OF MADHYA PRADESH" heading
-    #   - "Checkpost Tax e-Receipt" subheading
-    #   - "Receipt No." somewhere on the page
-    #   - "Grand Total :" near the bottom
-    # Same Angular checkpostv4 portal as UP/HR/PB — receipt template
-    # nearly identical, just with MP branding.
-    receipt_ready = False
-    deadline = time.monotonic() + RECEIPT_POLL_TIMEOUT_SECS
-    while time.monotonic() < deadline:
-        markers = await _cdp_eval(
-            session,
-            """
-            (function() {
-                var text = (document.body.innerText || '').toUpperCase();
-                return {
-                    govHeader:     text.indexOf('GOVERNMENT OF MADHYA PRADESH') >= 0,
-                    receiptHeader: text.indexOf('CHECKPOST TAX E-RECEIPT') >= 0,
-                    receiptNo:     text.indexOf('RECEIPT NO') >= 0,
-                    grandTotal:    text.indexOf('GRAND TOTAL') >= 0
-                };
-            })()
-            """,
-        )
-        if markers and all(markers.values()):
-            receipt_ready = True
-            break
-        await asyncio.sleep(3)
-
-    if not receipt_ready:
-        return RunOutcome(
-            status="partial",
-            summary=(
-                "Payment confirmed but receipt page did not render within "
-                f"{RECEIPT_POLL_TIMEOUT_SECS}s. Money was deducted; "
-                "receipt PDF was not captured."
-            ),
-            partial_reasons=["receipt_page_timeout"],
-            run_log=log.dump(),
-        )
-
-    receipt_data = await _extract_receipt_fields(session, params.vehicleNumber)
-    if not receipt_data:
-        return RunOutcome(
-            status="partial",
-            summary=(
-                "Receipt page rendered but key fields could not be parsed. "
-                "Money was deducted; receipt PDF was not captured."
-            ),
-            partial_reasons=["receipt_parse_failed"],
-            run_log=log.dump(),
-        )
-
-    save_started = time.monotonic()
-    save_result = await save_receipt(
-        session,
-        job_id,
-        job_params,
-        receipt_data,
-    )
-    log.record(
-        StepLog(
-            index=log.next_index(),
-            name="phase10.save_receipt",
-            status=(StepStatus.OK if save_result.get("ok") else StepStatus.FAILED),
-            duration_ms=int((time.monotonic() - save_started) * 1000),
-            value=receipt_data.get("receiptNumber"),
-            error=None if save_result.get("ok") else save_result.get("error"),
-        )
-    )
-
-    if save_result.get("ok") and save_result.get("pdfUploaded", True):
-        return RunOutcome(
-            status="done",
-            summary=(
-                f"Border tax paid for vehicle {params.vehicleNumber} into "
-                f"Madhya Pradesh. Receipt {receipt_data['receiptNumber']}, "
-                f"amount ₹{receipt_data['amount']}, "
-                f"payment date {receipt_data['paymentDate']}."
-            ),
-            receipt_number=receipt_data["receiptNumber"],
-            amount=float(receipt_data["amount"]),
-            run_log=log.dump(),
-        )
-
-    return RunOutcome(
-        status="partial",
-        summary=(
-            f"Payment successful but receipt PDF upload failed: "
-            f"{save_result.get('error', 'unknown error')}. "
-            f"Receipt number {receipt_data['receiptNumber']} captured."
-        ),
-        partial_reasons=["receipt_pdf_upload_failed"],
-        receipt_number=receipt_data["receiptNumber"],
-        amount=float(receipt_data["amount"]),
-        run_log=log.dump(),
+    return await wait_for_payment_and_capture_receipt(
+        session, log, r, job_id, job_params,
+        vehicle_number=params.vehicleNumber,
+        config=_MP_PAYMENT_CONFIG,
+        extract_receipt_fields=_extract_receipt_fields,
     )
 
 

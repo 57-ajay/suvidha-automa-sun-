@@ -31,6 +31,7 @@ from pydantic import ValidationError
 
 from .border_tax.params import BorderTaxParams
 from .handoff import run_ai_rescue
+from .fetch_receipt.params import FetchReceiptParams
 from .log import StepLogger
 from .types import HandoffNeeded, RunOutcome, ScriptedAbort
 
@@ -204,3 +205,91 @@ async def run_border_tax(
             await browser.stop()
         except Exception as e:
             print(f"[{job_id}] browser.stop error: {e}")
+
+
+# ─── Fetch-receipt path ─────────────────────────────────────────────────
+
+
+async def run_fetch_receipt(
+    job_params: dict,
+    source: str,
+    job_id: str,
+    r: redis.Redis,
+) -> RunOutcome:
+    """Run the fetch-receipt scripted flow. Always returns a RunOutcome
+    (never raises). The Browser session lifecycle mirrors run_border_tax
+    so live-VNC behaves identically."""
+
+    # 1. Inject source from the job hash into params, then validate.
+    enriched = dict(job_params)
+    enriched["source"] = source  # always honor the hash; ignore any
+    # accidental source in params
+    try:
+        params = FetchReceiptParams(**enriched)
+    except ValidationError as e:
+        return RunOutcome(
+            status="failed",
+            summary="Param validation failed before browser launch.",
+            abort_reason=f"invalid_params: {e}",
+        )
+
+    # 2. Resolve the runner (single module — no state dispatch).
+    try:
+        from .fetch_receipt.runner import run as fetch_receipt_run
+    except Exception as e:
+        return RunOutcome(
+            status="failed",
+            summary="Failed to import scripted.fetch_receipt.runner.",
+            abort_reason=f"runner_import_failed: {e}",
+        )
+
+    # 3. Spin up the browser (mirrors run_border_tax exactly).
+    browser = Browser(
+        headless=False,
+        chromium_sandbox=False,
+        args=["--disable-dev-shm-usage", "--disable-gpu"],
+        keep_alive=True,
+    )
+    log = StepLogger(job_id=job_id, r=r)
+
+    try:
+        try:
+            await browser.start()
+        except Exception as e:
+            return RunOutcome(
+                status="failed",
+                summary=f"Browser failed to start: {e}",
+                abort_reason="browser_start_failed",
+                run_log=log.dump(),
+            )
+
+        try:
+            outcome = await fetch_receipt_run(browser, params, log)
+        except ScriptedAbort as abort:
+            outcome = RunOutcome(
+                status="failed",
+                summary=abort.reason,
+                abort_reason=abort.reason,
+                run_log=log.dump(),
+            )
+        except Exception as e:
+            traceback.print_exc()
+            outcome = RunOutcome(
+                status="failed",
+                summary=f"Unhandled exception in fetch-receipt runner: {e}",
+                abort_reason=f"unhandled:{type(e).__name__}",
+                run_log=log.dump(),
+            )
+
+        # Attach total handoff cost (captcha LLM cost) to the outcome
+        # the same way run_border_tax does, so saveAgentCost gets the
+        # right number for this task.
+        outcome.total_cost_usd = log.total_handoff_cost()
+
+        return outcome
+
+    finally:
+        try:
+            await browser.stop()
+        except Exception:
+            pass

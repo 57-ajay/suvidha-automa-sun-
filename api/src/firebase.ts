@@ -1,3 +1,4 @@
+// api/src/firebase.ts
 import { initializeApp, cert, type ServiceAccount } from "firebase-admin/app";
 import { getFirestore } from "firebase-admin/firestore";
 import { getStorage } from "firebase-admin/storage";
@@ -21,5 +22,13 @@ export const borderTaxRequestsRef = db
     .collection("driverUtilitiesRequests")
     .doc("data")
     .collection("borderTaxRequests");
+
+export function driverBorderTaxUsageRef(driverId: string) {
+    return db
+        .collection("driverUtilitiesRequests")
+        .doc("borderTaxSummary")
+        .collection("driverUsage")
+        .doc(driverId);
+}
 
 console.log("[FIREBASE] Initialized successfully (Firestore + Storage)");

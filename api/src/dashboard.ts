@@ -216,8 +216,8 @@ async function refresh() {
       ].filter(Boolean).join('  ·  ');
 
       const isWaiting = j.status === 'waiting_for_human';
-      const canCancel = ['running','queued','waiting_for_human'].includes(j.status);
-      const hasLive = j.liveUrl && ['running','waiting_for_human'].includes(j.status);
+      const canCancel = ['running','queued','waiting_for_human', 'verifyingPayment'].includes(j.status);
+      const hasLive = j.liveUrl && ['running','waiting_for_human', 'verifyingPayment'].includes(j.status);
       const type = detectType(j.waitReason);
       const wasSent = sentJobs.has(j.id);
 

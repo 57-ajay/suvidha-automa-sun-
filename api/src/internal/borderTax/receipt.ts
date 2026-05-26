@@ -28,7 +28,13 @@ function toNumber(val: unknown): number | null {
 
 export async function handleSaveReceipt(input: SaveReceiptInput) {
     const { jobId, params, data, pdfBuffer } = input;
-    const driverId = params?.driverId ?? "driverId";
+
+    const driverId = params?.driverId;
+    if (!driverId) {
+        console.warn(`[save_receipt] WARN: driverId missing from params job=${jobId}. ` +
+            `Usage tracking will be impaired. Params: ${JSON.stringify(params)}`);
+    }
+    const resolvedDriverId = driverId ?? "unknown";
 
     console.log(`[save_receipt] START job=${jobId} pdf=${pdfBuffer?.length ?? 0} bytes`);
     console.log(`[save_receipt] params=${JSON.stringify(params)}`);
@@ -84,7 +90,7 @@ export async function handleSaveReceipt(input: SaveReceiptInput) {
 
     try {
         const bucket = getStorage().bucket();
-        const destination = `driverUtilitiesRequests/borderTaxRequests/${requestId}_${driverId}/${receiptData.receiptNumber}_receipt.pdf`;
+        const destination = `driverUtilitiesRequests/borderTaxRequests/${requestId}_${resolvedDriverId}/${receiptData.receiptNumber}_receipt.pdf`;
 
         const file = bucket.file(destination);
         await file.save(pdfBuffer, {
@@ -110,14 +116,16 @@ export async function handleSaveReceipt(input: SaveReceiptInput) {
     } catch (e) {
         pdfUploadError = (e as Error).message;
         console.error(`[save_receipt] PDF upload FAILED:`, e);
-        // Continue — we still want to save the receipt metadata even if PDF upload fails
+        // Continue — still want to save receipt metadata even if PDF upload fails
     }
 
     const stateLabel = ((params?.state || "UTTAR PRADESH").trim().toUpperCase());
 
     // ── Save receipt metadata to Firestore ──
+    // driverId is stored here so we can query borderTaxPayments by driverId
     const borderTaxRef = db.collection("borderTaxPayments");
     const docData = {
+        driverId: resolvedDriverId,
         vehicleNumber,
         requestId,
         jobId,
@@ -137,6 +145,7 @@ export async function handleSaveReceipt(input: SaveReceiptInput) {
             status: "completed",
             borderTaxUpdatedBy: "agent",
             receiptUpdatedAt: FieldValue.serverTimestamp(),
+            paymentDate: FieldValue.serverTimestamp(),
             ...(pdfUrl ? { receiptDocumentUrl: pdfUrl } : {}),
         });
         console.log(
@@ -146,6 +155,7 @@ export async function handleSaveReceipt(input: SaveReceiptInput) {
     } catch (e) {
         console.error(`[save_receipt] failed to mark borderTaxRequests/${requestId}:`, e);
     }
+
     const docRef = await borderTaxRef.add(docData);
 
     console.log(

@@ -241,7 +241,7 @@ async def run_agent(
         model="gemini-3-flash-preview",
         vertexai=True,
         # location="asia-south1",
-        project="nomadic-bison-481114-s4",
+        project="cabswale-ai",
     )
     tools = make_tools(job_id, job_params, tool_defs, r, task_id)
 

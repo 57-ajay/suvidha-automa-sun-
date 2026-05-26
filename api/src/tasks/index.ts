@@ -2,6 +2,7 @@ import type { Task } from "./types";
 import { challanSettlement } from "./challanSettlement";
 import { testHuman } from "./test-human";
 import { borderTax } from "./borderTax";
+import { fetchReceipt } from "./fetchReceipt";
 
 const tasks = new Map<string, Task>();
 
@@ -12,6 +13,7 @@ function register(task: Task) {
 register(challanSettlement);
 register(testHuman);
 register(borderTax);
+register(fetchReceipt);
 
 export function getTask(id: string): Task | undefined {
     return tasks.get(id);

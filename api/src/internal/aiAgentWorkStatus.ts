@@ -7,12 +7,18 @@ export async function setAiAgentWorkStatus(
     requestId: string | undefined,
     taskId: string | undefined,
     status: AiAgentWorkStatus,
+    source: string | undefined,
 ): Promise<{ ok: boolean; error?: string }> {
     if (!requestId) {
         return { ok: false, error: "requestId required" };
     }
     if (!taskId) {
         return { ok: false, error: "taskId required" };
+    }
+
+    if (!source) {
+        console.log(`[aiAgentWorkStatus] no source received, setting it to app`);
+        source = "app";
     }
 
     let docRef;
@@ -31,6 +37,7 @@ export async function setAiAgentWorkStatus(
         await docRef.update({
             aiAgentWorkStatus: status,
             aiAgentWorkStatusUpdatedAt: FieldValue.serverTimestamp(),
+            agentSource: source,
         });
         console.log(
             `[aiAgentWorkStatus] set "${status}" for taskId=${taskId} requestId=${requestId}`,

@@ -31,7 +31,7 @@ import redis
 
 from agent import run_agent
 from cost_calculator import fill_missing_cost
-from scripted.runner import run_border_tax, state_is_scripted_enabled
+from scripted.runner import run_border_tax, state_is_scripted_enabled, run_fetch_receipt
 from scripted.types import RunOutcome
 
 
@@ -86,8 +86,7 @@ async def notify_job_completed(
             f"cost_included={cost_data is not None}, "
             f"summary_len={len(summary) if summary else 0}, "
             f"has_error={error is not None}, "
-            f"partial_reasons={len(partial_reasons)
-                               if partial_reasons else 0}, "
+            f"partial_reasons={len(partial_reasons) if partial_reasons else 0}, "
             f"run_log_steps={len(run_log) if run_log else 0})"
         )
     except Exception as e:
@@ -97,9 +96,7 @@ async def notify_job_completed(
 # ─── AI-path helpers (unchanged) ───────────────────────────────────────
 
 
-def resolve_final_status(
-    result, job_id: str, r: redis.Redis
-) -> tuple[str, list[str]]:
+def resolve_final_status(result, job_id: str, r: redis.Redis) -> tuple[str, list[str]]:
     """For the AI path. Determines whether a successful agent run is
     actually 'done' or should be downgraded to 'partial'.
 
@@ -129,7 +126,7 @@ def resolve_final_status(
         reasons.append("max_steps_exceeded")
 
     try:
-        final = (result.final_result() or "")
+        final = result.final_result() or ""
         if re.search(r"status\s*:\s*partial", final, re.IGNORECASE):
             if not any(x.startswith("agent_reported") for x in reasons):
                 reasons.append("agent_reported_partial")
@@ -169,6 +166,8 @@ def extract_cost_data(result) -> dict | None:
 
 def _should_use_scripted(task_id: str, params: dict) -> bool:
     """Scripted runner takes over only when ALL conditions hold."""
+    if task_id == "fetch-receipt":
+        return True
     if task_id != "border-tax":
         return False
     state = params.get("state", "") or ""
@@ -186,9 +185,7 @@ def _scripted_cost_data(outcome: RunOutcome) -> dict | None:
     LLM calls and reported as such."""
     if not outcome.total_cost_usd or outcome.total_cost_usd <= 0:
         return None
-    entries_with_cost = sum(
-        1 for e in outcome.run_log if e.handoff_cost_usd
-    )
+    entries_with_cost = sum(1 for e in outcome.run_log if e.handoff_cost_usd)
     return {
         "totalPromptTokens": 0,
         "totalCompletionTokens": 0,
@@ -205,19 +202,22 @@ def _scripted_cost_data(outcome: RunOutcome) -> dict | None:
 
 async def _run_scripted(
     job_id: str,
+    task_id: str,
     job_params: dict,
+    source: str,
     r: redis.Redis,
 ) -> tuple[str, str, list[str], dict | None, list[dict] | None]:
     """Run the scripted path. Returns the same shape the AI path produces
     so the downstream notify code is identical:
       (status, summary, partial_reasons, cost_data, run_log_dump)
     """
-    state = job_params.get("state", "")
-    outcome = await run_border_tax(state, job_params, job_id, r)
+    if task_id == "fetch-receipt":
+        outcome = await run_fetch_receipt(job_params, source, job_id, r)
+    else:
+        state = job_params.get("state", "")
+        outcome = await run_border_tax(state, job_params, job_id, r)
 
-    run_log_dump = [
-        entry.model_dump(mode="json") for entry in outcome.run_log
-    ] or None
+    run_log_dump = [entry.model_dump(mode="json") for entry in outcome.run_log] or None
 
     partial_reasons: list[str] = []
     if outcome.status == "partial":
@@ -284,11 +284,9 @@ async def main():
                 partial_reasons,
                 cost_data,
                 run_log_dump,
-            ) = await _run_scripted(job_id, job_params, r)
+            ) = await _run_scripted(job_id, task_id, job_params, source, r)
         else:
-            result = await run_agent(
-                prompt, job_id, job_params, tool_defs, r, task_id
-            )
+            result = await run_agent(prompt, job_id, job_params, tool_defs, r, task_id)
             cost_data = extract_cost_data(result)
             final_result = result.final_result() or "No result returned"
             status, partial_reasons = resolve_final_status(result, job_id, r)
@@ -331,4 +329,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
