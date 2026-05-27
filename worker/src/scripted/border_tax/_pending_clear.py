@@ -25,12 +25,13 @@ This module:
         3. Click the "Check Pending Transaction" routerLink anchor inside
            the "Border Tax Payment" dropdown in the page header.
         4. Fill the vehicle number on the Check Transaction Status page.
-        5. Solve the canvas captcha (reuses scripted.captcha.solve_canvas_captcha
-           — direct Gemini-on-Vertex LLM OCR, no AI handoff agent).
+        5. Solve the canvas captcha (CDP-screenshot fallback to handle
+           canvases whose getBoundingClientRect lies — see
+           _capture_captcha_png and _ocr_captcha_image below).
         6. Click "Go". Poll for either:
               - the results table populating (captcha accepted), or
               - the "Captcha mismatch" SweetAlert2 popup (captcha rejected;
-                solve_canvas_captcha auto-refreshes and retries).
+                we click the refresh button and retry the loop).
         7. Click the bank/university icon in the first row.
         8. Poll for either outcome:
               - "Please try after X Minutes Y Seconds" SweetAlert2 → portal
@@ -49,6 +50,24 @@ This module:
       selection from parivahan.gov.in/en/node/579 is the only working path.
     - on "failed" → RunOutcome failed with abort_reason "pending_clear_failed",
       includes the reason hint.
+
+  Captcha-extraction strategy
+  ---------------------------
+  We do NOT use scripted.captcha.solve_canvas_captcha here, because its
+  _wait_visible(canvas, 10s) check relies on getBoundingClientRect()
+  reporting w>0 AND h>0. On both this page and the phase-6 disclaimer
+  page, the captcha <canvas> reports 0×0 even when it's drawn and
+  toDataURL works fine — same CSS quirk that pushed phase 6 to AI
+  handoff. Our local solver instead:
+    1. Waits for the canvas to be PRESENT in DOM (no size check).
+    2. Captures via canvas.toDataURL (cheapest) → CDP Page.captureScreenshot
+       clipped to the captcha rect → full viewport screenshot, whichever
+       lands first.
+    3. OCRs via direct llm.ainvoke against Gemini-on-Vertex — same cheap
+       path the shared solver uses, but applied to whichever PNG worked.
+    4. Refreshes the captcha between attempts (max MAX_CAPTCHA_ATTEMPTS=5).
+  This stays roughly $0.0001–0.0005 per attempt vs. ~$0.01–0.05 for a
+  full run_ai_rescue Agent loop.
 
   Heavy `print("[pending_clear] …")` logging at every branch so we can grep
   docker logs while we burn this in.
@@ -80,7 +99,7 @@ from typing import Literal
 
 import redis
 
-from ..captcha import solve_canvas_captcha
+from ..handoff import build_llm
 from ..log import StepLogger
 from ..steps import (
     _cdp_eval,
@@ -93,7 +112,7 @@ from ..steps import (
     wait_for_selector,
     wait_for_url,
 )
-from ..types import ScriptedAbort, StepLog, StepStatus
+from ..types import StepLog, StepStatus
 
 
 # ─── Selectors ─────────────────────────────────────────────────────────
@@ -141,9 +160,12 @@ OWNER_OUTCOME_POLL_TICK_SECS = 0.5
 GO_SUBMIT_POLL_SECS = 10.0
 
 # How long to wait after clicking the bank icon for either outcome
-# popup (try-after) or the recovery navigation/text.
-BANK_OUTCOME_POLL_SECS = 12.0
+# popup (try-after) or the recovery navigation/text. Gov portal is
+# slow — was 12s, bumped to 30s. We log a debug-context line every
+# DEBUG_TICK_SECS during the poll so timeouts are diagnosable.
+BANK_OUTCOME_POLL_SECS = 30.0
 BANK_OUTCOME_POLL_TICK_SECS = 0.5
+BANK_OUTCOME_DEBUG_TICK_SECS = 3.0  # log URL/popups/body every ~3s
 
 # Max captcha attempts before giving up. The solver auto-refreshes the
 # canvas between attempts via SEL_PENDING_CAPTCHA_REFRESH.
@@ -265,54 +287,572 @@ _GO_SUBMIT_STATE_JS = """
 
 
 # Click the bank/university icon in the first row of the results table.
-# The Angular click handler is bound on the parent <td>, not the <i>
-# itself, so we click the closest <td>.
+# The Angular click handler binding is unstable across this portal — it's
+# sometimes on the <i>, sometimes on the <td>, sometimes only listening
+# to synthetic MouseEvents. We click the icon AND the td AND dispatch
+# a synthetic event, then return everything we tried so the log shows
+# what landed.
 _CLICK_BANK_ICON_JS = """
 (function() {
   var rows = document.querySelectorAll('table.table-bordered tbody tr');
   if (!rows || rows.length === 0) return {ok: false, reason: 'no_rows'};
   var icon = rows[0].querySelector('i.fa-university');
   if (!icon) return {ok: false, reason: 'no_bank_icon'};
-  var clickable = icon.closest('td') || icon;
-  try { clickable.click(); return {ok: true}; }
-  catch (e) { return {ok: false, reason: 'click_threw:' + e.message}; }
+  var td = icon.closest('td') || icon.parentElement;
+
+  var attempts = [];
+
+  try { td.click(); attempts.push('td.click'); }
+  catch (e) { attempts.push('td.click_threw:' + (e.message || 'unknown')); }
+
+  try { icon.click(); attempts.push('icon.click'); }
+  catch (e) { attempts.push('icon.click_threw:' + (e.message || 'unknown')); }
+
+  try {
+    var evt = new MouseEvent('click', {bubbles: true, cancelable: true, view: window});
+    td.dispatchEvent(evt);
+    attempts.push('td.dispatchEvent');
+  } catch (e) { attempts.push('td.dispatch_threw:' + (e.message || 'unknown')); }
+
+  return {ok: true, attempts: attempts};
 })()
 """
 
 
-# After clicking the bank icon, classify the outcome:
-#   {state: "still_on_hold", hint: "Please try after X Minutes Y Seconds"}
-#     → portal still has the tx locked; we can't clear it yet.
-#   {state: "cleared", via: "url"|"body_text"}
-#     → portal redirected to /bank/DoubleVerification with "transaction is
-#       fail" — we're free to re-initiate the original tax flow.
-#   {state: "pending"}
-#     → keep polling.
+# After clicking the bank icon, classify the outcome AND always return
+# debug context (current URL, visible popups, body snippet) so the
+# polling loop can log what it's seeing each tick. Much more useful
+# than a silent 12s timeout when something unexpected happens.
+#
+# Decisions:
+#   {state: "still_on_hold", hint: "..."} — visible popup whose text
+#     matches /try\s*after/i.
+#   {state: "cleared", via: "url"|"body_text", ...} — URL contains
+#     "DoubleVerification" OR "/bank/", OR body contains the success
+#     text ("transaction is fail" / "initiate transaction again").
+#   {state: "pending", url, popups, body_snippet} — keep polling. The
+#     caller logs this context every few ticks so we can see what's
+#     actually on screen when something goes wrong.
 _BANK_OUTCOME_JS = """
 (function() {
-  var popups = document.querySelectorAll('.swal2-popup');
-  for (var i = 0; i < popups.length; i++) {
-    var r = popups[i].getBoundingClientRect();
+  var url = (window.location && window.location.href) || '';
+  var body = (document.body && document.body.innerText) || '';
+
+  var popups = [];
+  var pNodes = document.querySelectorAll('.swal2-popup');
+  for (var i = 0; i < pNodes.length; i++) {
+    var r = pNodes[i].getBoundingClientRect();
     if (r.width <= 0 || r.height <= 0) continue;
-    var container = popups[i].querySelector('.swal2-html-container');
-    var text = ((container && container.textContent) || popups[i].textContent || '').trim();
-    if (/try\\s*after/i.test(text)) {
-      return {state: 'still_on_hold', hint: text.substring(0, 240)};
+    var c = pNodes[i].querySelector('.swal2-html-container');
+    var text = ((c && c.textContent) || pNodes[i].textContent || '').trim();
+    popups.push(text.substring(0, 240));
+  }
+
+  for (var j = 0; j < popups.length; j++) {
+    if (/try\\s*after/i.test(popups[j])) {
+      return {
+        state: 'still_on_hold',
+        hint: popups[j],
+        url: url,
+        popups: popups
+      };
     }
   }
-  var url = (window.location && window.location.href) || '';
-  if (url.indexOf('DoubleVerification') !== -1
-      || url.indexOf('doubleVerification') !== -1
-      || url.toLowerCase().indexOf('doubleverification') !== -1) {
-    return {state: 'cleared', via: 'url'};
+
+  // URL signals: documented post-clear path is /bank/DoubleVerification.
+  // Also accept any /bank/ in case the path drifts.
+  if (/DoubleVerification/i.test(url) || /\\/bank\\//i.test(url)) {
+    return {
+      state: 'cleared',
+      via: 'url',
+      url: url,
+      popups: popups
+    };
   }
-  var body = (document.body && document.body.innerText) || '';
-  if (/transaction\\s*is\\s*fail/i.test(body)) {
-    return {state: 'cleared', via: 'body_text'};
+
+  // Body signals: the documented success text is "Your transaction is
+  // fail. Please initiate transaction again." — match either sentence.
+  if (/transaction\\s*is\\s*fail/i.test(body)
+      || /initiate\\s*transaction\\s*again/i.test(body)) {
+    return {
+      state: 'cleared',
+      via: 'body_text',
+      url: url,
+      body_snippet: body.substring(0, 240),
+      popups: popups
+    };
   }
-  return {state: 'pending'};
+
+  return {
+    state: 'pending',
+    url: url,
+    popups: popups,
+    body_snippet: body.substring(0, 240)
+  };
 })()
 """
+
+
+# ─── Captcha capture & OCR (CDP-screenshot fallback) ───────────────────
+#
+# WHY THIS EXISTS, not shared/solve_canvas_captcha:
+#   The shared solver does `_wait_visible(canvas, 10s)` which polls
+#   getBoundingClientRect for w>0 AND h>0. On the Check Pending
+#   Transaction page (and the phase 6 disclaimer page — that's why
+#   phase 6 uses AI handoff!), the captcha <canvas> element reports
+#   0×0 even when it's rendered and toDataURL works fine — probably
+#   a CSS quirk in the checkpostv4 Angular template. The shared
+#   solver therefore times out 5 times in a row before giving up.
+#
+# What we do instead:
+#   1. Wait for the canvas to be PRESENT in DOM (no size check).
+#   2. Try canvas.toDataURL() — cheapest, works on most pages.
+#   3. Fall back to CDP Page.captureScreenshot clipped to the captcha's
+#      bounding rect.
+#   4. Fall back further to a full-viewport screenshot (then the LLM
+#      prompt tells Gemini to find the captcha inside the screenshot).
+#   5. OCR via direct llm.ainvoke (same Gemini-on-Vertex path captcha.py
+#      uses — NOT an Agent loop, so cost stays ~$0.0001/call).
+
+
+# Wait for the captcha canvas to be in the DOM (no rendered-size check,
+# since that's the exact signal that's broken here).
+#
+# IMPORTANT: this page has TWO <canvas> elements — a hidden one (id="captcha",
+# bitmap 140×36, BoundingClientRect 0×0) AND a visible one (no id, bitmap
+# 145×36, BoundingClientRect 145×36). They render DIFFERENT captcha text.
+# Reading the hidden one means we submit gibberish while the user watches
+# the visible one refresh. We always pick the VISIBLE one, falling back to
+# the largest-bitmap canvas if none has a non-zero rect.
+_CAPTCHA_PRESENCE_JS = """
+(function() {
+  var all = document.querySelectorAll('canvas');
+  if (!all || all.length === 0) {
+    return {found: false, reason: 'no_canvas'};
+  }
+  var target = null;
+  var via = '';
+  for (var i = 0; i < all.length; i++) {
+    var c = all[i];
+    if (!(c instanceof HTMLCanvasElement)) continue;
+    var r = c.getBoundingClientRect();
+    if (r.width > 0 && r.height > 0) { target = c; via = 'visible'; break; }
+  }
+  if (!target) {
+    var maxArea = 0;
+    for (var j = 0; j < all.length; j++) {
+      var c2 = all[j];
+      if (!(c2 instanceof HTMLCanvasElement)) continue;
+      var area = (c2.width || 0) * (c2.height || 0);
+      if (area > maxArea) { maxArea = area; target = c2; via = 'largest_bitmap'; }
+    }
+  }
+  if (!target) return {found: false, reason: 'no_canvas_with_bitmap'};
+  return {
+    found: true,
+    via: via,
+    canvas_count: all.length,
+    bitmap_w: target.width,
+    bitmap_h: target.height,
+    parent_id: (target.parentElement && target.parentElement.id) || ''
+  };
+})()
+"""
+
+
+# Read the VISIBLE canvas as base64 PNG via toDataURL. Returns null if the
+# data URL is suspiciously short (blank canvas) or toDataURL threw (tainted).
+# Same visible-canvas selection rule as _CAPTCHA_PRESENCE_JS.
+_CANVAS_TODATAURL_JS = r"""
+(function() {
+  var all = document.querySelectorAll('canvas');
+  var target = null;
+  for (var i = 0; i < all.length; i++) {
+    var c = all[i];
+    if (!(c instanceof HTMLCanvasElement)) continue;
+    var r = c.getBoundingClientRect();
+    if (r.width > 0 && r.height > 0) { target = c; break; }
+  }
+  if (!target) {
+    var maxArea = 0;
+    for (var j = 0; j < all.length; j++) {
+      var c2 = all[j];
+      if (!(c2 instanceof HTMLCanvasElement)) continue;
+      var area = (c2.width || 0) * (c2.height || 0);
+      if (area > maxArea) { maxArea = area; target = c2; }
+    }
+  }
+  if (!target) return null;
+  try {
+    var url = target.toDataURL('image/png');
+    if (!url || url.length < 200) return null;
+    return url.replace(/^data:image\/png;base64,/, '');
+  } catch (e) {
+    return null;
+  }
+})()
+"""
+
+
+# Bounding rect of the captcha. We prefer the visible canvas itself, then
+# fall back to common container divs. Used to clip Page.captureScreenshot.
+# Returns null if no plausible element has a non-zero rect.
+_CAPTCHA_RECT_JS = """
+(function() {
+  // Prefer the visible canvas directly.
+  var all = document.querySelectorAll('canvas');
+  for (var i = 0; i < all.length; i++) {
+    var c = all[i];
+    if (!(c instanceof HTMLCanvasElement)) continue;
+    var r = c.getBoundingClientRect();
+    if (r.width > 0 && r.height > 0) {
+      return {x: r.left, y: r.top, w: r.width, h: r.height, sel: 'canvas[visible]'};
+    }
+  }
+  // Fall back to container divs in case all canvases lie about their rect.
+  var sels = ['div#captcha', 'div.cap'];
+  for (var k = 0; k < sels.length; k++) {
+    var el = document.querySelector(sels[k]);
+    if (!el) continue;
+    var rr = el.getBoundingClientRect();
+    if (rr.width > 0 && rr.height > 0) {
+      return {x: rr.left, y: rr.top, w: rr.width, h: rr.height, sel: sels[k]};
+    }
+  }
+  return null;
+})()
+"""
+
+
+# Click the refresh button next to the captcha (used between attempts).
+_REFRESH_CAPTCHA_JS = (
+    "(function(s){var b=document.querySelector(s);"
+    "if(b){b.click();return true;}return false;})("
+    "'div#captcha + button, button.btn-primary.m-left')"
+)
+
+
+async def _wait_captcha_in_dom(session, timeout: float = 15.0) -> bool:
+    """Poll until a visible captcha canvas is present in the DOM."""
+    started = time.monotonic()
+    deadline = started + timeout
+    while time.monotonic() < deadline:
+        res = await _cdp_eval(session, _CAPTCHA_PRESENCE_JS)
+        if res and res.get("found"):
+            elapsed = time.monotonic() - started
+            print(
+                f"[pending_clear] captcha in DOM after {elapsed:.1f}s "
+                f"(via={res.get('via')!r}, canvas_count={res.get('canvas_count')}, "
+                f"bitmap={res.get('bitmap_w')}x{res.get('bitmap_h')}, "
+                f"parent_id={res.get('parent_id')!r})"
+            )
+            return True
+        await asyncio.sleep(0.25)
+    print(f"[pending_clear] captcha never appeared in DOM within {timeout}s")
+    return False
+
+
+async def _capture_captcha_png(session) -> tuple[str | None, str]:
+    """Capture the captcha as base64 PNG. Returns (b64, source) where
+    source is one of:
+      'canvas_toDataURL' — cheapest, exact pixels
+      'cdp_clip'         — CDP screenshot clipped to captcha rect
+      'cdp_viewport'     — full viewport (LLM has to find the captcha)
+    Returns (None, '') if every path failed."""
+
+    # 1. canvas.toDataURL — cheapest, exact pixels.
+    b64 = await _cdp_eval(session, _CANVAS_TODATAURL_JS)
+    if b64:
+        return (b64, "canvas_toDataURL")
+
+    # 2. CDP screenshot clipped to the captcha's bounding rect.
+    rect = await _cdp_eval(session, _CAPTCHA_RECT_JS)
+    try:
+        cdp = await session.get_or_create_cdp_session()
+    except Exception as e:
+        print(f"[pending_clear] could not get CDP session: {e}")
+        return (None, "")
+
+    if rect and rect.get("w", 0) > 0 and rect.get("h", 0) > 0:
+        try:
+            pad = 6.0  # px padding so OCR isn't tight against the edges
+            result = await cdp.cdp_client.send.Page.captureScreenshot(
+                params={
+                    "format": "png",
+                    "clip": {
+                        "x": max(0.0, float(rect["x"]) - pad),
+                        "y": max(0.0, float(rect["y"]) - pad),
+                        "width": float(rect["w"]) + 2 * pad,
+                        "height": float(rect["h"]) + 2 * pad,
+                        "scale": 1.0,
+                    },
+                },
+                session_id=cdp.session_id,
+            )
+            data = (result or {}).get("data") if isinstance(result, dict) else getattr(result, "data", None)
+            if data:
+                return (data, "cdp_clip")
+        except Exception as e:
+            print(f"[pending_clear] CDP clipped screenshot failed: {type(e).__name__}: {e}")
+
+    # 3. Full viewport screenshot — last resort.
+    try:
+        result = await cdp.cdp_client.send.Page.captureScreenshot(
+            params={"format": "png"},
+            session_id=cdp.session_id,
+        )
+        data = (result or {}).get("data") if isinstance(result, dict) else getattr(result, "data", None)
+        if data:
+            return (data, "cdp_viewport")
+    except Exception as e:
+        print(f"[pending_clear] CDP viewport screenshot failed: {type(e).__name__}: {e}")
+
+    return (None, "")
+
+
+async def _ocr_captcha_image(image_b64: str, source: str) -> str:
+    """Direct LLM OCR using the captured PNG. Returns the decoded
+    characters, or 'UNREADABLE' if every message shape fails.
+
+    The CHEAP path. On some browser_use 0.12.x patch releases this
+    fails with `'dict' object has no attribute 'model_copy'` because
+    ChatGoogle.ainvoke wants pydantic message objects instead of raw
+    dicts. When it fails, the caller falls back to
+    _ocr_via_screenshot_agent, which is the EXPENSIVE-but-reliable
+    Agent path (~3 LLM calls per captcha vs 1 here).
+
+    Same message-shape juggling as captcha.py's _ocr_via_llm.
+    """
+    llm = build_llm()
+
+    if source == "cdp_viewport":
+        instruction = (
+            "This is a full-page screenshot of a government website "
+            "(Check Pending Transaction page). Find the small CAPTCHA "
+            "image — a rectangular box with distorted/wavy characters "
+            "on a light cyan-green background, typically 4–6 mixed "
+            "letters and digits, located near a blue refresh button "
+            "and a 'Go' button. Read ONLY the characters from inside "
+            "that captcha image — case-sensitive. Reply with ONLY "
+            "those characters, no spaces, no quotes, no explanation. "
+            "If you cannot find or read the captcha, reply with the "
+            "single word: UNREADABLE"
+        )
+    else:
+        instruction = (
+            "This is a captcha image from a government website. It "
+            "contains 4–6 distorted characters (mixed letters and "
+            "digits, case-sensitive) on a light cyan-green background. "
+            "Read the characters and reply with ONLY those characters, "
+            "no spaces, no quotes, no explanation. If you cannot read "
+            "it clearly, reply with the single word: UNREADABLE"
+        )
+
+    def _extract(response) -> str:
+        text = (
+            getattr(response, "completion", None)
+            or getattr(response, "content", None)
+            or ""
+        )
+        if isinstance(text, list):
+            text = " ".join(
+                str(p.get("text", "")) if isinstance(p, dict) else str(p)
+                for p in text
+            )
+        return (text or "").strip().strip("'\"` \t\n\r")
+
+    # Shape A: raw dict messages (matches captcha.py _ocr_via_llm).
+    try:
+        msgs = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": instruction},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{image_b64}"
+                        },
+                    },
+                ],
+            }
+        ]
+        response = await llm.ainvoke(msgs)
+        text = _extract(response)
+        if text and text.upper() != "UNREADABLE":
+            return text
+    except Exception as e:
+        print(f"[pending_clear] OCR shape-A (dict) failed: {type(e).__name__}: {e}")
+
+    # Shape B: langchain HumanMessage. Some ChatGoogle versions accept
+    # this and call .model_copy() on it successfully (it's a pydantic
+    # BaseModel, which is what shape-A's dicts don't provide).
+    try:
+        from langchain_core.messages import HumanMessage  # type: ignore
+
+        msg = HumanMessage(
+            content=[
+                {"type": "text", "text": instruction},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{image_b64}"
+                    },
+                },
+            ]
+        )
+        response = await llm.ainvoke([msg])
+        text = _extract(response)
+        if text and text.upper() != "UNREADABLE":
+            return text
+    except Exception as e:
+        print(f"[pending_clear] OCR shape-B (HumanMessage) failed: {type(e).__name__}: {e}")
+
+    # Shape C: browser_use's own UserMessage. Newer 0.12.x patches.
+    try:
+        from browser_use.llm.messages import (  # type: ignore
+            UserMessage,
+            ContentPartTextParam,
+            ContentPartImageParam,
+            ImageURL,
+        )
+
+        msg = UserMessage(
+            content=[
+                ContentPartTextParam(text=instruction),
+                ContentPartImageParam(
+                    image_url=ImageURL(
+                        url=f"data:image/png;base64,{image_b64}"
+                    )
+                ),
+            ]
+        )
+        response = await llm.ainvoke([msg])
+        text = _extract(response)
+        if text and text.upper() != "UNREADABLE":
+            return text
+    except Exception as e:
+        print(f"[pending_clear] OCR shape-C (browser_use UserMessage) failed: {type(e).__name__}: {e}")
+
+    return "UNREADABLE"
+
+
+async def _ocr_via_screenshot_agent(session) -> tuple[str, float]:
+    """Fallback OCR via a 1-step Agent that screenshots the page and
+    writes the captcha back through a captured tool call. Used when
+    every direct llm.ainvoke shape fails (see _ocr_captcha_image).
+
+    The Agent takes its OWN page screenshot — we don't pass it the
+    captured PNG. This is what makes it more reliable than the direct
+    path: browser_use's Agent infrastructure has been kept working
+    across patch releases even when bare llm.ainvoke message shapes
+    have drifted.
+
+    Returns:
+      (text, cost_usd) — text is the decoded captcha (or 'UNREADABLE'),
+      cost_usd is the Vertex API spend for this Agent run, extracted via
+      agent.token_cost_service. We mirror captcha.py's _ocr_via_agent
+      so the accumulated cost flows through StepLog.handoff_cost_usd →
+      StepLogger.total_handoff_cost() → RunOutcome.total_cost_usd → the
+      same place every other LLM cost in this run lands.
+
+    Cost: max_steps=2 keeps this to two Gemini-3-Flash vision calls per
+    attempt, ~$0.001–0.002 each. Five attempts worst-case ≈ $0.01.
+
+    The Agent is told NOT to click or type — it must ONLY call
+    submit_captcha(text) and then done. submit_captcha is a fake
+    tool we register here that just records the text into a closure
+    dict and returns "ok".
+    """
+    # Late-imported so the module loads even if browser_use is older
+    # than expected (we'd just degrade to UNREADABLE).
+    try:
+        from browser_use import Agent, Tools  # type: ignore
+    except Exception as e:
+        print(f"[pending_clear] could not import browser_use Agent: {e}")
+        return "UNREADABLE", 0.0
+
+    captured: dict[str, str] = {"text": ""}
+    tools = Tools()
+
+    @tools.action(
+        description=(
+            "Submit the captcha text you read from the small captcha "
+            "image on the current page. Pass the characters as a single "
+            "string with no spaces. If you cannot read them, pass "
+            "'UNREADABLE'."
+        )
+    )
+    async def submit_captcha(text: str) -> str:
+        captured["text"] = (text or "").strip().strip("'\"` \t\n\r")
+        return "ok"
+
+    # Tighter prompt: we observed Gemini-3-Flash calling submit_captcha
+    # TWICE before calling done (step 1: submit, step 2: submit again,
+    # step 3: done). The explicit "exactly TWO actions" framing + the
+    # max_steps=2 cap below keeps this at one submit + one done.
+    prompt = (
+        "Look at the current page — it is a Check Transaction Status "
+        "page on a government portal. It has an 'Input Vehicle No.' "
+        "field, a small CAPTCHA image (a rectangular box with "
+        "distorted characters on a light cyan-green background, 4–6 "
+        "mixed letters and digits, case-sensitive — example look: "
+        "wavy italics like 'xbjPCe' or '7v8da6'), an 'Input Text from "
+        "Image' field, and a blue 'Go' button.\n\n"
+        "Take EXACTLY TWO actions in order:\n"
+        "  STEP 1: Read the characters inside the CAPTCHA image, then "
+        "call submit_captcha(text='<characters>'). Preserve case "
+        "exactly. No spaces, no quotes, no surrounding text.\n"
+        "  STEP 2: Immediately call done.\n\n"
+        "Do NOT call submit_captcha twice. Do NOT click anything, do "
+        "NOT type into any field, do NOT navigate, do NOT take any "
+        "other action."
+    )
+
+    cost_usd = 0.0
+    agent = None
+    try:
+        agent = Agent(
+            task=prompt,
+            llm=build_llm(),
+            browser=session,
+            tools=tools,
+            calculate_cost=True,
+        )
+        # max_steps=2: tightest budget that lets the agent submit AND
+        # call done. If done is never reached, the run exits at the
+        # cap; we still have captured["text"] from step 1.
+        await agent.run(max_steps=2)
+    except Exception as e:
+        print(f"[pending_clear] screenshot-agent run failed: {type(e).__name__}: {e}")
+
+    # Cost extraction. Mirror captcha.py::_ocr_via_agent exactly so the
+    # accounting goes through the same machinery. Best-effort — if the
+    # cost service / fill_missing_cost path is unavailable we just
+    # report 0.0 rather than failing the whole flow.
+    if agent is not None:
+        try:
+            from cost_calculator import fill_missing_cost  # type: ignore
+
+            usage = await agent.token_cost_service.get_usage_summary()
+            cd = fill_missing_cost(usage)
+            if cd:
+                cost_usd = float(cd.get("totalCost", 0.0) or 0.0)
+        except Exception as e:
+            print(
+                f"[pending_clear] screenshot-agent cost extraction failed: "
+                f"{type(e).__name__}: {e}"
+            )
+
+    text = captured["text"]
+    if not text or text.upper() == "UNREADABLE":
+        print(f"[pending_clear] screenshot-agent returned no text (cost=${cost_usd:.5f})")
+        return "UNREADABLE", cost_usd
+    print(
+        f"[pending_clear] screenshot-agent returned: {text!r} "
+        f"(cost=${cost_usd:.5f})"
+    )
+    return text, cost_usd
 
 
 # ─── Public: owner-info outcome polling ────────────────────────────────
@@ -411,10 +951,11 @@ async def clear_pending_transaction(
     Args:
       session: browser-use Browser session (same one phase 3 was driving).
       vehicle_number: the registration number being processed.
-      job_id, r: pass-through to solve_canvas_captcha for the human
-        fallback (source != 'app').
-      source: 'web' or 'app' — controls whether captcha can fall back
-        to wait_for_human after AI attempts are exhausted.
+      job_id, r: present for parity with the shared captcha solver's
+        signature, currently unused by our local captcha loop. Kept so
+        we can wire up a human fallback later if we ever need to.
+      source: 'web' or 'app' — currently unused by the local captcha
+        loop. Kept for the same reason as job_id/r.
       log: StepLogger — every branch records exactly one entry.
 
     Returns:
@@ -525,22 +1066,22 @@ async def clear_pending_transaction(
         print(f"[pending_clear] vehicle fill failed: {type(e).__name__}: {e}")
         return ("failed", f"vehicle_fill_failed:{type(e).__name__}")
 
-    # ─── Step 4: solve canvas captcha + click Go ───────────────────────
-    # solve_canvas_captcha:
-    #   - reads the canvas as a base64 PNG via CDP (canvas.toDataURL),
-    #   - sends it to Gemini on Vertex AI via direct llm.ainvoke (NOT
-    #     an agent loop — this is the cheap path, not the AI handoff one),
-    #   - fills SEL_PENDING_CAPTCHA_INPUT,
-    #   - calls our submit_action(),
-    #   - if submit_action() returns False, clicks the refresh button to
-    #     get a fresh canvas and retries (up to MAX_CAPTCHA_ATTEMPTS).
-    #
-    # Our submit_action clicks "Go" and polls the page for the deciding
-    # state (results / captcha_mismatch / pending). Returns True when the
-    # results table populates (captcha was accepted), False on rejection
-    # so the solver refreshes and tries again.
+    # ─── Step 4: solve captcha + click Go (custom loop) ────────────────
+    # We do NOT use shared solve_canvas_captcha here. Its _wait_visible
+    # (canvas) check unreliably times out on this page — see the long
+    # comment near _wait_captcha_in_dom for the why. Our loop:
+    #   - waits for canvas PRESENCE (not size),
+    #   - captures via canvas.toDataURL → CDP-clipped screenshot → CDP
+    #     viewport screenshot (whichever works first),
+    #   - OCRs via direct llm.ainvoke against Gemini-on-Vertex,
+    #   - fills the input, clicks Go, polls for the outcome,
+    #   - on rejection or no-decision, clicks the refresh button and
+    #     retries up to MAX_CAPTCHA_ATTEMPTS times.
 
     async def _submit_go() -> bool:
+        """Click Go and poll for {results, captcha_mismatch, pending}.
+        Returns True if the results table populated (captcha accepted),
+        False on rejection (popup dismissed) or no-decision timeout."""
         print(f"[pending_clear] clicking Go to submit captcha")
         await _cdp_eval(
             session,
@@ -554,7 +1095,10 @@ async def clear_pending_transaction(
             state = (res or {}).get("state", "pending")
             if state == "results":
                 count = (res or {}).get("count", 0)
-                print(f"[pending_clear] table populated ({count} row(s)) — captcha accepted")
+                print(
+                    f"[pending_clear] table populated ({count} row(s)) "
+                    f"— captcha accepted"
+                )
                 return True
             if state == "captcha_mismatch":
                 text = ((res or {}).get("text") or "")[:120]
@@ -565,41 +1109,163 @@ async def clear_pending_transaction(
                     pass
                 return False
             await asyncio.sleep(0.5)
-        print(f"[pending_clear] Go submit timed out ({GO_SUBMIT_POLL_SECS}s) — no rows, no popup")
+        print(
+            f"[pending_clear] Go submit timed out ({GO_SUBMIT_POLL_SECS}s) "
+            f"— no rows, no popup"
+        )
         return False
 
-    try:
-        await solve_canvas_captcha(
-            session,
-            canvas_selector=SEL_PENDING_CAPTCHA_CANVAS,
-            input_selector=SEL_PENDING_CAPTCHA_INPUT,
-            refresh_selector=SEL_PENDING_CAPTCHA_REFRESH,
-            submit_action=_submit_go,
-            job_id=job_id,
-            r=r,
-            source=source,
-            log=log,
-            name="pending_clear.solve_captcha",
-            max_ai_attempts=MAX_CAPTCHA_ATTEMPTS,
+    async def _refresh_captcha() -> None:
+        """Click the blue refresh button next to the canvas. Best-effort."""
+        try:
+            ok = await _cdp_eval(session, _REFRESH_CAPTCHA_JS)
+            print(f"[pending_clear] refresh button clicked (ok={ok})")
+            # Wait briefly for the canvas to redraw.
+            await asyncio.sleep(1.0)
+        except Exception as e:
+            print(f"[pending_clear] refresh click raised: {type(e).__name__}: {e}")
+
+    # Wait for the canvas to be present in DOM before the first attempt.
+    if not await _wait_captcha_in_dom(session, timeout=15.0):
+        log.record(StepLog(
+            index=log.next_index(),
+            name="pending_clear.captcha_not_in_dom",
+            status=StepStatus.FAILED,
+            error="canvas element not present in DOM within 15s",
+        ))
+        return ("failed", "captcha_not_in_dom")
+
+    captcha_solved = False
+    last_source = ""
+    last_text = ""
+    # Accumulated cost across all screenshot-agent fallbacks in this clear
+    # flow. Attached to the final success / exhausted StepLog via
+    # handoff_cost_usd, so StepLogger.total_handoff_cost() picks it up the
+    # same way captcha.py does. We attach to the FINAL StepLog only (not
+    # per-retry) to avoid double-counting through the sum.
+    total_agent_cost = 0.0
+
+    for attempt in range(1, MAX_CAPTCHA_ATTEMPTS + 1):
+        attempt_started = time.monotonic()
+
+        # 4a. Capture image (toDataURL → clip → viewport).
+        image_b64, source = await _capture_captcha_png(session)
+        if not image_b64:
+            print(f"[pending_clear] attempt {attempt}: image capture failed via every method")
+            log.record(StepLog(
+                index=log.next_index(),
+                name="pending_clear.solve_captcha",
+                status=StepStatus.RETRIED,
+                attempt=attempt,
+                duration_ms=int((time.monotonic() - attempt_started) * 1000),
+                error="image_capture_failed",
+            ))
+            await _refresh_captcha()
+            continue
+
+        last_source = source
+        print(
+            f"[pending_clear] attempt {attempt}: captured "
+            f"{len(image_b64)}-char b64 via {source}"
         )
-    except ScriptedAbort as abort:
-        print(f"[pending_clear] captcha solver gave up: {abort.reason}")
+
+        # 4b. OCR via direct Gemini call. If every message shape fails
+        # (model_copy errors etc.), fall back to a 1-step Agent that
+        # screenshots the page and reads the captcha through a captured
+        # tool call. The Agent path is slower/pricier but proven to work
+        # across browser_use 0.12.x patch releases.
+        text = await _ocr_captcha_image(image_b64, source)
+        if not text or text.upper() == "UNREADABLE":
+            print(
+                f"[pending_clear] attempt {attempt}: direct OCR failed "
+                f"(src={source}), falling back to screenshot-agent"
+            )
+            text, agent_cost = await _ocr_via_screenshot_agent(session)
+            total_agent_cost += agent_cost
+            source = source + "+agent_fallback"
+
+        last_text = text
+        if not text or text.upper() == "UNREADABLE":
+            print(f"[pending_clear] attempt {attempt}: OCR returned UNREADABLE")
+            log.record(StepLog(
+                index=log.next_index(),
+                name="pending_clear.solve_captcha",
+                status=StepStatus.RETRIED,
+                attempt=attempt,
+                duration_ms=int((time.monotonic() - attempt_started) * 1000),
+                value=f"unreadable (src={source})",
+                handoff_reason="captcha_ocr",
+            ))
+            await _refresh_captcha()
+            continue
+
+        print(f"[pending_clear] attempt {attempt}: OCR='{text}' (src={source})")
+
+        # 4c. Fill the captcha input.
+        try:
+            await fill(
+                session,
+                SEL_PENDING_CAPTCHA_INPUT,
+                text,
+                log=log,
+                name=f"pending_clear.fill_captcha_attempt_{attempt}",
+            )
+        except Exception as e:
+            print(f"[pending_clear] attempt {attempt}: fill captcha failed: {e}")
+            await _refresh_captcha()
+            continue
+
+        # 4d. Click Go, poll for outcome.
+        accepted = await _submit_go()
+
+        if accepted:
+            log.record(StepLog(
+                index=log.next_index(),
+                name="pending_clear.solve_captcha",
+                status=StepStatus.OK,
+                attempt=attempt,
+                duration_ms=int((time.monotonic() - attempt_started) * 1000),
+                value=f"{text} (src={source})",
+                handoff_reason="captcha_ocr",
+                handoff_cost_usd=total_agent_cost,
+            ))
+            print(
+                f"[pending_clear] captcha solved on attempt {attempt}, "
+                f"total agent cost so far: ${total_agent_cost:.5f}"
+            )
+            captcha_solved = True
+            break
+
+        # Rejected or no decision — refresh and try again.
+        log.record(StepLog(
+            index=log.next_index(),
+            name="pending_clear.solve_captcha",
+            status=StepStatus.RETRIED,
+            attempt=attempt,
+            duration_ms=int((time.monotonic() - attempt_started) * 1000),
+            value=f"rejected:{text} (src={source})",
+            handoff_reason="captcha_ocr",
+        ))
+        await _refresh_captcha()
+
+    if not captcha_solved:
+        print(
+            f"[pending_clear] captcha not solved after "
+            f"{MAX_CAPTCHA_ATTEMPTS} attempts (last src={last_source}, "
+            f"last text={last_text!r}, total agent cost: "
+            f"${total_agent_cost:.5f})"
+        )
         log.record(StepLog(
             index=log.next_index(),
             name="pending_clear.captcha_exhausted",
             status=StepStatus.FAILED,
-            error=str(abort.reason),
+            error=(
+                f"captcha not solved after {MAX_CAPTCHA_ATTEMPTS} attempts "
+                f"(last src={last_source})"
+            ),
+            handoff_cost_usd=total_agent_cost,
         ))
-        return ("failed", f"captcha_exhausted:{abort.reason}")
-    except Exception as e:
-        print(f"[pending_clear] captcha solver crashed: {type(e).__name__}: {e}")
-        log.record(StepLog(
-            index=log.next_index(),
-            name="pending_clear.captcha_crashed",
-            status=StepStatus.FAILED,
-            error=f"{type(e).__name__}: {e}",
-        ))
-        return ("failed", f"captcha_crashed:{type(e).__name__}")
+        return ("failed", f"captcha_exhausted_after_{MAX_CAPTCHA_ATTEMPTS}_attempts")
 
     # ─── Step 5: click the bank/university icon ────────────────────────
     # Brief settle — Angular sometimes finishes the row mount a frame
@@ -634,15 +1300,32 @@ async def clear_pending_transaction(
         index=log.next_index(),
         name="pending_clear.click_bank_icon",
         status=StepStatus.OK,
+        value=f"attempts={(click_res or {}).get('attempts', [])}",
     ))
-    print(f"[pending_clear] bank icon clicked, polling for outcome…")
+    print(
+        f"[pending_clear] bank icon clicked, attempts="
+        f"{(click_res or {}).get('attempts', [])}, polling for outcome…"
+    )
 
     # ─── Step 6: poll for the outcome ──────────────────────────────────
+    # Give the page a moment to react to the click before the first
+    # poll — avoids racing against a still-in-flight navigation that
+    # would let us see a transient "pending" state.
+    await asyncio.sleep(1.0)
+
     poll_started = time.monotonic()
     poll_deadline = poll_started + BANK_OUTCOME_POLL_SECS
+    last_debug_log = 0.0
+    last_url = ""
+    last_popups: list = []
+    last_body_snippet = ""
+
     while time.monotonic() < poll_deadline:
         res = await _cdp_eval(session, _BANK_OUTCOME_JS)
         state = (res or {}).get("state", "pending")
+        last_url = (res or {}).get("url", "") or last_url
+        last_popups = (res or {}).get("popups", []) or last_popups
+        last_body_snippet = (res or {}).get("body_snippet", "") or last_body_snippet
 
         if state == "still_on_hold":
             hint_full = ((res or {}).get("hint") or "").strip()
@@ -654,7 +1337,7 @@ async def clear_pending_transaction(
                 re.IGNORECASE,
             )
             hint = (m.group(0).strip() if m else hint_full)[:80]
-            print(f"[pending_clear] outcome: still_on_hold (hint={hint!r})")
+            print(f"[pending_clear] outcome: still_on_hold (hint={hint!r}, url={last_url!r})")
             log.record(StepLog(
                 index=log.next_index(),
                 name="pending_clear.outcome",
@@ -672,26 +1355,56 @@ async def clear_pending_transaction(
 
         if state == "cleared":
             via = (res or {}).get("via", "")
-            print(f"[pending_clear] outcome: cleared (via={via})")
+            via_snippet = ""
+            if via == "url":
+                via_snippet = f"url={last_url!r}"
+            elif via == "body_text":
+                via_snippet = f"body_snippet={last_body_snippet[:120]!r}"
+            print(f"[pending_clear] outcome: cleared (via={via}, {via_snippet})")
             log.record(StepLog(
                 index=log.next_index(),
                 name="pending_clear.outcome",
                 status=StepStatus.OK,
                 duration_ms=int((time.monotonic() - flow_started) * 1000),
                 value=f"cleared:{via}",
+                url=last_url or None,
             ))
             return ("cleared", "")
 
+        # Periodic debug log so a stuck poll is diagnosable instead of
+        # silent. Every BANK_OUTCOME_DEBUG_TICK_SECS, print URL +
+        # popups + body snippet so we can see what's actually on screen.
+        elapsed = time.monotonic() - poll_started
+        if elapsed - last_debug_log >= BANK_OUTCOME_DEBUG_TICK_SECS:
+            last_debug_log = elapsed
+            print(
+                f"[pending_clear] poll @ {elapsed:.1f}s: state={state} "
+                f"url={last_url!r} "
+                f"popups={last_popups} "
+                f"body_snippet={last_body_snippet[:120]!r}"
+            )
+
         await asyncio.sleep(BANK_OUTCOME_POLL_TICK_SECS)
 
-    print(f"[pending_clear] outcome polling timed out after {BANK_OUTCOME_POLL_SECS}s")
+    # Timeout — dump everything we last saw so we know WHY it timed out.
+    print(
+        f"[pending_clear] outcome polling timed out after "
+        f"{BANK_OUTCOME_POLL_SECS}s. Last seen:\n"
+        f"  url={last_url!r}\n"
+        f"  popups={last_popups}\n"
+        f"  body_snippet={last_body_snippet[:240]!r}"
+    )
     log.record(StepLog(
         index=log.next_index(),
         name="pending_clear.outcome",
         status=StepStatus.FAILED,
         duration_ms=int((time.monotonic() - flow_started) * 1000),
-        value="poll_timeout",
-        error=f"no decisive bank-icon outcome within {BANK_OUTCOME_POLL_SECS}s",
+        value=f"poll_timeout url={last_url[:120]!r} popups={last_popups}",
+        error=(
+            f"no decisive bank-icon outcome within {BANK_OUTCOME_POLL_SECS}s; "
+            f"body_snippet={last_body_snippet[:120]!r}"
+        ),
+        url=last_url or None,
     ))
     return ("failed", "outcome_poll_timeout")
 
