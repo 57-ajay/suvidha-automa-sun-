@@ -31,7 +31,7 @@ import redis
 
 from agent import run_agent
 from cost_calculator import fill_missing_cost
-from scripted.runner import run_border_tax, state_is_scripted_enabled, run_fetch_receipt
+from scripted.runner import run_border_tax, state_is_scripted_enabled, run_fetch_receipt, state_is_net_banking_scripted
 from scripted.types import RunOutcome
 
 
@@ -174,7 +174,12 @@ def _should_use_scripted(task_id: str, params: dict) -> bool:
     if not state_is_scripted_enabled(state):
         return False
     pm = ((params.get("paymentMethod") or "upi") or "").lower()
-    return pm == "upi"
+    if state_is_scripted_enabled(state):
+        return True
+    elif pm == "upi":
+        return True
+    else:
+        return False
 
 
 def _scripted_cost_data(outcome: RunOutcome) -> dict | None:

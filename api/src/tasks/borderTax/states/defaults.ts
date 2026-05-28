@@ -48,6 +48,15 @@ export const STATE_DEFAULTS: Record<string, StateDefaults> = {
         permitTypeFallback: "TEMPORARY PERMIT",
         paymentMethod: "upi",
     },
+    "UTTARAKHAND": {
+        taxMode: "DAYS",
+        entryDistrict: "DEHRADUN",
+        entryCheckpoint: "",
+        serviceType: "Air Conditioned Service",
+        permitType: "TEMPORARY PERMIT",
+        permitTypeFallback: "ALL INDIA TOURIST PERMIT",
+        paymentMethod: "net_banking",
+    },
 };
 
 // ─── Apply defaults ────────────────────────────────────────────────────────

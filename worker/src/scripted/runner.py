@@ -45,6 +45,7 @@ _BORDER_TAX_STATE_MODULES: dict[str, str] = {
     "RJ": "scripted.border_tax.rj",
     "PB": "scripted.border_tax.pb",
     "MP": "scripted.border_tax.mp",
+    "UK": "scripted.border_tax.uk",
 }
 
 
@@ -62,6 +63,9 @@ _STATE_TO_CODE: dict[str, str] = {
     "MP": "MP",
     "M.P.": "MP",
     "MADHYA PRADESH": "MP",
+    "UK": "UK",
+    "U.K.": "UK",
+    "UTTARAKHAND": "UK",
 }
 
 
@@ -69,6 +73,17 @@ def normalize_state_code(state_or_name: str) -> str:
     """Map any state input to its 2-letter code (or pass through if unknown)."""
     key = (state_or_name or "").strip().upper()
     return _STATE_TO_CODE.get(key, key)
+
+
+_NET_BANKING_SCRIPTED_STATES = {"UK"}
+
+
+def state_is_net_banking_scripted(state_or_name: str) -> bool:
+    """True iff state is a net-banking-only scripted state AND enabled via
+    SCRIPTED_BORDER_TAX_STATES. These run scripted even when paymentMethod != 'upi'."""
+    return (
+        state_is_scripted_enabled(state_or_name) and normalize_state_code(state_or_name) in _NET_BANKING_SCRIPTED_STATES
+    )
 
 
 def state_is_scripted_enabled(state_or_name: str) -> bool:

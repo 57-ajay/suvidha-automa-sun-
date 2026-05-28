@@ -43,6 +43,7 @@ _STATE_ALIAS: dict[str, str] = {
     "PUNJAB": "PB",
     "MADHYA PRADESH": "MP",
     "M.P.": "MP",
+    "UTTARAKHAND": "UK",
 }
 
 _STATE_DEFAULTS: dict[str, dict[str, str]] = {
@@ -94,6 +95,15 @@ _STATE_DEFAULTS: dict[str, dict[str, str]] = {
         "permitTypeFallback": "TEMPORARY PERMIT",
         "paymentMethod": "upi",
     },
+    "UK": {
+        "taxMode": "DAYS",
+        "entryDistrict": "DEHRADUN",
+        "entryCheckpoint": "",                       # "" → pick first checkpost
+        "serviceType": "Air Conditioned Service",    # AC default per spec
+        "permitType": "TEMPORARY PERMIT",
+        "permitTypeFallback": "ALL INDIA TOURIST PERMIT",
+        "paymentMethod": "net_banking",              # no UPI on UK
+    },
 }
 
 
@@ -116,6 +126,8 @@ class BorderTaxParams(BaseModel):
         "RAJASTHAN",
         "PUNJAB",
         "MADHYA PRADESH",
+        "UK",
+        "UTTARAKHAND",
     ] = "UP"
 
     # Tax modes supported across all states. Per-state validity is
