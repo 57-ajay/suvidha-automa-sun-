@@ -359,9 +359,11 @@ async def run(
         tag="button",
     )
 
-    # Owner-info / pending-transaction handling is IDENTICAL to up.py.
-    # (Same parivahan portal, same popups.) If signatures ever drift, keep
-    # this block byte-for-byte in sync with up.py's phase-3 block.
+    # Owner-info outcome routing. `wait_for_owner_info_outcome` returns ONE
+    # of: "district_ready" (happy path — district select is up), "pending_popup"
+    # (stale pending tx from a prior attempt), "validity_popup" (insurance /
+    # fitness / PUCC expired), or "timeout" (nothing decisive in 30s). The
+    # branch structure mirrors UP/HR/PB/MP — keep it byte-for-byte aligned.
     outcome = await wait_for_owner_info_outcome(
         session, log, name="phase3.wait_owner_outcome"
     )
@@ -376,29 +378,52 @@ async def run(
                     f"SCRIPTED_BORDER_TAX_AUTO_CLEAR_PENDING=true to attempt "
                     f"auto-clear."
                 ),
-                abort_reason="pending_transaction_exists",
+                abort_reason="pending_transaction_popup",
                 run_log=log.dump(),
             )
-        cleared = await clear_pending_transaction(
-            session, log=log, name="phase3.clear_pending"
+
+        print(f"[uk.phase3] pending-tx popup detected; attempting auto-clear")
+        clear_status, hint = await clear_pending_transaction(
+            session,
+            vehicle_number=params.vehicleNumber,
+            job_id=job_id,
+            r=r,
+            source=params.source,
+            log=log,
         )
-        if not cleared:
+
+        if clear_status == "still_on_hold":
             return RunOutcome(
                 status="failed",
                 summary=(
                     f"Vehicle {params.vehicleNumber} has a pending transaction "
-                    f"that could not be auto-cleared."
+                    f"at the parivahan portal that cannot be cleared yet. "
+                    f"Please retry in ~{hint}."
+                ),
+                abort_reason="pending_transaction_still_on_hold",
+                run_log=log.dump(),
+            )
+        if clear_status == "failed":
+            return RunOutcome(
+                status="failed",
+                summary=(
+                    f"Auto-clear of pending transaction for vehicle "
+                    f"{params.vehicleNumber} did not succeed. Reason: {hint}."
                 ),
                 abort_reason="pending_clear_failed",
                 run_log=log.dump(),
             )
-        # Re-navigate to owner info and re-fetch details after clearing.
+
+        # clear_status == "cleared": restart phases 1+2 via the navigation
+        # helper, re-fill the vehicle, re-click Get Details, re-evaluate.
+        # ONE retry only — if the second pass still doesn't yield
+        # district_ready we bail.
+        print(f"[uk.phase3] pending tx cleared; restarting phases 1+2")
         await navigate_to_owner_info_page(
-            session, log=log, name="phase3.renav_owner_info"
-        )
-        await wait_for_selector(
-            session, SEL_VEHICLE_INPUT, log=log,
-            name="phase3.wait_vehicle_input_retry", timeout=30,
+            session,
+            state_code="UK",
+            log=log,
+            wait_for_tax_collection_url=True,
         )
         await fill(
             session, SEL_VEHICLE_INPUT, params.vehicleNumber, log=log,
@@ -411,20 +436,47 @@ async def run(
         outcome = await wait_for_owner_info_outcome(
             session, log, name="phase3.wait_owner_outcome_retry"
         )
+        if outcome != "district_ready":
+            return RunOutcome(
+                status="failed",
+                summary=(
+                    f"After clearing pending transaction for vehicle "
+                    f"{params.vehicleNumber}, phase-3 retry yielded "
+                    f"outcome={outcome!r} (expected 'district_ready'). "
+                    f"Cannot continue."
+                ),
+                abort_reason=f"after_pending_clear:{outcome}",
+                run_log=log.dump(),
+            )
 
-    if outcome not in ("ok", "success"):
+    elif outcome == "validity_popup":
         return RunOutcome(
             status="failed",
             summary=(
-                f"Get Details did not return valid owner/vehicle data for "
-                f"{params.vehicleNumber} (outcome={outcome!r})."
+                f"Vehicle {params.vehicleNumber} has no valid insurance/"
+                f"fitness/PUCC. Please renew before attempting border tax "
+                f"payment."
             ),
-            abort_reason=f"get_details_failed:{outcome}",
+            abort_reason="vehicle_validity_expired_phase3",
             run_log=log.dump(),
         )
 
+    elif outcome == "timeout":
+        return RunOutcome(
+            status="failed",
+            summary=(
+                f"Owner-info page did not respond within 30s after Get "
+                f"Details click for vehicle {params.vehicleNumber}. The "
+                f"portal may be slow or the central RC fetch failed silently."
+            ),
+            abort_reason="get_details_timeout",
+            run_log=log.dump(),
+        )
+
+    # outcome == "district_ready" — fall through to district + checkpost.
+
     # 3a. Entry District — try the configured/default district by text,
-    #     fall back to the first available option.
+    #     fall back to the first available option for robustness.
     district_set = False
     if params.entryDistrict:
         try:
@@ -828,7 +880,6 @@ async def run(
         extract_receipt_fields=_extract_receipt_fields,
         poll_qr=False,
         timeout_secs=HANDOVER_TIMEOUT_SECS,
-        receipt_poll_secs=RECEIPT_POLL_SECS,
     )
 
 
