@@ -44,6 +44,12 @@ _STATE_ALIAS: dict[str, str] = {
     "MADHYA PRADESH": "MP",
     "M.P.": "MP",
     "UTTARAKHAND": "UK",
+    "HIMACHAL PRADESH": "HP",
+    "H.P.": "HP",
+    "BIHAR": "BR",
+    "TAMIL NADU": "TN",
+    "TAMILNADU": "TN",
+    "T.N.": "TN",
 }
 
 _STATE_DEFAULTS: dict[str, dict[str, str]] = {
@@ -98,11 +104,38 @@ _STATE_DEFAULTS: dict[str, dict[str, str]] = {
     "UK": {
         "taxMode": "DAYS",
         "entryDistrict": "DEHRADUN",
-        "entryCheckpoint": "",                       # "" → pick first checkpost
-        "serviceType": "Air Conditioned Service",    # AC default per spec
+        "entryCheckpoint": "",
+        "serviceType": "Air Conditioned Service",
         "permitType": "TEMPORARY PERMIT",
         "permitTypeFallback": "ALL INDIA TOURIST PERMIT",
-        "paymentMethod": "net_banking",              # no UPI on UK
+        "paymentMethod": "net_banking",
+    },
+    "HP": {
+        "taxMode": "DAYS",
+        "entryDistrict": "TIPRA",
+        "entryCheckpoint": "",
+        "serviceType": "NOT APPLICABLE",
+        "permitType": "TEMPORARY PERMIT",
+        "permitTypeFallback": "TEMPORARY PERMIT",
+        "paymentMethod": "net_banking",
+    },
+    "BR": {
+        "taxMode": "DAYS",
+        "entryDistrict": "PATNA",
+        "entryCheckpoint": "",
+        "serviceType": "NOT APPLICABLE",
+        "permitType": "TEMPORARY PERMIT",
+        "permitTypeFallback": "TEMPORARY PERMIT",
+        "paymentMethod": "net_banking",
+    },
+    "TN": {
+        "taxMode": "WEEKLY",
+        "entryDistrict": "KRISHNAGIRI",
+        "entryCheckpoint": "",
+        "serviceType": "NOT APPLICABLE",
+        "permitType": "ALL INDIA TOURIST PERMIT",
+        "permitTypeFallback": "CONTRACT CARRIAGE PERMIT",
+        "paymentMethod": "upi",
     },
 }
 
@@ -128,12 +161,18 @@ class BorderTaxParams(BaseModel):
         "MADHYA PRADESH",
         "UK",
         "UTTARAKHAND",
+        "HP",
+        "BR",
+        "HIMACHAL PRADESH",
+        "BIHAR",
+        "TN",
+        "TAMIL NADU",
     ] = "UP"
 
     # Tax modes supported across all states. Per-state validity is
     # enforced inside the state runner (e.g. PB rejects MONTHLY, MP
     # rejects everything except DAYS).
-    taxMode: Literal["DAYS", "MONTHLY", "QUARTERLY"] = "DAYS"
+    taxMode: Literal["DAYS", "WEEKLY", "MONTHLY", "QUARTERLY", "YEARLY"] = "DAYS"
 
     entryDistrict: str = ""
     entryCheckpoint: str = ""

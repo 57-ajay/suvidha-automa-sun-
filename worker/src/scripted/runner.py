@@ -46,6 +46,9 @@ _BORDER_TAX_STATE_MODULES: dict[str, str] = {
     "PB": "scripted.border_tax.pb",
     "MP": "scripted.border_tax.mp",
     "UK": "scripted.border_tax.uk",
+    "HP": "scripted.border_tax.hp",
+    "BR": "scripted.border_tax.br",
+    "TN": "scripted.border_tax.tn",
 }
 
 
@@ -66,6 +69,15 @@ _STATE_TO_CODE: dict[str, str] = {
     "UK": "UK",
     "U.K.": "UK",
     "UTTARAKHAND": "UK",
+    "HP": "HP",
+    "HIMACHAL PRADESH": "HP",
+    "H.P.": "HP",
+    "BR": "BR",
+    "BIHAR": "BR",
+    "TN": "TN",
+    "TAMIL NADU": "TN",
+    "TAMILNADU": "TN",
+    "T.N.": "TN",
 }
 
 
@@ -75,7 +87,7 @@ def normalize_state_code(state_or_name: str) -> str:
     return _STATE_TO_CODE.get(key, key)
 
 
-_NET_BANKING_SCRIPTED_STATES = {"UK"}
+_NET_BANKING_SCRIPTED_STATES = {"UK", "HP", "BR"}
 
 
 def state_is_net_banking_scripted(state_or_name: str) -> bool:

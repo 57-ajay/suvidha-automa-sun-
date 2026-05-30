@@ -57,6 +57,29 @@ export const STATE_DEFAULTS: Record<string, StateDefaults> = {
         permitTypeFallback: "ALL INDIA TOURIST PERMIT",
         paymentMethod: "net_banking",
     },
+    "HIMACHAL PRADESH": {
+        taxMode: "DAYS",
+        entryDistrict: "TIPRA",
+        serviceType: "NOT APPLICABLE",
+        permitType: "TEMPORARY PERMIT",
+        paymentMethod: "net_banking",
+    },
+    "BIHAR": {
+        taxMode: "DAYS",
+        entryDistrict: "PATNA",
+        serviceType: "NOT APPLICABLE",
+        permitType: "TEMPORARY PERMIT",
+        paymentMethod: "net_banking",
+    },
+    "TAMIL NADU": {
+        taxMode: "WEEKLY",
+        entryDistrict: "KRISHNAGIRI",
+        entryCheckpoint: "",
+        serviceType: "NOT APPLICABLE",
+        permitType: "ALL INDIA TOURIST PERMIT",
+        permitTypeFallback: "CONTRACT CARRIAGE PERMIT",
+        paymentMethod: "upi",
+    },
 };
 
 // ─── Apply defaults ────────────────────────────────────────────────────────

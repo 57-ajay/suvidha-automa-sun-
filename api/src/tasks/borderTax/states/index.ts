@@ -7,13 +7,23 @@ import { buildPrompt as buildUK } from "./uk";
 
 export type StateBuilder = (p: Record<string, string>) => Promise<string>;
 
+const scriptedOnlyStub =
+    (label: string): StateBuilder =>
+        async () =>
+            `[scripted-only] ${label} border-tax — the worker dispatches this by ` +
+            `state code; this prompt is never executed by the agent.`;
+
 export const STATE_BUILDERS: Record<string, StateBuilder> = {
     "UTTAR PRADESH": buildUP,
     "HARYANA": buildHR,
     "RAJASTHAN": buildRJ,
     "PUNJAB": buildPB,
     "MADHYA PRADESH": buildMP,
-    "UTTARAKHAND": buildUK
+    "UTTARAKHAND": buildUK,
+    // Scripted-only (form-fill then human handover; no AI):
+    "HIMACHAL PRADESH": scriptedOnlyStub("Himachal Pradesh"),
+    "BIHAR": scriptedOnlyStub("Bihar"),
+    "TAMIL NADU": scriptedOnlyStub("Tamil Nadu"),
 };
 
 export const STATE_ALIASES: Record<string, string> = {
@@ -26,6 +36,12 @@ export const STATE_ALIASES: Record<string, string> = {
     "M.P.": "MADHYA PRADESH",
     "UK": "UTTARAKHAND",
     "U.K.": "UTTARAKHAND",
+    "HP": "HIMACHAL PRADESH",
+    "H.P.": "HIMACHAL PRADESH",
+    "BR": "BIHAR",
+    "TN": "TAMIL NADU",
+    "T.N.": "TAMIL NADU",
+    "TAMILNADU": "TAMIL NADU",
 };
 
 export function resolveStateKey(input: string | undefined | null): string {

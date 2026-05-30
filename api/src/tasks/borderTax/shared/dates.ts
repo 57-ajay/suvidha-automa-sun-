@@ -62,6 +62,9 @@ const SAME_DAY_STATES = new Set([
 const NO_SAME_DAY_STATES = new Set([
     "PUNJAB",
     "HARYANA",
+    "HIMACHAL PRADESH",
+    "BIHAR",
+    "TAMIL NADU",
 ]);
 
 /**
