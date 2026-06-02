@@ -62,9 +62,13 @@ VC_HOME = "https://vcourts.gov.in/virtualcourt/index.php"
 # contain the target text, so a broad "select" works WITHOUT the exact id.
 SEL_DEPARTMENT_DROPDOWN = "select"
 
-# VC_SEARCH inputs — CONFIRM from live DOM.
-SEL_CHALLAN_INPUT = "input#TODO_challan_number"  # TODO
-SEL_VEHICLE_INPUT = "input#TODO_vehicle_number"  # TODO
+# VC_SEARCH — confirmed from live DOM.
+# The tab is an <a> whose label is in a nested <p>, so textContent match misses;
+# target its id directly. Clicking it activates the #nav-sbPoliceStation pane
+# that holds #challan_no.
+SEL_TAB_CHALLAN_VEHICLE = "a#mainMenuActive_police"  # "Challan/Vehicle No." tab
+SEL_CHALLAN_INPUT = "input#challan_no"
+# (no vehicle field in the challan-number search; add SEL_VEHICLE_INPUT if needed)
 
 # Pay/confirm-page inputs, IF this court asks for chassis/engine to verify
 # before payment. They are NOT on the search page. May not exist — the
@@ -134,25 +138,17 @@ async def run(
             run_log=log.dump(),
         )
 
-    # ── Phase 2: open Challan/Vehicle tab, pre-fill identifiers ─────────────
-    # The tab is usually an <a>; adjust `tag` if click_by_text can't find it.
-    await click_by_text(
-        session,
-        "Challan/Vehicle No.",
-        tag="a",
-        log=log,
-        name="vc.tab_challan_vehicle",
-    )
-
-    # Deterministic fills — leaves ONLY the captcha for the human.
+    # ── Phase 2: activate the Challan/Vehicle tab, fill the challan number ──
+    # Click the tab first (activates #nav-sbPoliceStation pane holding
+    # #challan_no), then fill — `fill` waits for the input to be visible.
+    await click(session, SEL_TAB_CHALLAN_VEHICLE, log=log, name="vc.tab_challan_vehicle")
     await fill(session, SEL_CHALLAN_INPUT, challan, log=log, name="vc.fill_challan")
-    await fill(session, SEL_VEHICLE_INPUT, veh, log=log, name="vc.fill_vehicle")
 
     # ── Phase 3: CAPTCHA = human checkpoint ─────────────────────────────────
     captcha_reason = (
-        f"Virtual Courts ({department}): challan {challan} and vehicle {veh} "
-        f"are pre-filled. Please read the CAPTCHA shown on screen, type it "
-        f"into 'Enter Captcha', click Submit, then reply 'done'."
+        f"Virtual Courts ({department}): challan {challan} is filled. "
+        f"Please read the CAPTCHA shown on screen, type it into 'Enter Captcha', "
+        f"click Submit, then reply 'done'."
     )
     t0 = time.monotonic()
     reply = await wait_for_human_via_redis(
