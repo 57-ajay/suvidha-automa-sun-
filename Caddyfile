@@ -1,5 +1,6 @@
 {$DOMAIN} {
     handle /api/* {
+        tls internal
         reverse_proxy api:3000
     }
 
