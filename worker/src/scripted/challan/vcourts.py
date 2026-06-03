@@ -200,7 +200,6 @@ async def run(
     # "View" button is the right one.
     await click_by_text(session, "View", tag="button", log=log, name="vc.open_record")
 
-    # ── Phase 4c: pre-fill the mobile number ONLY (no Get-OTP / verify) ──
     if not params.phoneNo:
         return RunOutcome(
             status="failed",
@@ -208,6 +207,14 @@ async def run(
             abort_reason="missing_phone",
             run_log=log.dump(),
         )
+
+    # ── Phase 4c: select the verify radio — it unhides the input fields ──
+    # (#incorrectsubmit's showOTP() reveals #otp_mobile_ce; we fill the
+    #  mobile number, NOT the chassis/engine boxes.)
+    await click(session, "#incorrectsubmit", log=log, name="vc.reveal_input_fields")
+
+    # ── Phase 4d: fill the mobile number ONLY (no Get-OTP / verify click) ─
+    # fill waits for visibility, so it holds until showOTP paints the field.
     await fill(session, "#otp_mobile_ce", params.phoneNo, log=log, name="vc.fill_otp_mobile")
 
     # If a UPI QR renders on the pay page, capture it so the client can show
