@@ -72,7 +72,7 @@ SEL_CHALLAN_INPUT = "input#challan_no"
 
 # ── Tunables ─────────────────────────────────────────────────────────────
 HUMAN_CAPTCHA_TIMEOUT = 600  # seconds the operator has to solve+submit
-HUMAN_PAYMENT_TIMEOUT = 300  # seconds the operator has to pay
+HUMAN_PAYMENT_TIMEOUT = 600  # seconds: human does OTP + payment in one handover
 SEARCH_HEADER_TIMEOUT = 20  # wait for VC_SEARCH to render after Proceed
 RESULTS_POLL_TIMEOUT = 30  # wait for VC_RESULTS after captcha+submit
 
@@ -200,22 +200,15 @@ async def run(
     # "View" button is the right one.
     await click_by_text(session, "View", tag="button", log=log, name="vc.open_record")
 
-    # ── Phase 4c: choose "pay by verifying Engine + Chassis" ────────────
-    # Built-in waits cover async loading: click waits for the radio to render
-    # after view(...) loads the detail; fill waits for the field to appear
-    # after the radio's showOTP('E') reveals it. No manual sleeps needed.
-    await click(session, "#incorrectsubmit", log=log, name="vc.choose_verify_path")
-
-    # ── Phase 4d: fill the last-4 verification fields ───────────────────
-    # Field is digits-only (isOnlyNumber on keypress). chassisNo[-4:] is the
-    # common case; if a chassis ever ends in letters, take last 4 numeric chars.
-    chassis_last4 = (params.chassisNo or "").strip()[-4:]  # MA3ZFDFSKSE191630 → "1630"
-    await fill(session, "#fcha_no_add", chassis_last4, log=log, name="vc.fill_chassis_last4")
-
-    # TODO: engine last-4 — radio says "Engine No AND Chassis No", so a sibling
-    # field almost certainly exists. Send its id, then add:
-    # engine_last4 = (params.engineNo or "").strip()[-4:]   # Z12ENF066904 → "6904"
-    # await fill(session, "#<engine_field_id>", engine_last4, log=log, name="vc.fill_engine_last4")
+    # ── Phase 4c: pre-fill the mobile number ONLY (no Get-OTP / verify) ──
+    if not params.phoneNo:
+        return RunOutcome(
+            status="failed",
+            summary="phoneNo is required for the OTP path.",
+            abort_reason="missing_phone",
+            run_log=log.dump(),
+        )
+    await fill(session, "#otp_mobile_ce", params.phoneNo, log=log, name="vc.fill_otp_mobile")
 
     # If a UPI QR renders on the pay page, capture it so the client can show
     # it. Best-effort — never block payment on this.
@@ -225,8 +218,9 @@ async def run(
         pass
 
     pay_reason = (
-        f"Virtual Courts ({department}): please complete the payment for "
-        f"challan {challan} (vehicle {veh}) in the browser, then reply 'done'."
+        f"Virtual Courts ({department}): challan {challan}, mobile {params.phoneNo} is filled. "
+        f"Click 'Get OTP', enter the OTP received on {params.phoneNo}, verify, then complete "
+        f"the payment in the browser, and reply 'done'."
     )
     t1 = time.monotonic()
     pay_reply = await wait_for_human_via_redis(

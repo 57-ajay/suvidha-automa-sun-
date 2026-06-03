@@ -23,6 +23,7 @@ class ChallanPaymentParams(BaseModel):
     # ── optional ──────────────────────────────────────────────────────────
     chassisNo: str | None = None
     engineNo: str | None = None
+    phoneNo: str | None = None
     # If provided, used VERBATIM as the Virtual Courts "Select Department"
     # option text. If omitted, the runner derives it from challanNo via
     # scripted.challan.dispatch.department_from_challan.
@@ -43,3 +44,11 @@ class ChallanPaymentParams(BaseModel):
     @classmethod
     def _strip_challan(cls, v: str) -> str:
         return (v or "").strip()
+
+    @field_validator("phoneNo")
+    @classmethod
+    def _normalize_phone(cls, v: str | None) -> str | None:
+        if not v:
+            return None
+        digits = re.sub(r"\D", "", v)
+        return digits[-10:] if digits else None  # strips +91 / spaces

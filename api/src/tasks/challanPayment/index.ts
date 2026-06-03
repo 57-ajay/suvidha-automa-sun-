@@ -22,7 +22,7 @@ export const challanPayment: Task = {
   id: "challan-payment",
   name: "Challan Payment (Virtual Courts)",
   requiredParams: ["requestId", "vehicleNumber", "challanNo"],
-  optionalParams: ["chassisNo", "engineNo", "department", "driverId"],
+  optionalParams: ["chassisNo", "engineNo", "phoneNo", "department", "driverId"],
   tools: [],
   buildPrompt: async (_p, _source) => {
     return "[scripted-only] challan-payment — worker dispatches by taskId; this prompt is not executed.";
