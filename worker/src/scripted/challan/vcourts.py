@@ -70,14 +70,8 @@ SEL_TAB_CHALLAN_VEHICLE = "a#mainMenuActive_police"  # "Challan/Vehicle No." tab
 SEL_CHALLAN_INPUT = "input#challan_no"
 # (no vehicle field in the challan-number search; add SEL_VEHICLE_INPUT if needed)
 
-# Pay/confirm-page inputs, IF this court asks for chassis/engine to verify
-# before payment. They are NOT on the search page. May not exist — the
-# fills below are wrapped in try/except. CONFIRM from live DOM.
-SEL_CHASSIS_INPUT = "input#TODO_chassis"  # TODO
-SEL_ENGINE_INPUT = "input#TODO_engine"  # TODO
-
 # ── Tunables ─────────────────────────────────────────────────────────────
-HUMAN_CAPTCHA_TIMEOUT = 200  # seconds the operator has to solve+submit
+HUMAN_CAPTCHA_TIMEOUT = 600  # seconds the operator has to solve+submit
 HUMAN_PAYMENT_TIMEOUT = 300  # seconds the operator has to pay
 SEARCH_HEADER_TIMEOUT = 20  # wait for VC_SEARCH to render after Proceed
 RESULTS_POLL_TIMEOUT = 30  # wait for VC_RESULTS after captcha+submit
@@ -141,7 +135,9 @@ async def run(
     # ── Phase 2: activate the Challan/Vehicle tab, fill the challan number ──
     # Click the tab first (activates #nav-sbPoliceStation pane holding
     # #challan_no), then fill — `fill` waits for the input to be visible.
-    await click(session, SEL_TAB_CHALLAN_VEHICLE, log=log, name="vc.tab_challan_vehicle")
+    await click(
+        session, SEL_TAB_CHALLAN_VEHICLE, log=log, name="vc.tab_challan_vehicle"
+    )
     await fill(session, SEL_CHALLAN_INPUT, challan, log=log, name="vc.fill_challan")
 
     # ── Phase 3: CAPTCHA = human checkpoint ─────────────────────────────────
@@ -199,40 +195,27 @@ async def run(
             run_log=log.dump(),
         )
 
-    # TODO (Phase 4b): locate the record row whose "Challan No." matches
-    # `challan` and click its View / Pay control. The selector depends on the
-    # results markup — grab it from the live DOM. Rough shape once known:
-    #
-    #   await click(session, f"a[data-challan='{challan}']", log=log, name="vc.open_record")
-    #
-    # or scan rows with a small _cdp_eval that finds the row containing
-    # `challan` and clicks its pay button.
+    # ── Phase 4b: open the matching record ──────────────────────────────
+    # Searched by exact challan number → single record → the lone green
+    # "View" button is the right one.
+    await click_by_text(session, "View", tag="button", log=log, name="vc.open_record")
 
-    # ── Phase 5: PAYMENT = human checkpoint ─────────────────────────────────
-    # If the pay/confirm page asks for chassis/engine, fill them first. These
-    # may not exist on every court's page, hence the try/except.
-    if params.chassisNo:
-        try:
-            await fill(
-                session,
-                SEL_CHASSIS_INPUT,
-                params.chassisNo,
-                log=log,
-                name="vc.fill_chassis",
-            )
-        except Exception:
-            pass
-    if params.engineNo:
-        try:
-            await fill(
-                session,
-                SEL_ENGINE_INPUT,
-                params.engineNo,
-                log=log,
-                name="vc.fill_engine",
-            )
-        except Exception:
-            pass
+    # ── Phase 4c: choose "pay by verifying Engine + Chassis" ────────────
+    # Built-in waits cover async loading: click waits for the radio to render
+    # after view(...) loads the detail; fill waits for the field to appear
+    # after the radio's showOTP('E') reveals it. No manual sleeps needed.
+    await click(session, "#incorrectsubmit", log=log, name="vc.choose_verify_path")
+
+    # ── Phase 4d: fill the last-4 verification fields ───────────────────
+    # Field is digits-only (isOnlyNumber on keypress). chassisNo[-4:] is the
+    # common case; if a chassis ever ends in letters, take last 4 numeric chars.
+    chassis_last4 = (params.chassisNo or "").strip()[-4:]  # MA3ZFDFSKSE191630 → "1630"
+    await fill(session, "#fcha_no_add", chassis_last4, log=log, name="vc.fill_chassis_last4")
+
+    # TODO: engine last-4 — radio says "Engine No AND Chassis No", so a sibling
+    # field almost certainly exists. Send its id, then add:
+    # engine_last4 = (params.engineNo or "").strip()[-4:]   # Z12ENF066904 → "6904"
+    # await fill(session, "#<engine_field_id>", engine_last4, log=log, name="vc.fill_engine_last4")
 
     # If a UPI QR renders on the pay page, capture it so the client can show
     # it. Best-effort — never block payment on this.
