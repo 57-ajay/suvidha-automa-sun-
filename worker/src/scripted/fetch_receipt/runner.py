@@ -41,6 +41,7 @@ from .params import FetchReceiptParams
 URL_REPORT_PAGE = (
     "https://services.parivahan.gov.in/checkpostv4/#/public/reports/PaymentReceipt"
 )
+URL_PORTAL_HOME = "https://services.parivahan.gov.in/checkpostv4/#/"
 
 SEL_STATE_DROPDOWN = "select#inputState"
 SEL_VEHICLE_INPUT = "input#inputVehicleNo"
@@ -234,12 +235,23 @@ async def run(
     job_params = params.model_dump()
 
     # ─── Phase 1: open the report page ────────────────────────────────
+    # checkpostv4's Angular app rewrites deep-links to "/" when they're the
+    # FIRST navigation (same quirk the border-tax pending-clear flow works
+    # around). Cold-load the home shell, let the router bootstrap, THEN
+    # switch to the reports route as a client-side hash change so it sticks.
     await navigate(
         session,
-        URL_REPORT_PAGE,
+        URL_PORTAL_HOME,
         log=log,
-        name="phase1.open_report_page",
+        name="phase1.open_home",
     )
+    await sleep_seconds(2.5, log=log, name="phase1.settle_home")
+
+    await _cdp_eval(
+        session,
+        "window.location.hash = '#/public/reports/PaymentReceipt';",
+    )
+
     await wait_for_selector(
         session,
         SEL_STATE_DROPDOWN,
