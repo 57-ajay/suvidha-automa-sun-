@@ -205,6 +205,7 @@ _MP_PAYMENT_CONFIG = PaymentCaptureConfig(
     state_name="Madhya Pradesh",
     qr_selector=SEL_QR_TIMER,  # div#countDownTimer — disappears w/ QR
     receipt_markers=[
+        "Transport Department of MADHYA PRADESH",
         "GOVERNMENT OF MADHYA PRADESH",
         "CHECKPOST TAX E-RECEIPT",
         "RECEIPT NO",
@@ -921,7 +922,11 @@ async def run(
 
     if params.source == "web":
         return await web_handover_and_capture(
-            session, log, r, job_id, job_params,
+            session,
+            log,
+            r,
+            job_id,
+            job_params,
             vehicle_number=params.vehicleNumber,
             config=_MP_PAYMENT_CONFIG,
             extract_receipt_fields=_extract_receipt_fields,
@@ -1162,7 +1167,11 @@ async def run(
     )
 
     return await wait_for_payment_and_capture_receipt(
-        session, log, r, job_id, job_params,
+        session,
+        log,
+        r,
+        job_id,
+        job_params,
         vehicle_number=params.vehicleNumber,
         config=_MP_PAYMENT_CONFIG,
         extract_receipt_fields=_extract_receipt_fields,
