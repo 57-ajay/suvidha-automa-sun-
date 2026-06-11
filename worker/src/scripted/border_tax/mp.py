@@ -205,11 +205,10 @@ _MP_PAYMENT_CONFIG = PaymentCaptureConfig(
     state_name="Madhya Pradesh",
     qr_selector=SEL_QR_TIMER,  # div#countDownTimer — disappears w/ QR
     receipt_markers=[
-        "Transport Department of MADHYA PRADESH",
-        "GOVERNMENT OF MADHYA PRADESH",
         "CHECKPOST TAX E-RECEIPT",
         "RECEIPT NO",
         "GRAND TOTAL",
+        "MADHYA PRADESH",
     ],
     positive_markers_regex=[
         r"payment\s*successful",

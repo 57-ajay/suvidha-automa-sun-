@@ -128,7 +128,7 @@ SEL_TAX_UPTO = "input#uptpDate"
 # more robust than matching by text.
 _TAX_MODE_VALUES = {
     "DAYS": "1",
-    "MONTHLY": "3",      # best-effort; not every state exposes monthly
+    "MONTHLY": "3",  # best-effort; not every state exposes monthly
     "QUARTERLY": "5",
     "YEARLY": "7",
 }
@@ -136,10 +136,10 @@ _TAX_MODE_VALUES = {
 
 # ─── Tuning ────────────────────────────────────────────────────────────
 
-PHASE_GAP_SECS = 1.5             # polite breath between phases
-PERMIT_SET_TIMEOUT_SECS = 15     # per-attempt timeout when setting permit type
+PHASE_GAP_SECS = 1.5  # polite breath between phases
+PERMIT_SET_TIMEOUT_SECS = 15  # per-attempt timeout when setting permit type
 CHECKPOINT_POPULATE_TIMEOUT = 10
-HANDOVER_TIMEOUT_SECS = 900      # 15 minutes (human captcha + payment window)
+HANDOVER_TIMEOUT_SECS = 900  # 15 minutes (human captcha + payment window)
 
 
 # ─── Config ────────────────────────────────────────────────────────────
@@ -149,8 +149,8 @@ HANDOVER_TIMEOUT_SECS = 900      # 15 minutes (human captcha + payment window)
 class StateHandoverConfig:
     """Per-state knobs for the form-fill-then-handover flow."""
 
-    state_code: str                          # parivahan <option value>, e.g. "HP"
-    state_name: str                          # human-readable, e.g. "Himachal Pradesh"
+    state_code: str  # parivahan <option value>, e.g. "HP"
+    state_name: str  # human-readable, e.g. "Himachal Pradesh"
     checkpost_strategy: Literal["match_district", "first_option"]
     payment_config: PaymentCaptureConfig
     extract_receipt_fields: Callable[..., Awaitable[dict | None]]
@@ -263,29 +263,33 @@ async def _select_checkpoint_with_fallback(
     while True:
         res = await _cdp_eval(session, expr_template)
         if res and res.get("ok"):
-            log.record(StepLog(
-                index=log.next_index(),
-                name=name,
-                status=StepStatus.OK,
-                duration_ms=int((time.monotonic() - started) * 1000),
-                selector=selector,
-                value=(
-                    f"{res.get('selected')} (value={res.get('value')}, "
-                    f"fallback={res.get('fallback_used')})"
-                ),
-            ))
+            log.record(
+                StepLog(
+                    index=log.next_index(),
+                    name=name,
+                    status=StepStatus.OK,
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                    selector=selector,
+                    value=(
+                        f"{res.get('selected')} (value={res.get('value')}, "
+                        f"fallback={res.get('fallback_used')})"
+                    ),
+                )
+            )
             return res
         if res:
             last_reason = res.get("reason", "no_result")
         if time.monotonic() > deadline:
-            log.record(StepLog(
-                index=log.next_index(),
-                name=name,
-                status=StepStatus.FAILED,
-                duration_ms=int((time.monotonic() - started) * 1000),
-                selector=selector,
-                error=f"checkpost not selectable: {last_reason}",
-            ))
+            log.record(
+                StepLog(
+                    index=log.next_index(),
+                    name=name,
+                    status=StepStatus.FAILED,
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                    selector=selector,
+                    error=f"checkpost not selectable: {last_reason}",
+                )
+            )
             return {"ok": False, "reason": last_reason}
         await asyncio.sleep(0.5)
 
@@ -336,8 +340,13 @@ async def _select_tax_mode(
         "    return {ok:false, labels:labels};"
         "  }"
         "  return {ok:false, labels:[]};"
-        "})(" + json.dumps(SEL_TAX_MODE_CANDIDATES) + ", "
-        + json.dumps(want_value) + ", " + json.dumps(want_text) + ")"
+        "})("
+        + json.dumps(SEL_TAX_MODE_CANDIDATES)
+        + ", "
+        + json.dumps(want_value)
+        + ", "
+        + json.dumps(want_text)
+        + ")"
     )
     nudge_js = (
         "(function(sels){"
@@ -361,15 +370,17 @@ async def _select_tax_mode(
     while time.monotonic() < deadline:
         res = await _cdp_eval(session, select_js)
         if res and res.get("ok"):
-            log.record(StepLog(
-                index=log.next_index(),
-                name=f"phase5.select_tax_mode[{desired}]",
-                status=StepStatus.OK,
-                duration_ms=int((time.monotonic() - started) * 1000),
-                selector=SEL_TAX_MODE_CANDIDATES[0],
-                value=f"{res.get('text')} (value={res.get('value')}); "
-                f"offered={res.get('labels')}",
-            ))
+            log.record(
+                StepLog(
+                    index=log.next_index(),
+                    name=f"phase5.select_tax_mode[{desired}]",
+                    status=StepStatus.OK,
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                    selector=SEL_TAX_MODE_CANDIDATES[0],
+                    value=f"{res.get('text')} (value={res.get('value')}); "
+                    f"offered={res.get('labels')}",
+                )
+            )
             return True, list(res.get("labels") or [])
         if res:
             last_labels = list(res.get("labels") or []) or last_labels
@@ -380,14 +391,16 @@ async def _select_tax_mode(
             nudged = True
         await asyncio.sleep(0.5)
 
-    log.record(StepLog(
-        index=log.next_index(),
-        name=f"phase5.select_tax_mode[{desired}]",
-        status=StepStatus.FAILED,
-        duration_ms=int((time.monotonic() - started) * 1000),
-        selector=SEL_TAX_MODE_CANDIDATES[0],
-        error=f"tax mode {desired!r} not found; available={last_labels}",
-    ))
+    log.record(
+        StepLog(
+            index=log.next_index(),
+            name=f"phase5.select_tax_mode[{desired}]",
+            status=StepStatus.FAILED,
+            duration_ms=int((time.monotonic() - started) * 1000),
+            selector=SEL_TAX_MODE_CANDIDATES[0],
+            error=f"tax mode {desired!r} not found; available={last_labels}",
+        )
+    )
     return False, last_labels
 
 
@@ -413,7 +426,8 @@ async def _set_date_like(
         session,
         "(function(s){var e=document.querySelector(s);"
         "return e?((e.getAttribute('type')||e.type||'')).toLowerCase():'';})("
-        + json.dumps(selector) + ")",
+        + json.dumps(selector)
+        + ")",
     )
     if (input_type or "") == "datetime-local":
         value = f"{iso_date}T00:00"
@@ -424,7 +438,8 @@ async def _set_date_like(
     actual = await _cdp_eval(
         session,
         "(function(s){var e=document.querySelector(s);return e?(e.value||''):'';})("
-        + json.dumps(selector) + ")",
+        + json.dumps(selector)
+        + ")",
     )
     return str(actual or "")
 
@@ -451,48 +466,83 @@ async def run_handover_flow(
 
     # ─── Phase 1: parivahan landing ────────────────────────────────────
     await navigate(
-        session, "https://parivahan.gov.in/en/node/579",
-        log=log, name="phase1.open_parivahan",
+        session,
+        "https://parivahan.gov.in/en/node/579",
+        log=log,
+        name="phase1.open_parivahan",
     )
     await wait_for_selector(
-        session, SEL_STATE_DROPDOWN, log=log, name="phase1.wait_state_dropdown",
+        session,
+        SEL_STATE_DROPDOWN,
+        log=log,
+        name="phase1.wait_state_dropdown",
     )
     await select_by_value(
-        session, SEL_STATE_DROPDOWN, sc, log=log, name=f"phase1.select_state_{tag}",
+        session,
+        SEL_STATE_DROPDOWN,
+        sc,
+        log=log,
+        name=f"phase1.select_state_{tag}",
     )
     await wait_for_url(
-        session, "checkpostv4", log=log, name="phase1.wait_service_page",
+        session,
+        "checkpostv4",
+        log=log,
+        name="phase1.wait_service_page",
     )
     await sleep_seconds(PHASE_GAP_SECS, log=log, name="phase1.settle")
 
     # ─── Phase 2: service selection ────────────────────────────────────
     await wait_for_selector(
-        session, SEL_SERVICE_DROPDOWN, log=log,
-        name="phase2.wait_service_dropdown", timeout=45,
+        session,
+        SEL_SERVICE_DROPDOWN,
+        log=log,
+        name="phase2.wait_service_dropdown",
+        timeout=45,
     )
     await select_by_text(
-        session, SEL_SERVICE_DROPDOWN, "VEHICLE TAX COLLECTION (OTHER STATE)",
-        log=log, name="phase2.select_service",
+        session,
+        SEL_SERVICE_DROPDOWN,
+        "VEHICLE TAX COLLECTION (OTHER STATE)",
+        log=log,
+        name="phase2.select_service",
     )
     await click_by_text(
-        session, "Go", log=log, name="phase2.click_go", tag="button",
+        session,
+        "Go",
+        log=log,
+        name="phase2.click_go",
+        tag="button",
     )
     await wait_for_url(
-        session, "taxCollectionOnline", log=log, name="phase2.wait_owner_info_page",
+        session,
+        "taxCollectionOnline",
+        log=log,
+        name="phase2.wait_owner_info_page",
     )
     await sleep_seconds(PHASE_GAP_SECS, log=log, name="phase2.settle")
 
     # ─── Phase 3: owner information ────────────────────────────────────
     await wait_for_selector(
-        session, SEL_VEHICLE_INPUT, log=log,
-        name="phase3.wait_vehicle_input", timeout=30,
+        session,
+        SEL_VEHICLE_INPUT,
+        log=log,
+        name="phase3.wait_vehicle_input",
+        timeout=30,
     )
     await fill(
-        session, SEL_VEHICLE_INPUT, params.vehicleNumber,
-        log=log, name="phase3.fill_vehicle",
+        session,
+        SEL_VEHICLE_INPUT,
+        params.vehicleNumber,
+        log=log,
+        name="phase3.fill_vehicle",
     )
     await click_by_text(
-        session, "Get Details", log=log, name="phase3.click_get_details", tag="button",
+        session,
+        "Get Details",
+        log=log,
+        name="phase3.click_get_details",
+        tag="button",
     )
 
     # Owner-info outcome routing. For these states we do NOT auto-clear a
@@ -542,8 +592,11 @@ async def run_handover_flow(
     if params.entryDistrict:
         try:
             await select_by_text(
-                session, SEL_DISTRICT, params.entryDistrict,
-                log=log, name="phase3.select_district",
+                session,
+                SEL_DISTRICT,
+                params.entryDistrict,
+                log=log,
+                name="phase3.select_district",
             )
             district_set = True
         except Exception:
@@ -560,8 +613,11 @@ async def run_handover_flow(
                 run_log=log.dump(),
             )
         await select_by_value(
-            session, SEL_DISTRICT, opt["value"],
-            log=log, name="phase3.select_district_first",
+            session,
+            SEL_DISTRICT,
+            opt["value"],
+            log=log,
+            name="phase3.select_district_first",
         )
         district_text = opt.get("text", "") or district_text
 
@@ -575,8 +631,11 @@ async def run_handover_flow(
         district_text if config.checkpost_strategy == "match_district" else ""
     )
     cp = await _select_checkpoint_with_fallback(
-        session, SEL_CHECKPOINT, desired_checkpost,
-        log=log, name="phase3.select_checkpost",
+        session,
+        SEL_CHECKPOINT,
+        desired_checkpost,
+        log=log,
+        name="phase3.select_checkpost",
     )
     if not cp.get("ok"):
         return RunOutcome(
@@ -587,7 +646,11 @@ async def run_handover_flow(
         )
 
     await click_by_text(
-        session, "Next", log=log, name="phase3.click_next", tag="button",
+        session,
+        "Next",
+        log=log,
+        name="phase3.click_next",
+        tag="button",
     )
     await sleep_seconds(PHASE_GAP_SECS, log=log, name="phase3.settle")
 
@@ -603,14 +666,21 @@ async def run_handover_flow(
     _close_sel = "button.swal2-confirm, .modal-footer button, .swal-button--confirm"
 
     await abort_if_popup_text(
-        session, _validity_keywords, _validity_abort,
-        log=log, name="phase4.check_validity_on_load", close_selector=_close_sel,
+        session,
+        _validity_keywords,
+        _validity_abort,
+        log=log,
+        name="phase4.check_validity_on_load",
+        close_selector=_close_sel,
     )
 
     # Permit Type select is the earliest reliable "form ready" signal.
     await wait_for_selector(
-        session, SEL_PERMIT_TYPE, log=log,
-        name="phase4.wait_vehicle_info_page", timeout=30,
+        session,
+        SEL_PERMIT_TYPE,
+        log=log,
+        name="phase4.wait_vehicle_info_page",
+        timeout=30,
     )
 
     # 4a. Vehicle Category — leave if pre-filled, else first option.
@@ -624,18 +694,23 @@ async def run_handover_flow(
         )
         if opt.get("ok"):
             await select_by_value(
-                session, SEL_VEHICLE_CATEGORY, opt["value"],
-                log=log, name="phase4.select_vehicle_category_first",
+                session,
+                SEL_VEHICLE_CATEGORY,
+                opt["value"],
+                log=log,
+                name="phase4.select_vehicle_category_first",
             )
             await asyncio.sleep(1.0)
         else:
-            log.record(StepLog(
-                index=log.next_index(),
-                name="phase4.vehicle_category_empty",
-                status=StepStatus.RETRIED,
-                value="<empty>",
-                error="Vehicle Category empty and no options; proceeding.",
-            ))
+            log.record(
+                StepLog(
+                    index=log.next_index(),
+                    name="phase4.vehicle_category_empty",
+                    status=StepStatus.RETRIED,
+                    value="<empty>",
+                    error="Vehicle Category empty and no options; proceeding.",
+                )
+            )
 
     # 4b. Permit Type — leave if pre-filled, else primary + fallback chain.
     permit_val = await get_select_value(session, SEL_PERMIT_TYPE)
@@ -654,7 +729,10 @@ async def run_handover_flow(
         for cand in permit_candidates:
             try:
                 await select_by_text(
-                    session, SEL_PERMIT_TYPE, cand, log=log,
+                    session,
+                    SEL_PERMIT_TYPE,
+                    cand,
+                    log=log,
                     name=f"phase4.select_permit_type[{cand}]",
                     timeout=PERMIT_SET_TIMEOUT_SECS,
                 )
@@ -669,7 +747,10 @@ async def run_handover_flow(
             )
             if opt.get("ok"):
                 await select_by_value(
-                    session, SEL_PERMIT_TYPE, opt["value"], log=log,
+                    session,
+                    SEL_PERMIT_TYPE,
+                    opt["value"],
+                    log=log,
                     name="phase4.select_permit_type_first",
                 )
                 permit_set = True
@@ -688,8 +769,11 @@ async def run_handover_flow(
         # Let Angular react before Service Type's options are queried.
         await asyncio.sleep(1.5)
         await abort_if_popup_text(
-            session, _validity_keywords, _validity_abort,
-            log=log, name="phase4.check_validity_after_permit",
+            session,
+            _validity_keywords,
+            _validity_abort,
+            log=log,
+            name="phase4.check_validity_after_permit",
             close_selector=_close_sel,
         )
 
@@ -702,8 +786,11 @@ async def run_handover_flow(
     if not service_val:
         try:
             await select_by_text(
-                session, SEL_SERVICE_TYPE, params.serviceType,
-                log=log, name="phase4.select_service_type",
+                session,
+                SEL_SERVICE_TYPE,
+                params.serviceType,
+                log=log,
+                name="phase4.select_service_type",
             )
         except Exception as e:
             opt = await _first_non_placeholder_option(
@@ -711,7 +798,10 @@ async def run_handover_flow(
             )
             if opt.get("ok"):
                 await select_by_value(
-                    session, SEL_SERVICE_TYPE, opt["value"], log=log,
+                    session,
+                    SEL_SERVICE_TYPE,
+                    opt["value"],
+                    log=log,
                     name="phase4.select_service_type_first",
                 )
             else:
@@ -727,19 +817,30 @@ async def run_handover_flow(
                 )
         await asyncio.sleep(1.0)
         await abort_if_popup_text(
-            session, _validity_keywords, _validity_abort,
-            log=log, name="phase4.check_validity_after_service",
+            session,
+            _validity_keywords,
+            _validity_abort,
+            log=log,
+            name="phase4.check_validity_after_service",
             close_selector=_close_sel,
         )
 
     await click_by_text(
-        session, "Next", log=log, name="phase4.click_next", tag="button",
+        session,
+        "Next",
+        log=log,
+        name="phase4.click_next",
+        tag="button",
     )
     await sleep_seconds(PHASE_GAP_SECS, log=log, name="phase4.settle")
 
     # ─── Phase 5: tax information ──────────────────────────────────────
     await wait_for_selector(
-        session, SEL_TAX_FROM, log=log, name="phase5.wait_tax_page", timeout=30,
+        session,
+        SEL_TAX_FROM,
+        log=log,
+        name="phase5.wait_tax_page",
+        timeout=30,
     )
 
     # Diagnostic: record exactly what taxMode reached the runner (so the
@@ -747,15 +848,17 @@ async def run_handover_flow(
     # of the caller's taxMode). The available modes are vehicle-specific —
     # the parivahan portal renders different Tax Mode options per RC — so a
     # requested mode may legitimately not be offered for a given vehicle.
-    log.record(StepLog(
-        index=log.next_index(),
-        name="phase5.requested_tax_mode",
-        status=StepStatus.OK,
-        value=(
-            f"requested taxMode={params.taxMode!r}, "
-            f"taxFrom={params.taxFrom}, taxUpto={params.taxUpto}"
-        ),
-    ))
+    log.record(
+        StepLog(
+            index=log.next_index(),
+            name="phase5.requested_tax_mode",
+            status=StepStatus.OK,
+            value=(
+                f"requested taxMode={params.taxMode!r}, "
+                f"taxFrom={params.taxFrom}, taxUpto={params.taxUpto}"
+            ),
+        )
+    )
 
     # 5a. Tax Mode. The parivahan portal renders different Tax Mode options
     #     per RC (DAYS=1, QUARTERLY=5, YEARLY=7 when offered), so the
@@ -763,7 +866,10 @@ async def run_handover_flow(
     #     by <option> value (robust to the leading space in the option text),
     #     re-querying the live <select> for up to 30s to absorb async render.
     mode_ok, available_modes = await _select_tax_mode(
-        session, params.taxMode, log=log, timeout=30,
+        session,
+        params.taxMode,
+        log=log,
+        timeout=30,
     )
     if not mode_ok:
         offered = ", ".join(available_modes) if available_modes else "none"
@@ -787,7 +893,11 @@ async def run_handover_flow(
     #     rejected). Re-filling here also re-asserts the value in case the
     #     tax-mode selection reset it.
     tf_actual = await _set_date_like(
-        session, SEL_TAX_FROM, params.taxFrom, log=log, name="phase5.fill_tax_from",
+        session,
+        SEL_TAX_FROM,
+        params.taxFrom,
+        log=log,
+        name="phase5.fill_tax_from",
     )
     if not tf_actual or not tf_actual.startswith(params.taxFrom):
         return RunOutcome(
@@ -805,7 +915,10 @@ async def run_handover_flow(
     #     auto-derives (and disables) this field. Same type-aware fill.
     if params.taxMode == "DAYS":
         tu_actual = await _set_date_like(
-            session, SEL_TAX_UPTO, params.taxUpto, log=log,
+            session,
+            SEL_TAX_UPTO,
+            params.taxUpto,
+            log=log,
             name="phase5.fill_tax_upto",
         )
         if not tu_actual or not tu_actual.startswith(params.taxUpto):
@@ -821,26 +934,37 @@ async def run_handover_flow(
                 run_log=log.dump(),
             )
     else:
-        log.record(StepLog(
-            index=log.next_index(),
-            name="phase5.skip_tax_upto",
-            status=StepStatus.OK,
-            value=f"taxMode={params.taxMode}: Tax Upto auto-derived, not filled",
-        ))
+        log.record(
+            StepLog(
+                index=log.next_index(),
+                name="phase5.skip_tax_upto",
+                status=StepStatus.OK,
+                value=f"taxMode={params.taxMode}: Tax Upto auto-derived, not filled",
+            )
+        )
 
     await sleep_seconds(1, log=log, name="phase5.wait_before_calc")
     await click_by_text(
-        session, "Calculate Fee/Tax", log=log,
-        name="phase5.click_calculate", tag="button",
+        session,
+        "Calculate Fee/Tax",
+        log=log,
+        name="phase5.click_calculate",
+        tag="button",
     )
     await sleep_seconds(4, log=log, name="phase5.wait_calculation")
 
     await extract_and_save_border_tax_amount(
-        session, log=log, name="phase5.extract_border_tax_amount",
+        session,
+        log=log,
+        name="phase5.extract_border_tax_amount",
     )
 
     await click_by_text(
-        session, "Next", log=log, name="phase5.click_next", tag="button",
+        session,
+        "Next",
+        log=log,
+        name="phase5.click_next",
+        tag="button",
     )
     await sleep_seconds(PHASE_GAP_SECS, log=log, name="phase5.settle")
 
@@ -854,7 +978,11 @@ async def run_handover_flow(
     # never block on an explicit human "done". poll_qr=False: the human
     # operates the browser directly, so there is no in-app QR to surface.
     return await web_handover_and_capture(
-        session, log, r, job_id, job_params,
+        session,
+        log,
+        r,
+        job_id,
+        job_params,
         vehicle_number=params.vehicleNumber,
         config=config.payment_config,
         extract_receipt_fields=config.extract_receipt_fields,

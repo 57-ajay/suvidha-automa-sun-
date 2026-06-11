@@ -69,9 +69,18 @@ from ._handover_runner import StateHandoverConfig, run_handover_flow
 # ─── Receipt parsing ───────────────────────────────────────────────────
 
 _MONTH_TO_NUM = {
-    "JAN": "01", "FEB": "02", "MAR": "03", "APR": "04",
-    "MAY": "05", "JUN": "06", "JUL": "07", "AUG": "08",
-    "SEP": "09", "OCT": "10", "NOV": "11", "DEC": "12",
+    "JAN": "01",
+    "FEB": "02",
+    "MAR": "03",
+    "APR": "04",
+    "MAY": "05",
+    "JUN": "06",
+    "JUL": "07",
+    "AUG": "08",
+    "SEP": "09",
+    "OCT": "10",
+    "NOV": "11",
+    "DEC": "12",
 }
 
 
@@ -101,22 +110,25 @@ async def _extract_receipt_fields(session, vehicle_number: str) -> dict | None:
         return None
 
     receipt_match = re.search(
-        r"Receipt\s*No\.?\s*:?\s*([A-Z0-9]+)", text, re.IGNORECASE,
+        r"Receipt\s*No\.?\s*:?\s*([A-Z0-9]+)",
+        text,
+        re.IGNORECASE,
     )
     receipt_number = receipt_match.group(1) if receipt_match else None
 
     amount_match = re.search(
-        r"Grand\s*Total\s*:?\s*(\d+(?:\.\d+)?)", text, re.IGNORECASE,
+        r"Grand\s*Total\s*:?\s*(\d+(?:\.\d+)?)",
+        text,
+        re.IGNORECASE,
     )
     amount = amount_match.group(1) if amount_match else None
 
     date_match = re.search(
         r"Payment\s*Confirmation\s*Date\s*:?\s*([\d]{1,2}-\w{3}-\d{4})",
-        text, re.IGNORECASE,
+        text,
+        re.IGNORECASE,
     )
-    payment_date = (
-        _normalize_receipt_date(date_match.group(1)) if date_match else None
-    )
+    payment_date = _normalize_receipt_date(date_match.group(1)) if date_match else None
 
     if not (receipt_number or amount):
         return None
@@ -138,8 +150,8 @@ _UK_PAYMENT_CONFIG = PaymentCaptureConfig(
     receipt_markers=[
         "GOVERNMENT OF UTTARAKHAND",
         "CHECKPOST TAX E-RECEIPT",
-        "RECEIPT NO",
-        "GRAND TOTAL",
+        "Receipt No",
+        # "GRAND TOTAL",
     ],
     positive_markers_regex=[
         r"payment\s*successful",
@@ -162,7 +174,7 @@ _UK_PAYMENT_CONFIG = PaymentCaptureConfig(
 _UK_CONFIG = StateHandoverConfig(
     state_code="UK",
     state_name="Uttarakhand",
-    checkpost_strategy="first_option",   # ASHARODI/KULHAL/TIMLI/TUNI ≠ district
+    checkpost_strategy="first_option",  # ASHARODI/KULHAL/TIMLI/TUNI ≠ district
     payment_config=_UK_PAYMENT_CONFIG,
     extract_receipt_fields=_extract_receipt_fields,
 )
