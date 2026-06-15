@@ -4,6 +4,7 @@ import type { JobSource } from "./tasks/types";
 import { handleSaveChallans, type InternalRequest } from "./internal/challanSettlement/challans";
 import { handleSaveDiscounts } from "./internal/challanSettlement/discounts";
 import { handleSaveReceipt } from "./internal/borderTax/receipt";
+import { handleSaveChallanReceipt } from "./internal/challanPayment/receipt";
 import { releaseAgentSlot, saveAgentCost } from "./internal/agentConfig";
 import { saveAgentWorkSummary } from "./internal/agentWorkSummary";
 import { DASHBOARD_HTML } from "./dashboard";
@@ -525,6 +526,103 @@ const server = Bun.serve({
                     return Response.json(result, { status });
                 } catch (e: any) {
                     console.error("[API] ERROR save_receipt:", e);
+                    return Response.json({ ok: false, error: e.message }, { status: 500 });
+                }
+            }
+
+            // ── Challan-payment receipt save (multipart/form-data with PDF) ──────────
+            if (req.method === "POST" && url.pathname === "/api/internal/challan-payment/save-receipt") {
+                try {
+                    const contentType = req.headers.get("content-type") || "";
+                    if (!contentType.toLowerCase().includes("multipart/form-data")) {
+                        console.log(
+                            `[API] POST /api/internal/challan-payment/save-receipt` +
+                            ` | FAIL: wrong content-type=${contentType}`
+                        );
+                        return Response.json(
+                            { ok: false, error: `Expected multipart/form-data, got: ${contentType}` },
+                            { status: 400 }
+                        );
+                    }
+
+                    const formData = await req.formData();
+                    const pdfFile  = formData.get("pdf");
+                    const jobIdField = formData.get("jobId");
+                    const paramsRaw  = formData.get("params");
+                    const dataRaw    = formData.get("data");
+
+                    if (!pdfFile || !(pdfFile instanceof Blob)) {
+                        return Response.json(
+                            { ok: false, error: "Missing or invalid 'pdf' part" },
+                            { status: 400 }
+                        );
+                    }
+                    if (typeof jobIdField !== "string" || !jobIdField) {
+                        return Response.json(
+                            { ok: false, error: "Missing 'jobId' field" },
+                            { status: 400 }
+                        );
+                    }
+                    if (typeof paramsRaw !== "string") {
+                        return Response.json(
+                            { ok: false, error: "Missing 'params' field" },
+                            { status: 400 }
+                        );
+                    }
+                    if (typeof dataRaw !== "string") {
+                        return Response.json(
+                            { ok: false, error: "Missing 'data' field" },
+                            { status: 400 }
+                        );
+                    }
+
+                    let parsedParams: Record<string, string>;
+                    let parsedData: unknown;
+                    try {
+                        parsedParams = JSON.parse(paramsRaw);
+                    } catch (e: any) {
+                        return Response.json(
+                            { ok: false, error: `'params' is not valid JSON: ${e.message}` },
+                            { status: 400 }
+                        );
+                    }
+                    try {
+                        parsedData = JSON.parse(dataRaw);
+                    } catch (e: any) {
+                        return Response.json(
+                            { ok: false, error: `'data' is not valid JSON: ${e.message}` },
+                            { status: 400 }
+                        );
+                    }
+
+                    const pdfBuffer = Buffer.from(await pdfFile.arrayBuffer());
+
+                    console.log(
+                        `[API] POST /api/internal/challan-payment/save-receipt | ` +
+                        `jobId=${jobIdField} pdf=${pdfBuffer.length} bytes ` +
+                        `params=${JSON.stringify(parsedParams)} ` +
+                        `data=${JSON.stringify(parsedData).substring(0, 200)}`
+                    );
+
+                    if (pdfBuffer.length < 1000) {
+                        console.log(`[API]   FAIL: PDF too small (${pdfBuffer.length} bytes)`);
+                        return Response.json(
+                            { ok: false, error: `PDF too small (${pdfBuffer.length} bytes), likely corrupted or empty page` },
+                            { status: 400 }
+                        );
+                    }
+
+                    const result = await handleSaveChallanReceipt({
+                        jobId: jobIdField,
+                        params: parsedParams,
+                        data: parsedData,
+                        pdfBuffer,
+                    });
+                    const status = result.ok ? 200 : 400;
+                    console.log(`[API]   result: ${JSON.stringify(result)}`);
+                    return Response.json(result, { status });
+                } catch (e: any) {
+                    console.error("[API] ERROR save_challan_receipt:", e);
                     return Response.json({ ok: false, error: e.message }, { status: 500 });
                 }
             }

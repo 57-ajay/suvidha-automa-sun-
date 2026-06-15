@@ -260,17 +260,251 @@ async def run(
             run_log=log.dump(),
         )
 
-    # ── Phase 6: receipt (best-effort) ──────────────────────────────────────
-    # TODO: poll for this court's receipt-page markers, then capture the PDF:
-    #   await save_receipt(session, job_id, params.model_dump())
-    # (Upgrade path: use border_tax/_web_handover.web_handover_and_capture to
-    #  poll QR + receipt concurrently once you know the receipt markers.)
+    # ── Phase 6: receipt capture ─────────────────────────────────────────────────
+    #
+    # The vcourts receipt page is identified by the Print button:
+    #   <button class="btn btn-primary btn-sm" onclick="window.print();">
+    #     <i class="fas fa-print" ...></i>&nbsp;Print
+    #   </button>
+    #
+    # We:
+    #   1. Poll for that button (≤ 60 s) to confirm the receipt page is loaded.
+    #   2. Read receiptNumber, amount, and paymentDate from the DOM.
+    #   3. Call save_receipt → /api/internal/challan-payment/save-receipt.
+    #   4. Return done / partial depending on the result.
+
+    # ── 6a: poll for receipt page ────────────────────────────────────────────────
+    _RECEIPT_READY_JS = """
+    (function() {
+      // The receipt page has a "window.print()" onclick Print button.
+      var btns = document.querySelectorAll('button.btn-primary.btn-sm');
+      for (var i = 0; i < btns.length; i++) {
+        var oc = (btns[i].getAttribute('onclick') || '');
+        if (oc.indexOf('window.print') !== -1) {
+          return { found: true };
+        }
+      }
+      return { found: false };
+    })();
+    """
+
+    # JS to scrape the three receipt fields we need.
+    _RECEIPT_DATA_JS = """
+    (function() {
+      var text = document.body.innerText || '';
+
+      // ── Receipt Number ──
+      // vcourts shows e.g. "Receipt No. : RC/2024/12345" or "Receipt No:RC/2024/12345"
+      var rcMatch = text.match(/Receipt\\s*No\\.?\\s*:?\\s*([A-Z0-9\\/\\-]+)/i);
+      var receiptNumber = rcMatch ? rcMatch[1].trim() : null;
+
+      // ── Amount ──
+      // "Total Amount : 1000" / "Total Amount: ₹1,000" / "Grand Total : 1000/-"
+      var amtMatch = text.match(/(?:Total\\s*Amount|Grand\\s*Total)\\s*:?\\s*[₹Rs\\.]*\\s*([\\d,]+)/i);
+      var amount = amtMatch ? parseInt(amtMatch[1].replace(/,/g,''), 10) : null;
+
+      // ── Payment Date ──
+      // e.g. "Payment Date : 15/06/2024" or "Date of Payment : 2024-06-15"
+      var dtMatch = text.match(/(?:Payment\\s*Date|Date\\s*of\\s*Payment)\\s*:?\\s*([\\d\\-\\/]+)/i);
+      var rawDate = dtMatch ? dtMatch[1].trim() : null;
+
+      // Normalise to YYYY-MM-DD
+      var paymentDate = null;
+      if (rawDate) {
+        // DD/MM/YYYY → YYYY-MM-DD
+        var slashMatch = rawDate.match(/^(\\d{1,2})[\\/-](\\d{1,2})[\\/-](\\d{4})$/);
+        if (slashMatch) {
+          paymentDate = slashMatch[3] + '-' +
+                        slashMatch[2].padStart(2,'0') + '-' +
+                        slashMatch[1].padStart(2,'0');
+        } else {
+          // Already ISO or similar
+          paymentDate = rawDate;
+        }
+      }
+
+      return { receiptNumber: receiptNumber, amount: amount, paymentDate: paymentDate };
+    })();
+    """
+
+    RECEIPT_POLL_SECS = 60
+    RECEIPT_POLL_INTERVAL = 5
+    RECEIPT_PAINT_SETTLE_SECS = 2
+
+    log.record(
+        StepLog(
+            index=log.next_index(),
+            name="phase6.receipt_wait.start",
+            status=StepStatus.OK,
+            value=f"polling up to {RECEIPT_POLL_SECS}s for Print button",
+        )
+    )
+
+    phase6_start = time.monotonic()
+    receipt_page_found = False
+    deadline = phase6_start + RECEIPT_POLL_SECS
+
+    while time.monotonic() < deadline:
+        try:
+            res = await _cdp_eval(session, _RECEIPT_READY_JS)
+            if res and res.get("found"):
+                receipt_page_found = True
+                break
+        except Exception:
+            pass
+        await asyncio.sleep(RECEIPT_POLL_INTERVAL)
+
+    elapsed_ms = int((time.monotonic() - phase6_start) * 1000)
+
+    if not receipt_page_found:
+        log.record(
+            StepLog(
+                index=log.next_index(),
+                name="phase6.receipt_wait",
+                status=StepStatus.FAILED,
+                duration_ms=elapsed_ms,
+                error=f"receipt page (Print button) did not appear within {RECEIPT_POLL_SECS}s",
+            )
+        )
+        return RunOutcome(
+            status="partial",
+            summary=(
+                f"Challan {challan} ({department}): payment confirmed by human but "
+                f"receipt page did not load within {RECEIPT_POLL_SECS}s. "
+                f"Payment likely succeeded — reconcile manually.\n"
+                f"Challan: {challan}\nDepartment: {department}\n"
+                f"Vehicle: {params.vehicleNumber}\nReceipt PDF: not uploaded — receipt page timeout\n"
+                f"Status: partial"
+            ),
+            partial_reasons=["receipt_page_timeout"],
+            run_log=log.dump(),
+        )
+
+    log.record(
+        StepLog(
+            index=log.next_index(),
+            name="phase6.receipt_wait",
+            status=StepStatus.OK,
+            duration_ms=elapsed_ms,
+            value="Print button found — receipt page loaded",
+        )
+    )
+
+    # Let the page finish painting (watermarks, etc.) before PDF capture.
+    await asyncio.sleep(RECEIPT_PAINT_SETTLE_SECS)
+
+    # ── 6b: read receipt fields ───────────────────────────────────────────────────
+    receipt_fields: dict = {}
+    try:
+        receipt_fields = await _cdp_eval(session, _RECEIPT_DATA_JS) or {}
+    except Exception as e:
+        log.record(
+            StepLog(
+                index=log.next_index(),
+                name="phase6.receipt_read",
+                status=StepStatus.FAILED,
+                error=f"CDP eval failed: {e}",
+            )
+        )
+        receipt_fields = {}
+
+    receipt_number = receipt_fields.get("receiptNumber")
+    receipt_amount = receipt_fields.get("amount")
+    receipt_date   = receipt_fields.get("paymentDate") or time.strftime("%Y-%m-%d")
+
+    log.record(
+        StepLog(
+            index=log.next_index(),
+            name="phase6.receipt_read",
+            status=StepStatus.OK if receipt_number else StepStatus.FAILED,
+            value=f"receiptNumber={receipt_number!r} amount={receipt_amount!r} date={receipt_date!r}",
+        )
+    )
+
+    if not receipt_number or receipt_amount is None:
+        return RunOutcome(
+            status="partial",
+            summary=(
+                f"Challan {challan} ({department}): receipt page loaded but could not "
+                f"read required fields (receiptNumber={receipt_number!r}, "
+                f"amount={receipt_amount!r}). PDF not uploaded.\n"
+                f"Challan: {challan}\nDepartment: {department}\n"
+                f"Vehicle: {params.vehicleNumber}\n"
+                f"Receipt Number: {receipt_number or 'unknown'}\n"
+                f"Receipt PDF: not uploaded — could not read receipt fields\nStatus: partial"
+            ),
+            partial_reasons=["receipt_fields_unreadable"],
+            run_log=log.dump(),
+        )
+
+    # ── 6c: capture PDF + upload via challan-payment endpoint ─────────────────────
+    save_data = {
+        "vehicleNumber": params.vehicleNumber,
+        "receiptNumber": receipt_number,
+        "amount": receipt_amount,
+        "paymentDate": receipt_date,
+        "challanNo": challan,
+        "department": department,
+    }
+
+    # Route to the challan-specific save-receipt endpoint so the handler writes
+    # to challanRequests + challanPayments (not borderTaxRequests/borderTaxPayments).
+    save_resp = await save_receipt(
+        session,
+        job_id,
+        params.model_dump(),
+        save_data,
+        endpoint="/api/internal/challan-payment/save-receipt",
+    )
+
+    log.record(
+        StepLog(
+            index=log.next_index(),
+            name="phase6.save_receipt",
+            status=StepStatus.OK if save_resp.get("ok") else StepStatus.FAILED,
+            value=json.dumps(save_resp)[:300],
+        )
+    )
+
+    if not save_resp.get("ok"):
+        return RunOutcome(
+            status="partial",
+            summary=(
+                f"Challan {challan} ({department}): payment confirmed, receipt page loaded, "
+                f"but save_receipt failed: {save_resp.get('error', 'unknown')}.\n"
+                f"Challan: {challan}\nDepartment: {department}\n"
+                f"Vehicle: {params.vehicleNumber}\n"
+                f"Receipt Number: {receipt_number}\nAmount: ₹{receipt_amount}\n"
+                f"Receipt PDF: not uploaded — {save_resp.get('error', 'unknown')}\nStatus: partial"
+            ),
+            partial_reasons=["save_receipt_failed"],
+            run_log=log.dump(),
+        )
+
+    if not save_resp.get("pdfUploaded"):
+        return RunOutcome(
+            status="partial",
+            summary=(
+                f"Challan {challan} ({department}): payment confirmed, receipt metadata saved "
+                f"(receipt {receipt_number}) but PDF upload to GCS failed: "
+                f"{save_resp.get('pdfUploadError', 'unknown')}.\n"
+                f"Challan: {challan}\nDepartment: {department}\n"
+                f"Vehicle: {params.vehicleNumber}\n"
+                f"Receipt Number: {receipt_number}\nAmount: ₹{receipt_amount}\n"
+                f"Receipt PDF: not uploaded — PDF upload failed\nStatus: partial"
+            ),
+            partial_reasons=["pdf_upload_failed"],
+            run_log=log.dump(),
+        )
 
     return RunOutcome(
         status="done",
         summary=(
-            f"Challan {challan} ({department}) handed off for payment and "
-            f"confirmed by human."
+            f"Challan {challan} ({department}): payment completed and receipt captured.\n"
+            f"Challan: {challan}\nDepartment: {department}\n"
+            f"Vehicle: {params.vehicleNumber}\n"
+            f"Receipt Number: {receipt_number}\nAmount: ₹{receipt_amount}\n"
+            f"Payment Date: {receipt_date}\nReceipt PDF: uploaded\nStatus: complete"
         ),
         run_log=log.dump(),
     )

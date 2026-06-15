@@ -381,6 +381,7 @@ async def save_receipt(
     job_id: str,
     job_params: dict,
     data: Any,
+    endpoint: str = "/api/internal/border-tax/save-receipt",
 ) -> dict:
     """Capture the currently-visible receipt page as a PDF via CDP
     Page.printToPDF, then upload it + the receipt metadata to
@@ -450,7 +451,7 @@ async def save_receipt(
     try:
         async with httpx.AsyncClient(timeout=60) as client:
             resp = await client.post(
-                f"{API_URL}/api/internal/border-tax/save-receipt",
+                f"{API_URL}{endpoint}",
                 files=files,
                 data=form_data,
             )
