@@ -327,8 +327,8 @@ async def run(
     })();
     """
 
-    RECEIPT_POLL_SECS = 60
-    RECEIPT_POLL_INTERVAL = 5
+    RECEIPT_POLL_SECS = 3600  # 1 hour
+    RECEIPT_POLL_INTERVAL = 10
     RECEIPT_PAINT_SETTLE_SECS = 2
 
     log.record(
