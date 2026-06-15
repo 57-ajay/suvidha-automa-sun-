@@ -1,6 +1,6 @@
-import { FieldValue } from "firebase-admin/firestore";
+import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import { getStorage } from "firebase-admin/storage";
-import { db, challanRequestsRef } from "../../firebase";
+import { challanRequestsRef } from "../../firebase";
 
 interface ReceiptData {
     vehicleNumber: string;
@@ -79,14 +79,20 @@ export async function handleSaveChallanReceipt(input: SaveChallanReceiptInput) {
         return { ok: false, error: `Invalid data type: ${typeof data}` };
     }
 
-    if (!receiptData?.receiptNumber) {
-        return { ok: false, error: "receiptNumber is required" };
+    // The receipt PDF (and its URL) is the deliverable — receiptNumber/amount are
+    // best-effort metadata and must NOT block saving the receipt. The challan
+    // being paid is identified by challanNo, which we always have from params.
+    const challanNo = receiptData.challanNo ?? params?.challanNo ?? null;
+    const receiptNumber = receiptData.receiptNumber || null;
+    const amount = toNumber(receiptData.amount); // may be null — informational only
+
+    if (!challanNo) {
+        console.log(`[save_challan_receipt] FAIL: challanNo missing`);
+        return { ok: false, error: "challanNo missing — cannot locate the challan to attach the receipt" };
     }
 
-    const amount = toNumber(receiptData.amount);
-    if (amount === null) {
-        return { ok: false, error: `Invalid amount: ${receiptData.amount}` };
-    }
+    // Filename base: receiptNumber if known, else challanNo, else requestId.
+    const fileBase = String(receiptNumber || challanNo || requestId).replace(/[^A-Za-z0-9._-]/g, "_");
 
     // ── Upload PDF to GCS ──────────────────────────────────────────────────
     let pdfUrl: string | null = null;
@@ -96,7 +102,7 @@ export async function handleSaveChallanReceipt(input: SaveChallanReceiptInput) {
         const bucket = getStorage().bucket();
         const destination =
             `driverUtilitiesRequests/challanPaymentRequests/` +
-            `${requestId}_${resolvedDriverId}/${receiptData.receiptNumber}_receipt.pdf`;
+            `${requestId}_${resolvedDriverId}/${fileBase}_receipt.pdf`;
 
         const file = bucket.file(destination);
         await file.save(pdfBuffer, {
@@ -104,7 +110,8 @@ export async function handleSaveChallanReceipt(input: SaveChallanReceiptInput) {
                 contentType: "application/pdf",
                 metadata: {
                     vehicleNumber,
-                    receiptNumber: receiptData.receiptNumber,
+                    challanNo: String(challanNo),
+                    ...(receiptNumber ? { receiptNumber } : {}),
                     jobId,
                 },
             },
@@ -125,59 +132,84 @@ export async function handleSaveChallanReceipt(input: SaveChallanReceiptInput) {
         // Continue — still persist metadata even if PDF upload fails
     }
 
-    // ── Save a record in challanPayments collection ────────────────────────
-    const challanPaymentsRef = db.collection("challanPayments");
-    const docData = {
-        driverId: resolvedDriverId,
-        vehicleNumber,
-        requestId,
-        jobId,
-        challanNo: receiptData.challanNo ?? params?.challanNo ?? null,
-        department: receiptData.department ?? params?.department ?? null,
-        receiptNumber: receiptData.receiptNumber,
-        amount,
-        paymentDate: receiptData.paymentDate || new Date().toISOString().split("T")[0],
-        ...(pdfUrl ? { pdfUrl } : {}),
-        ...(pdfUploadError ? { pdfUploadError } : {}),
-        status: "paid",
-        createdAt: FieldValue.serverTimestamp(),
-    };
-
-    // ── Update the challanRequests doc ─────────────────────────────────────
-    try {
-        await challanRequestsRef.doc(requestId).update({
-            status: "completed",
-            challanUpdatedBy: "agent",
-            receiptUpdatedAt: FieldValue.serverTimestamp(),
-            paymentDate: FieldValue.serverTimestamp(),
-            ...(pdfUrl ? { receiptDocumentUrl: pdfUrl } : {}),
-        });
-        console.log(
-            `[save_challan_receipt] marked challanRequests/${requestId} status=completed ` +
-            `(receiptDocumentUrl=${pdfUrl ? "set" : "skipped — pdf upload failed"})`
-        );
-    } catch (e) {
-        console.error(
-            `[save_challan_receipt] failed to mark challanRequests/${requestId}:`, e
-        );
-        // Non-fatal — still save the payment record
+    // The whole point is to persist the receipt URL — if the upload failed there
+    // is nothing to save, so report failure (the caller marks the job partial).
+    if (!pdfUrl) {
+        console.log(`[save_challan_receipt] FAIL: PDF upload failed, no URL to attach`);
+        return {
+            ok: false,
+            error: `PDF upload failed: ${pdfUploadError ?? "unknown"}`,
+            vehicle: vehicleNumber,
+        };
     }
 
-    const paymentDoc = await challanPaymentsRef.add(docData);
+    // ── Attach the receipt to the matching challan ─────────────────────────
+    // Challan receipts live PER-CHALLAN as `challans[].receipt = { url, at }`
+    // (see Cabswale-Customers data model + driverUtilitiesRequests.js writer),
+    // not at the doc level. We only save the receipt URL here — we do NOT mark
+    // the challan/request paid; the existing backend trigger handles paid status.
+    const docRef = challanRequestsRef.doc(requestId);
+    const receiptObj = { url: pdfUrl, at: Timestamp.now() }; // serverTimestamp() is illegal inside array elements
+    let attachedTo: "challans" | "challansDraft" | null = null;
+
+    try {
+        const snap = await docRef.get();
+        if (!snap.exists) {
+            return { ok: false, error: `No challanRequest found for requestId ${requestId}`, receiptUrl: pdfUrl };
+        }
+        const docData = snap.data()!;
+
+        // Match by challanNo or id; prefer the finalized `challans` array, fall
+        // back to `challansDraft` if the doc hasn't been finalized yet.
+        const matches = (c: any) =>
+            String(c?.challanNo) === String(challanNo) || String(c?.id) === String(challanNo);
+
+        const challans: any[] = Array.isArray(docData.challans) ? docData.challans : [];
+        const draft: any[] = Array.isArray(docData.challansDraft) ? docData.challansDraft : [];
+
+        const update: Record<string, any> = { updatedAt: FieldValue.serverTimestamp() };
+
+        if (challans.some(matches)) {
+            update.challans = challans.map((c) => (matches(c) ? { ...c, receipt: receiptObj } : c));
+            attachedTo = "challans";
+        } else if (draft.some(matches)) {
+            update.challansDraft = draft.map((c) => (matches(c) ? { ...c, receipt: receiptObj } : c));
+            attachedTo = "challansDraft";
+        } else {
+            console.log(
+                `[save_challan_receipt] challanNo=${challanNo} not found in challans/challansDraft ` +
+                `for requestId=${requestId}`
+            );
+            return {
+                ok: false,
+                error: `challanNo ${challanNo} not found in challans/challansDraft for requestId ${requestId}`,
+                receiptUrl: pdfUrl,
+            };
+        }
+
+        await docRef.update(update);
+        console.log(
+            `[save_challan_receipt] attached receipt.url to ${attachedTo}[challanNo=${challanNo}] ` +
+            `in challanRequests/${requestId}`
+        );
+    } catch (e) {
+        console.error(`[save_challan_receipt] failed to attach receipt to challanRequests/${requestId}:`, e);
+        return { ok: false, error: `Failed to save receipt: ${(e as Error).message}`, receiptUrl: pdfUrl };
+    }
 
     console.log(
-        `[save_challan_receipt] DONE job=${jobId} vehicle=${vehicleNumber} ` +
-        `receipt=${receiptData.receiptNumber} amount=₹${amount} ` +
-        `doc=${paymentDoc.id} pdfUploaded=${!!pdfUrl}`
+        `[save_challan_receipt] DONE job=${jobId} vehicle=${vehicleNumber} challanNo=${challanNo} ` +
+        `receipt=${receiptNumber ?? "n/a"} amount=${amount ?? "n/a"} attachedTo=${attachedTo}`
     );
 
     return {
         ok: true,
         vehicle: vehicleNumber,
-        receiptNumber: receiptData.receiptNumber,
+        challanNo,
+        receiptNumber,
         amount,
-        docId: paymentDoc.id,
-        pdfUploaded: !!pdfUrl,
-        ...(pdfUploadError ? { pdfUploadError } : {}),
+        receiptUrl: pdfUrl,
+        attachedTo,
+        pdfUploaded: true,
     };
 }

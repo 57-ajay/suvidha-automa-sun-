@@ -277,7 +277,8 @@ async def run(
     _RECEIPT_READY_JS = """
     (function() {
       // The receipt page has a "window.print()" onclick Print button.
-      var btns = document.querySelectorAll('button.btn-primary.btn-sm');
+      // Match by onclick attribute directly — robust against class names/spacing.
+      var btns = document.querySelectorAll('button[onclick]');
       for (var i = 0; i < btns.length; i++) {
         var oc = (btns[i].getAttribute('onclick') || '');
         if (oc.indexOf('window.print') !== -1) {
@@ -289,9 +290,24 @@ async def run(
     """
 
     # JS to scrape the three receipt fields we need.
+    # Searches the main document AND any same-origin iframes (the receipt detail
+    # is sometimes rendered inside a frame, leaving document.body.innerText empty).
+    # Also returns `rawText` (truncated) + `frameCount` for diagnostics so we can
+    # see the real page format when the regexes miss.
     _RECEIPT_DATA_JS = """
     (function() {
       var text = document.body.innerText || '';
+      var frameCount = 0;
+      var frames = document.querySelectorAll('iframe');
+      for (var f = 0; f < frames.length; f++) {
+        try {
+          var doc = frames[f].contentDocument;
+          if (doc && doc.body) {
+            frameCount++;
+            text += '\\n' + (doc.body.innerText || '');
+          }
+        } catch (e) { /* cross-origin frame — skip */ }
+      }
 
       // ── Receipt Number ──
       // vcourts shows e.g. "Receipt No. : RC/2024/12345" or "Receipt No:RC/2024/12345"
@@ -323,7 +339,13 @@ async def run(
         }
       }
 
-      return { receiptNumber: receiptNumber, amount: amount, paymentDate: paymentDate };
+      return {
+        receiptNumber: receiptNumber,
+        amount: amount,
+        paymentDate: paymentDate,
+        frameCount: frameCount,
+        rawText: text.replace(/\\s+/g, ' ').trim().substring(0, 1500),
+      };
     })();
     """
 
@@ -411,17 +433,33 @@ async def run(
     receipt_number = receipt_fields.get("receiptNumber")
     receipt_amount = receipt_fields.get("amount")
     receipt_date   = receipt_fields.get("paymentDate") or time.strftime("%Y-%m-%d")
+    raw_text       = receipt_fields.get("rawText") or ""
+    frame_count    = receipt_fields.get("frameCount")
 
     log.record(
         StepLog(
             index=log.next_index(),
             name="phase6.receipt_read",
             status=StepStatus.OK if receipt_number else StepStatus.FAILED,
-            value=f"receiptNumber={receipt_number!r} amount={receipt_amount!r} date={receipt_date!r}",
+            value=f"receiptNumber={receipt_number!r} amount={receipt_amount!r} date={receipt_date!r} frames={frame_count!r}",
         )
     )
 
     if not receipt_number or receipt_amount is None:
+        # Dump the actual page text so we can see the real receipt format and fix
+        # the regexes (logged to worker stdout AND the run log for the dashboard).
+        print(
+            f"[{job_id}] receipt fields unreadable — frameCount={frame_count!r} "
+            f"rawText[:1500]={raw_text!r}"
+        )
+        log.record(
+            StepLog(
+                index=log.next_index(),
+                name="phase6.receipt_page_text",
+                status=StepStatus.FAILED,
+                value=f"frames={frame_count!r} rawText={raw_text[:600]!r}",
+            )
+        )
         return RunOutcome(
             status="partial",
             summary=(
