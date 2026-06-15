@@ -289,66 +289,6 @@ async def run(
     })();
     """
 
-    # JS to scrape the three receipt fields we need.
-    # Searches the main document AND any same-origin iframes (the receipt detail
-    # is sometimes rendered inside a frame, leaving document.body.innerText empty).
-    # Also returns `rawText` (truncated) + `frameCount` for diagnostics so we can
-    # see the real page format when the regexes miss.
-    _RECEIPT_DATA_JS = """
-    (function() {
-      var text = document.body.innerText || '';
-      var frameCount = 0;
-      var frames = document.querySelectorAll('iframe');
-      for (var f = 0; f < frames.length; f++) {
-        try {
-          var doc = frames[f].contentDocument;
-          if (doc && doc.body) {
-            frameCount++;
-            text += '\\n' + (doc.body.innerText || '');
-          }
-        } catch (e) { /* cross-origin frame — skip */ }
-      }
-
-      // ── Receipt Number ──
-      // vcourts shows e.g. "Receipt No. : RC/2024/12345" or "Receipt No:RC/2024/12345"
-      var rcMatch = text.match(/Receipt\\s*No\\.?\\s*:?\\s*([A-Z0-9\\/\\-]+)/i);
-      var receiptNumber = rcMatch ? rcMatch[1].trim() : null;
-
-      // ── Amount ──
-      // "Total Amount : 1000" / "Total Amount: ₹1,000" / "Grand Total : 1000/-"
-      var amtMatch = text.match(/(?:Total\\s*Amount|Grand\\s*Total)\\s*:?\\s*[₹Rs\\.]*\\s*([\\d,]+)/i);
-      var amount = amtMatch ? parseInt(amtMatch[1].replace(/,/g,''), 10) : null;
-
-      // ── Payment Date ──
-      // e.g. "Payment Date : 15/06/2024" or "Date of Payment : 2024-06-15"
-      var dtMatch = text.match(/(?:Payment\\s*Date|Date\\s*of\\s*Payment)\\s*:?\\s*([\\d\\-\\/]+)/i);
-      var rawDate = dtMatch ? dtMatch[1].trim() : null;
-
-      // Normalise to YYYY-MM-DD
-      var paymentDate = null;
-      if (rawDate) {
-        // DD/MM/YYYY → YYYY-MM-DD
-        var slashMatch = rawDate.match(/^(\\d{1,2})[\\/-](\\d{1,2})[\\/-](\\d{4})$/);
-        if (slashMatch) {
-          paymentDate = slashMatch[3] + '-' +
-                        slashMatch[2].padStart(2,'0') + '-' +
-                        slashMatch[1].padStart(2,'0');
-        } else {
-          // Already ISO or similar
-          paymentDate = rawDate;
-        }
-      }
-
-      return {
-        receiptNumber: receiptNumber,
-        amount: amount,
-        paymentDate: paymentDate,
-        frameCount: frameCount,
-        rawText: text.replace(/\\s+/g, ' ').trim().substring(0, 1500),
-      };
-    })();
-    """
-
     RECEIPT_POLL_SECS = 3600  # 1 hour
     RECEIPT_POLL_INTERVAL = 10
     RECEIPT_PAINT_SETTLE_SECS = 2
@@ -415,78 +355,17 @@ async def run(
     # Let the page finish painting (watermarks, etc.) before PDF capture.
     await asyncio.sleep(RECEIPT_PAINT_SETTLE_SECS)
 
-    # ── 6b: read receipt fields ───────────────────────────────────────────────────
-    receipt_fields: dict = {}
-    try:
-        receipt_fields = await _cdp_eval(session, _RECEIPT_DATA_JS) or {}
-    except Exception as e:
-        log.record(
-            StepLog(
-                index=log.next_index(),
-                name="phase6.receipt_read",
-                status=StepStatus.FAILED,
-                error=f"CDP eval failed: {e}",
-            )
-        )
-        receipt_fields = {}
-
-    receipt_number = receipt_fields.get("receiptNumber")
-    receipt_amount = receipt_fields.get("amount")
-    receipt_date   = receipt_fields.get("paymentDate") or time.strftime("%Y-%m-%d")
-    raw_text       = receipt_fields.get("rawText") or ""
-    frame_count    = receipt_fields.get("frameCount")
-
-    log.record(
-        StepLog(
-            index=log.next_index(),
-            name="phase6.receipt_read",
-            status=StepStatus.OK if receipt_number else StepStatus.FAILED,
-            value=f"receiptNumber={receipt_number!r} amount={receipt_amount!r} date={receipt_date!r} frames={frame_count!r}",
-        )
-    )
-
-    if not receipt_number or receipt_amount is None:
-        # Dump the actual page text so we can see the real receipt format and fix
-        # the regexes (logged to worker stdout AND the run log for the dashboard).
-        print(
-            f"[{job_id}] receipt fields unreadable — frameCount={frame_count!r} "
-            f"rawText[:1500]={raw_text!r}"
-        )
-        log.record(
-            StepLog(
-                index=log.next_index(),
-                name="phase6.receipt_page_text",
-                status=StepStatus.FAILED,
-                value=f"frames={frame_count!r} rawText={raw_text[:600]!r}",
-            )
-        )
-        return RunOutcome(
-            status="partial",
-            summary=(
-                f"Challan {challan} ({department}): receipt page loaded but could not "
-                f"read required fields (receiptNumber={receipt_number!r}, "
-                f"amount={receipt_amount!r}). PDF not uploaded.\n"
-                f"Challan: {challan}\nDepartment: {department}\n"
-                f"Vehicle: {params.vehicleNumber}\n"
-                f"Receipt Number: {receipt_number or 'unknown'}\n"
-                f"Receipt PDF: not uploaded — could not read receipt fields\nStatus: partial"
-            ),
-            partial_reasons=["receipt_fields_unreadable"],
-            run_log=log.dump(),
-        )
-
-    # ── 6c: capture PDF + upload via challan-payment endpoint ─────────────────────
+    # ── 6b: capture PDF + upload via challan-payment endpoint ─────────────────────
+    # No field scraping. The Print button (6a) already confirmed a valid receipt
+    # page is loaded, so we just render it to PDF and upload. The API attaches the
+    # receipt URL to challans[].receipt.url keyed by challanNo (from params). The
+    # PDF is the deliverable — receiptNumber/amount are not needed.
     save_data = {
         "vehicleNumber": params.vehicleNumber,
-        "receiptNumber": receipt_number,
-        "amount": receipt_amount,
-        "paymentDate": receipt_date,
         "challanNo": challan,
         "department": department,
     }
 
-    # Route to the challan-specific save-receipt endpoint so the handler writes
-    # to challanRequests + challanPayments (not borderTaxRequests/borderTaxPayments).
     save_resp = await save_receipt(
         session,
         job_id,
@@ -504,45 +383,28 @@ async def run(
         )
     )
 
+    # API returns ok:false (no receiptUrl) if the PDF render/upload failed.
     if not save_resp.get("ok"):
         return RunOutcome(
             status="partial",
             summary=(
-                f"Challan {challan} ({department}): payment confirmed, receipt page loaded, "
-                f"but save_receipt failed: {save_resp.get('error', 'unknown')}.\n"
+                f"Challan {challan} ({department}): payment confirmed and receipt page "
+                f"loaded, but receipt upload failed: {save_resp.get('error', 'unknown')}.\n"
                 f"Challan: {challan}\nDepartment: {department}\n"
                 f"Vehicle: {params.vehicleNumber}\n"
-                f"Receipt Number: {receipt_number}\nAmount: ₹{receipt_amount}\n"
                 f"Receipt PDF: not uploaded — {save_resp.get('error', 'unknown')}\nStatus: partial"
             ),
             partial_reasons=["save_receipt_failed"],
             run_log=log.dump(),
         )
 
-    if not save_resp.get("pdfUploaded"):
-        return RunOutcome(
-            status="partial",
-            summary=(
-                f"Challan {challan} ({department}): payment confirmed, receipt metadata saved "
-                f"(receipt {receipt_number}) but PDF upload to GCS failed: "
-                f"{save_resp.get('pdfUploadError', 'unknown')}.\n"
-                f"Challan: {challan}\nDepartment: {department}\n"
-                f"Vehicle: {params.vehicleNumber}\n"
-                f"Receipt Number: {receipt_number}\nAmount: ₹{receipt_amount}\n"
-                f"Receipt PDF: not uploaded — PDF upload failed\nStatus: partial"
-            ),
-            partial_reasons=["pdf_upload_failed"],
-            run_log=log.dump(),
-        )
-
     return RunOutcome(
         status="done",
         summary=(
-            f"Challan {challan} ({department}): payment completed and receipt captured.\n"
+            f"Challan {challan} ({department}): payment completed and receipt uploaded.\n"
             f"Challan: {challan}\nDepartment: {department}\n"
             f"Vehicle: {params.vehicleNumber}\n"
-            f"Receipt Number: {receipt_number}\nAmount: ₹{receipt_amount}\n"
-            f"Payment Date: {receipt_date}\nReceipt PDF: uploaded\nStatus: complete"
+            f"Receipt PDF: uploaded\nStatus: complete"
         ),
         run_log=log.dump(),
     )
