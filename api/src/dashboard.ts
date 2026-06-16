@@ -243,7 +243,7 @@ async function refresh() {
 
       html += '<div class="actions">';
       html += '<span class="badge ' + j.status + '">' + j.status.replace(/_/g,' ') + '</span>';
-      if (hasLive) html += '<a class="btn" href="' + j.liveUrl + '" target="_blank">Live</a>';
+      if (hasLive) html += '<a class="btn" href="/api/jobs/' + j.id + '/live" target="_blank">Live</a>';
       if (canCancel) html += '<button class="btn cancel" onclick="cancelJob(\\'' + j.id + '\\')">Cancel</button>';
       html += '</div>'; // .actions
       html += '</div>'; // .job-top

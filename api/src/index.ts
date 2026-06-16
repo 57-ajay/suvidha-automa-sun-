@@ -8,6 +8,7 @@ import { handleSaveChallanReceipt } from "./internal/challanPayment/receipt";
 import { releaseAgentSlot, saveAgentCost } from "./internal/agentConfig";
 import { saveAgentWorkSummary } from "./internal/agentWorkSummary";
 import { DASHBOARD_HTML } from "./dashboard";
+import { liveConsoleHtml } from "./liveConsole";
 import { setAssignedPartner } from "./internal/assignedPartner";
 import { setAiAgentWorkStatus } from "./internal/aiAgentWorkStatus";
 import "./firebase";
@@ -187,6 +188,19 @@ const server = Bun.serve({
                 return Response.json({
                     ...rest,
                     ...(mobileNumber ? { mobileNumber } : {}),
+                });
+            }
+
+            // GET /api/jobs/:id/live  — full-screen live console (VNC iframe + controls)
+            const liveMatch = url.pathname.match(/^\/api\/jobs\/([^/]+)\/live$/);
+            if (req.method === "GET" && liveMatch) {
+                const jobId = liveMatch[1]!;
+                const job = await redis.hgetall(`job:${jobId}`);
+                if (!job || !job.id) {
+                    return new Response("Job not found", { status: 404 });
+                }
+                return new Response(liveConsoleHtml(jobId), {
+                    headers: { "Content-Type": "text/html" },
                 });
             }
 
