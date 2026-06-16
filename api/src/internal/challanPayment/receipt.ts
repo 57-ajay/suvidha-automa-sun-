@@ -94,21 +94,28 @@ export async function handleSaveChallanReceipt(input: SaveChallanReceiptInput) {
     // Filename base: receiptNumber if known, else challanNo, else requestId.
     const fileBase = String(receiptNumber || challanNo || requestId).replace(/[^A-Za-z0-9._-]/g, "_");
 
-    // ── Upload PDF to GCS ──────────────────────────────────────────────────
+    // ── Upload PDF to Firebase Storage ─────────────────────────────────────
+    // Match the EXISTING challan-receipt convention exactly (verified against
+    // real completed challanRequests docs):
+    //   path: driverUtilitiesRequests/challan/{requestId}/{challanNo}_{ms}_receipt.pdf
+    //   url:  permanent Firebase Storage download URL (?alt=media&token=<uuid>)
+    // — NOT a getSignedUrl() signed URL (different domain + it expires).
     let pdfUrl: string | null = null;
     let pdfUploadError: string | null = null;
 
     try {
         const bucket = getStorage().bucket();
         const destination =
-            `driverUtilitiesRequests/challanPaymentRequests/` +
-            `${requestId}_${resolvedDriverId}/${fileBase}_receipt.pdf`;
+            `driverUtilitiesRequests/challan/${requestId}/` +
+            `${fileBase}_${Date.now()}_receipt.pdf`;
+        const downloadToken = crypto.randomUUID();
 
         const file = bucket.file(destination);
         await file.save(pdfBuffer, {
             metadata: {
                 contentType: "application/pdf",
                 metadata: {
+                    firebaseStorageDownloadTokens: downloadToken,
                     vehicleNumber,
                     challanNo: String(challanNo),
                     ...(receiptNumber ? { receiptNumber } : {}),
@@ -117,19 +124,15 @@ export async function handleSaveChallanReceipt(input: SaveChallanReceiptInput) {
             },
         });
 
-        const [url] = await file.getSignedUrl({
-            action: "read",
-            expires: Date.now() + 365 * 24 * 60 * 60 * 1000, // 1 year
-        });
-
-        pdfUrl = url;
+        pdfUrl =
+            `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/` +
+            `${encodeURIComponent(destination)}?alt=media&token=${downloadToken}`;
         console.log(
             `[save_challan_receipt] PDF uploaded: ${destination} (${pdfBuffer.length} bytes)`
         );
     } catch (e) {
         pdfUploadError = (e as Error).message;
         console.error(`[save_challan_receipt] PDF upload FAILED:`, e);
-        // Continue — still persist metadata even if PDF upload fails
     }
 
     // The whole point is to persist the receipt URL — if the upload failed there

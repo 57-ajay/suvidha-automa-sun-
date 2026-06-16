@@ -91,7 +91,12 @@ const server = Bun.serve({
                     );
                 }
 
-                const jobId = params?.requestId || crypto.randomUUID();
+                // jobId is the Redis tracking/dedup key only — it must be unique
+                // PER CHALLAN, because one challanRequests doc (requestId) can hold
+                // many challans, each paid as its own job. challanNo is globally
+                // unique, so use it as the jobId. requestId stays in params and is
+                // what locates the doc to attach the receipt to (see receipt.ts).
+                const jobId = params?.challanNo || params?.requestId || crypto.randomUUID();
 
                 const existingStatus = await redis.hget(`job:${jobId}`, "status");
                 if (existingStatus && ["queued", "running", "waiting_for_human", "verifyingPayment"].includes(existingStatus)) {
@@ -657,8 +662,11 @@ const server = Bun.serve({
                         return Response.json({ ok: true, skipped: true });
                     }
 
-                    // Release agent slot (fire-and-forget)
-                    releaseAgentSlot(jobId).catch((e) => {
+                    // Release agent slot (fire-and-forget). Keyed on requestId:
+                    // automationAgentConfig stores `assignedRequestIds` (doc ids),
+                    // and jobId may now be the per-challan challanNo (see /api/run),
+                    // so releasing by jobId would miss the slot and leak it.
+                    releaseAgentSlot(requestId).catch((e) => {
                         console.error(`[API] background releaseAgentSlot failed for requestId=${requestId}:`, e);
                     });
 
@@ -793,8 +801,16 @@ const server = Bun.serve({
                     );
                 }
 
+                let params: Record<string, any> = {};
+                try { params = JSON.parse(job.params || "{}"); } catch { /* ignore */ }
+                const requestId = typeof params.requestId === "string" ? params.requestId : undefined;
+
+                // Release the agent slot by requestId (assignedRequestIds holds doc
+                // ids; jobId may be the per-challan challanNo — see /api/run).
+                const slotKey = requestId || jobId;
+
                 if (current === "queued") {
-                    await releaseAgentSlot(jobId);
+                    await releaseAgentSlot(slotKey);
                     await redis.lrem("job:queue", 0, jobId);
                 }
 
@@ -803,11 +819,7 @@ const server = Bun.serve({
                 // Refresh TTL so cancelled job stays visible for 24H
                 await redis.expire(`job:${jobId}`, JOB_TTL);
 
-                await releaseAgentSlot(jobId);
-
-                let params: Record<string, any> = {};
-                try { params = JSON.parse(job.params || "{}"); } catch { /* ignore */ }
-                const requestId = typeof params.requestId === "string" ? params.requestId : undefined;
+                await releaseAgentSlot(slotKey);
                 const source = job?.source || "app";
                 console.log("[source from cancel api]", job?.source);
 
