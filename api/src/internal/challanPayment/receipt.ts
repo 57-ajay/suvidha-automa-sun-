@@ -1,6 +1,6 @@
 import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import { getStorage } from "firebase-admin/storage";
-import { challanRequestsRef } from "../../firebase";
+import { challanRequestsRef, db } from "../../firebase";
 
 interface ReceiptData {
     vehicleNumber: string;
@@ -155,30 +155,44 @@ export async function handleSaveChallanReceipt(input: SaveChallanReceiptInput) {
     const receiptObj = { url: pdfUrl, at: Timestamp.now() }; // serverTimestamp() is illegal inside array elements
     let attachedTo: "challans" | "challansDraft" | null = null;
 
+    // Match by challanNo or id; prefer the finalized `challans` array, fall
+    // back to `challansDraft` if the doc hasn't been finalized yet.
+    const matches = (c: any) =>
+        String(c?.challanNo) === String(challanNo) || String(c?.id) === String(challanNo);
+
     try {
-        const snap = await docRef.get();
-        if (!snap.exists) {
+        // Transaction: jobId == challanNo lets multiple challans in the SAME doc
+        // run as concurrent jobs, so two whole-array writes would clobber each
+        // other's entries. Read-modify-write the challans[] array atomically.
+        const outcome = await db.runTransaction(async (tx) => {
+            const snap = await tx.get(docRef);
+            if (!snap.exists) return { kind: "no_doc" as const };
+            const docData = snap.data()!;
+
+            const challans: any[] = Array.isArray(docData.challans) ? docData.challans : [];
+            const draft: any[] = Array.isArray(docData.challansDraft) ? docData.challansDraft : [];
+
+            if (challans.some(matches)) {
+                tx.update(docRef, {
+                    challans: challans.map((c) => (matches(c) ? { ...c, receipt: receiptObj } : c)),
+                    updatedAt: FieldValue.serverTimestamp(),
+                });
+                return { kind: "ok" as const, attachedTo: "challans" as const };
+            }
+            if (draft.some(matches)) {
+                tx.update(docRef, {
+                    challansDraft: draft.map((c) => (matches(c) ? { ...c, receipt: receiptObj } : c)),
+                    updatedAt: FieldValue.serverTimestamp(),
+                });
+                return { kind: "ok" as const, attachedTo: "challansDraft" as const };
+            }
+            return { kind: "not_in_array" as const };
+        });
+
+        if (outcome.kind === "no_doc") {
             return { ok: false, error: `No challanRequest found for requestId ${requestId}`, receiptUrl: pdfUrl };
         }
-        const docData = snap.data()!;
-
-        // Match by challanNo or id; prefer the finalized `challans` array, fall
-        // back to `challansDraft` if the doc hasn't been finalized yet.
-        const matches = (c: any) =>
-            String(c?.challanNo) === String(challanNo) || String(c?.id) === String(challanNo);
-
-        const challans: any[] = Array.isArray(docData.challans) ? docData.challans : [];
-        const draft: any[] = Array.isArray(docData.challansDraft) ? docData.challansDraft : [];
-
-        const update: Record<string, any> = { updatedAt: FieldValue.serverTimestamp() };
-
-        if (challans.some(matches)) {
-            update.challans = challans.map((c) => (matches(c) ? { ...c, receipt: receiptObj } : c));
-            attachedTo = "challans";
-        } else if (draft.some(matches)) {
-            update.challansDraft = draft.map((c) => (matches(c) ? { ...c, receipt: receiptObj } : c));
-            attachedTo = "challansDraft";
-        } else {
+        if (outcome.kind === "not_in_array") {
             console.log(
                 `[save_challan_receipt] challanNo=${challanNo} not found in challans/challansDraft ` +
                 `for requestId=${requestId}`
@@ -190,7 +204,7 @@ export async function handleSaveChallanReceipt(input: SaveChallanReceiptInput) {
             };
         }
 
-        await docRef.update(update);
+        attachedTo = outcome.attachedTo;
         console.log(
             `[save_challan_receipt] attached receipt.url to ${attachedTo}[challanNo=${challanNo}] ` +
             `in challanRequests/${requestId}`

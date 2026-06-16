@@ -9,6 +9,7 @@ import { releaseAgentSlot, saveAgentCost } from "./internal/agentConfig";
 import { saveAgentWorkSummary } from "./internal/agentWorkSummary";
 import { DASHBOARD_HTML } from "./dashboard";
 import { liveConsoleHtml } from "./liveConsole";
+import { setChallanAiAgentStatus } from "./internal/challanPayment/aiAgentStatus";
 import { setAssignedPartner } from "./internal/assignedPartner";
 import { setAiAgentWorkStatus } from "./internal/aiAgentWorkStatus";
 import "./firebase";
@@ -152,6 +153,18 @@ const server = Bun.serve({
                         console.error(
                             `[API] background setAiAgentWorkStatus(started) failed for requestId=
                                     ${params.requestId}:`,
+                            e,
+                        );
+                    });
+                }
+
+                // Per-challan aiAgentStatus = running (challan-payment only) on the
+                // same challans[] entry the receipt URL is written to.
+                if (taskId === "challan-payment" && params?.requestId && params?.challanNo) {
+                    setChallanAiAgentStatus(params.requestId, params.challanNo, "running", "").catch((e) => {
+                        console.error(
+                            `[API] background setChallanAiAgentStatus(running) failed for ` +
+                            `requestId=${params.requestId} challanNo=${params.challanNo}:`,
                             e,
                         );
                     });
@@ -743,6 +756,31 @@ const server = Bun.serve({
                                 );
                             });
 
+                            // Per-challan aiAgentStatus = completed | failed (challan-payment only).
+                            // The user's enum is running/completed/failed, so partial maps to
+                            // failed and carries the partial reasons. jobId == challanNo here.
+                            if (job?.taskId === "challan-payment") {
+                                const challanNo =
+                                    typeof params?.challanNo === "string" ? params.challanNo : jobId;
+                                const cpStatus = resolvedStatus === "done" ? "completed" : "failed";
+                                const cpReason =
+                                    cpStatus === "completed"
+                                        ? ""
+                                        : (error
+                                            || (partialReasons && partialReasons.length
+                                                ? partialReasons.join("; ")
+                                                : "")
+                                            || summary
+                                            || "failed");
+                                setChallanAiAgentStatus(requestId, challanNo, cpStatus, cpReason).catch((e) => {
+                                    console.error(
+                                        `[API] background setChallanAiAgentStatus(${cpStatus}) failed for ` +
+                                        `requestId=${requestId} challanNo=${challanNo}:`,
+                                        e,
+                                    );
+                                });
+                            }
+
                             if (costData) {
                                 saveAgentCost(
                                     requestId,
@@ -841,6 +879,19 @@ const server = Bun.serve({
                     setAiAgentWorkStatus(requestId, job.taskId, "failed", source).catch((e) => {
                         console.error(
                             `[API] background setAiAgentWorkStatus(failed) on cancel failed for requestId=${requestId}:`,
+                            e,
+                        );
+                    });
+                }
+
+                // Per-challan aiAgentStatus = failed on cancel (challan-payment only),
+                // otherwise a cancelled challan would stay "running" forever.
+                if (job.taskId === "challan-payment" && requestId) {
+                    const challanNo = typeof params.challanNo === "string" ? params.challanNo : jobId;
+                    setChallanAiAgentStatus(requestId, challanNo, "failed", "cancelled by user").catch((e) => {
+                        console.error(
+                            `[API] background setChallanAiAgentStatus(failed/cancel) failed for ` +
+                            `requestId=${requestId} challanNo=${challanNo}:`,
                             e,
                         );
                     });
