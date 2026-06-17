@@ -76,23 +76,12 @@ export function liveConsoleHtml(jobId: string): string {
 
   .intervene { display:none; flex-direction:column; gap:10px;
     padding:12px; background:#1f1510; border:1px solid #fb923c44; border-radius:8px; }
-  .quick-btns { display:flex; gap:6px; flex-wrap:wrap; }
-  .quick-btns button {
-    background:#222; border:1px solid #444; color:#ccc; padding:5px 11px;
-    border-radius:5px; font-size:12px; cursor:pointer;
+  .intervene-hint { font-size:13px; line-height:1.5; color:#fbbf77; }
+  .btn.done {
+    background:#fb923c; color:#111; padding:11px 16px; font-size:14px; font-weight:700;
+    animation:pulse 2s infinite;
   }
-  .quick-btns button:hover { background:#333; border-color:#888; }
-  .intervene-form { display:flex; gap:8px; }
-  .intervene-form input {
-    flex:1; min-width:0; background:#111; border:1px solid #444; color:#eee;
-    padding:8px 12px; border-radius:6px; font-size:14px; outline:none;
-  }
-  .intervene-form input:focus { border-color:#fb923c; }
-  .intervene-form button {
-    background:#fb923c; color:#111; border:none; padding:8px 16px; border-radius:6px;
-    font-size:13px; font-weight:600; cursor:pointer; white-space:nowrap;
-  }
-  .intervene-form button:hover { background:#f97316; }
+  .btn.done:hover { background:#f97316; }
   #msg { font-size:13px; min-height:16px; }
   .sent { color:#4ade80; } .err { color:#f87171; }
 
@@ -126,11 +115,8 @@ export function liveConsoleHtml(jobId: string): string {
     </div>
 
     <div class="intervene" id="intervene">
-      <div class="quick-btns" id="quick"></div>
-      <div class="intervene-form">
-        <input type="text" id="inp" placeholder="Type your response…">
-        <button id="sendBtn">Send</button>
-      </div>
+      <div class="intervene-hint" id="interveneHint">Complete this step in the browser on the left (enter the OTP / finish the payment), then click <b>Done</b> so the agent continues.</div>
+      <button class="btn done" id="doneBtn">✅ Done — continue</button>
       <div id="msg"></div>
     </div>
 
@@ -146,28 +132,15 @@ const JOB_ID = ${JSON.stringify(jobId)};
 const CANCELABLE = ['running','queued','waiting_for_human','verifyingPayment'];
 let vncSet = false;
 let paramsRendered = false;
-let lastQuickType = null;
 
 const $ = function (id) { return document.getElementById(id); };
 
-function detectType(reason) {
-  if (!reason) return 'text';
-  const r = reason.toLowerCase();
-  if (r.includes('otp')) return 'otp';
-  if (r.includes('captcha')) return 'captcha';
-  if (r.includes('upi') || r.includes('qr')) return 'upi';
-  return 'text';
-}
-function placeholder(type) {
-  if (type === 'otp') return 'Enter OTP (e.g. 123456)';
-  if (type === 'captcha') return 'Type what you see, or "done" after solving in the view';
-  if (type === 'upi') return 'Type "done" after payment is complete';
-  return 'Type your response…';
-}
-function quickActions(type) {
-  if (type === 'captcha') return [{label:'I solved it', value:'done'}, {label:'done', value:'done'}];
-  if (type === 'upi') return [{label:'✅ Payment done', value:'done'}, {label:'❌ Payment failed', value:'failed'}];
-  return [{label:'✅ Done', value:'done'}];
+function hintFor(reason) {
+  const r = (reason || '').toLowerCase();
+  if (r.includes('otp')) return 'Enter the OTP in the browser on the left, submit it, then click Done.';
+  if (r.includes('captcha')) return 'Solve the CAPTCHA in the browser on the left, then click Done.';
+  if (r.includes('upi') || r.includes('qr')) return 'Complete the payment in the browser on the left, then click Done.';
+  return 'Complete this step in the browser on the left, then click Done so the agent continues.';
 }
 
 function renderParams(params, taskId, source) {
@@ -198,21 +171,7 @@ function renderIntervene(waiting, reason) {
   const panel = $('intervene');
   if (!waiting) { panel.style.display = 'none'; return; }
   panel.style.display = 'flex';
-  const type = detectType(reason);
-  if (type !== lastQuickType) {
-    lastQuickType = type;
-    const q = $('quick'); q.innerHTML = '';
-    quickActions(type).forEach(function (qa) {
-      const b = document.createElement('button');
-      b.textContent = qa.label;
-      b.onclick = function () { submitInput(qa.value); };
-      q.appendChild(b);
-    });
-    const inp = $('inp');
-    inp.placeholder = placeholder(type);
-    if (type === 'otp') { inp.setAttribute('inputmode','numeric'); inp.setAttribute('autocomplete','one-time-code'); }
-    else { inp.removeAttribute('inputmode'); inp.removeAttribute('autocomplete'); }
-  }
+  $('interveneHint').textContent = hintFor(reason);
 }
 
 async function poll() {
@@ -257,23 +216,19 @@ async function poll() {
   } catch (e) { /* transient network error; next tick retries */ }
 }
 
-async function submitInput(quickValue) {
-  const inp = $('inp');
-  const value = quickValue || (inp ? inp.value.trim() : '');
+async function submitDone() {
   const msg = $('msg');
-  if (!value) { if (inp) inp.focus(); return; }
-  $('sendBtn').disabled = true;
+  $('doneBtn').disabled = true;
   msg.className = ''; msg.textContent = 'Sending…';
   try {
     const res = await fetch('/api/jobs/' + JOB_ID + '/intervene', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ input: value }),
+      body: JSON.stringify({ input: 'done' }),
     });
     const data = await res.json().catch(function () { return {}; });
     if (res.ok) {
       msg.className = 'sent'; msg.textContent = 'Sent! Agent will resume shortly.';
-      if (inp) inp.value = '';
       setTimeout(poll, 1200);
     } else {
       msg.className = 'err'; msg.textContent = data.error || 'Failed';
@@ -281,7 +236,7 @@ async function submitInput(quickValue) {
   } catch (e) {
     msg.className = 'err'; msg.textContent = 'Network error';
   } finally {
-    $('sendBtn').disabled = false;
+    $('doneBtn').disabled = false;
   }
 }
 
@@ -293,8 +248,7 @@ async function cancelJob() {
 }
 
 $('cancelBtn').onclick = cancelJob;
-$('sendBtn').onclick = function () { submitInput(); };
-$('inp').addEventListener('keydown', function (e) { if (e.key === 'Enter') submitInput(); });
+$('doneBtn').onclick = submitDone;
 
 poll();
 setInterval(poll, 3000);
