@@ -115,7 +115,7 @@ export function liveConsoleHtml(jobId: string): string {
     </div>
 
     <div class="intervene" id="intervene">
-      <div class="intervene-hint" id="interveneHint">Complete this step in the browser on the left (enter the OTP / finish the payment), then click <b>Done</b> so the agent continues.</div>
+      <div class="intervene-hint" id="interveneHint">Click <b>Done</b> after the payment is complete in the browser on the left.</div>
       <button class="btn done" id="doneBtn">✅ Done — continue</button>
       <div id="msg"></div>
     </div>
@@ -136,11 +136,7 @@ let paramsRendered = false;
 const $ = function (id) { return document.getElementById(id); };
 
 function hintFor(reason) {
-  const r = (reason || '').toLowerCase();
-  if (r.includes('otp')) return 'Enter the OTP in the browser on the left, submit it, then click Done.';
-  if (r.includes('captcha')) return 'Solve the CAPTCHA in the browser on the left, then click Done.';
-  if (r.includes('upi') || r.includes('qr')) return 'Complete the payment in the browser on the left, then click Done.';
-  return 'Complete this step in the browser on the left, then click Done so the agent continues.';
+  return 'Click Done after the payment is complete in the browser on the left.';
 }
 
 function renderParams(params, taskId, source) {
