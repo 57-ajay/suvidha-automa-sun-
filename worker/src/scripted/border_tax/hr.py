@@ -94,6 +94,7 @@ from ._pending_clear import (
     navigate_to_owner_info_page,
     wait_for_owner_info_outcome,
 )
+from ._tax_time import ist_hhmm, stamp_dtlocal
 
 # ─── Selectors ─────────────────────────────────────────────────────────
 
@@ -158,9 +159,9 @@ SEL_QR_IMG = "img#qrcodeImg"
 # ─── Tuning ────────────────────────────────────────────────────────────
 
 PHASE_GAP_SECS = 1.5
-PERMIT_SET_TIMEOUT_SECS = 15         # per-attempt timeout when setting permit type
-EGRAS_NAVIGATION_TIMEOUT = 45        # post-submit → eGRAS page load
-EGRAS_REDIRECT_TIMEOUT = 60          # eGRAS Continue → SBIePay redirect
+PERMIT_SET_TIMEOUT_SECS = 15  # per-attempt timeout when setting permit type
+EGRAS_NAVIGATION_TIMEOUT = 45  # post-submit → eGRAS page load
+EGRAS_REDIRECT_TIMEOUT = 60  # eGRAS Continue → SBIePay redirect
 CHECKPOINT_POPULATE_TIMEOUT = 10
 
 
@@ -609,8 +610,7 @@ async def run(
         # de-dupe while preserving order
         seen: set[str] = set()
         permit_candidates = [
-            p for p in permit_candidates
-            if p and not (p in seen or seen.add(p))
+            p for p in permit_candidates if p and not (p in seen or seen.add(p))
         ]
 
         last_err = None
@@ -681,11 +681,14 @@ async def run(
 
     # 4d. Distance — text input, not a select. Read its current .value
     # via CDP; fill only when empty. Default 1000 if param missing.
-    distance_value = await _cdp_eval(
-        session,
-        "(function(){var e=document.querySelector("
-        "'input#floatingDistance');return e?e.value:'';})()",
-    ) or ""
+    distance_value = (
+        await _cdp_eval(
+            session,
+            "(function(){var e=document.querySelector("
+            "'input#floatingDistance');return e?e.value:'';})()",
+        )
+        or ""
+    )
     if not distance_value.strip():
         distance_to_set = (params.distance or "1000").strip()
         await fill(
@@ -744,10 +747,15 @@ async def run(
         )
 
     # 5b/5c. Tax From / Tax Upto — datetime-local inputs.
-    # The DOM .value the input ACCEPTS is "YYYY-MM-DDTHH:MM" (literal T).
-    # Plain YYYY-MM-DD will SILENTLY FAIL on these fields.
-    tf_dtlocal = f"{params.taxFrom}T00:00"
-    tu_dtlocal = f"{params.taxUpto}T00:00"
+
+    # Plain YYYY-MM-DD will SILENTLY FAIL on these fields. Stamp the current
+    # IST time (one read, reused for both ends) so the permit starts at
+    # submission and the From->Upto span stays an exact 24h multiple. HR is
+    # NO_SAME_DAY, so DAYS taxUpto is already taxFrom + duration >= tomorrow,
+    # staying above the field min. See _tax_time.py.
+    hhmm = ist_hhmm()
+    tf_dtlocal = stamp_dtlocal(params.taxFrom, hhmm)
+    tu_dtlocal = stamp_dtlocal(params.taxUpto, hhmm)
 
     await fill(
         session,
@@ -766,16 +774,22 @@ async def run(
 
     # Verify both fields actually accepted the value. If either is empty,
     # the form's "min" attribute likely rejected the date as out-of-range.
-    tf_actual = await _cdp_eval(
-        session,
-        "(function(){var e=document.querySelector("
-        "'input#floatingTaxfrom');return e?e.value:'';})()",
-    ) or ""
-    tu_actual = await _cdp_eval(
-        session,
-        "(function(){var e=document.querySelector("
-        "'input#uptpDate');return e?e.value:'';})()",
-    ) or ""
+    tf_actual = (
+        await _cdp_eval(
+            session,
+            "(function(){var e=document.querySelector("
+            "'input#floatingTaxfrom');return e?e.value:'';})()",
+        )
+        or ""
+    )
+    tu_actual = (
+        await _cdp_eval(
+            session,
+            "(function(){var e=document.querySelector("
+            "'input#uptpDate');return e?e.value:'';})()",
+        )
+        or ""
+    )
 
     if not tf_actual or not tf_actual.startswith(params.taxFrom):
         return RunOutcome(
@@ -829,7 +843,11 @@ async def run(
 
     if params.source == "web":
         return await web_handover_and_capture(
-            session, log, r, job_id, job_params,
+            session,
+            log,
+            r,
+            job_id,
+            job_params,
             vehicle_number=params.vehicleNumber,
             config=_HR_PAYMENT_CONFIG,
             extract_receipt_fields=_extract_receipt_fields,
@@ -1115,7 +1133,11 @@ async def run(
     )
 
     return await wait_for_payment_and_capture_receipt(
-        session, log, r, job_id, job_params,
+        session,
+        log,
+        r,
+        job_id,
+        job_params,
         vehicle_number=params.vehicleNumber,
         config=_HR_PAYMENT_CONFIG,
         extract_receipt_fields=_extract_receipt_fields,

@@ -91,6 +91,7 @@ from ._extract_amount import extract_and_save_border_tax_amount
 from ._payment_wait import PaymentCaptureConfig
 from ._web_handover import web_handover_and_capture
 from ._pending_clear import wait_for_owner_info_outcome
+from ._tax_time import ist_hhmm, stamp_dtlocal
 
 
 # ─── Selectors (shared parivahan Angular DOM) ──────────────────────────
@@ -409,6 +410,7 @@ async def _set_date_like(
     selector: str,
     iso_date: str,
     *,
+    hhmm: str | None,
     log: StepLogger,
     name: str,
 ) -> str:
@@ -416,10 +418,9 @@ async def _set_date_like(
     .value the field actually accepted (so the caller can verify it stuck
     above the field's `min`).
 
-    parivahan is inconsistent across states: some Tax From / Tax Upto inputs
-    are `type="date"` (canonical value "YYYY-MM-DD", e.g. Bihar) and some are
-    `type="datetime-local"` (value "YYYY-MM-DDTHH:MM", e.g. HP). Setting the
-    wrong format makes the browser silently drop the value, so we read the
+    datetime-local inputs (e.g. HP) get the caller's IST `hhmm` stamped;
+    type="date" (or text/unknown, e.g. Bihar) get the bare ISO date. Setting
+    the wrong format makes the browser silently drop the value, so we read the
     element's type first and format to match.
     """
     input_type = await _cdp_eval(
@@ -429,11 +430,10 @@ async def _set_date_like(
         + json.dumps(selector)
         + ")",
     )
-    if (input_type or "") == "datetime-local":
-        value = f"{iso_date}T00:00"
-    else:
-        # type="date" (or text/unknown) → plain ISO date.
-        value = iso_date
+    use_time = (input_type or "") == "datetime-local"
+    # datetime-local → "YYYY-MM-DDTHH:MM" with the shared IST time; date/text/
+    # unknown → plain "YYYY-MM-DD" (hhmm ignored). See _tax_time.py.
+    value = stamp_dtlocal(iso_date, hhmm if use_time else None)
     await fill(session, selector, value, log=log, name=name)
     actual = await _cdp_eval(
         session,
@@ -443,6 +443,47 @@ async def _set_date_like(
     )
     return str(actual or "")
 
+
+#
+# async def _set_date_like(
+#     session,
+#     selector: str,
+#     iso_date: str,
+#     *,
+#     log: StepLogger,
+#     name: str,
+# ) -> str:
+#     """Fill a date-ish input, formatting by its `type`, and return the DOM
+#     .value the field actually accepted (so the caller can verify it stuck
+#     above the field's `min`).
+#
+#     parivahan is inconsistent across states: some Tax From / Tax Upto inputs
+#     are `type="date"` (canonical value "YYYY-MM-DD", e.g. Bihar) and some are
+#     `type="datetime-local"` (value "YYYY-MM-DDTHH:MM", e.g. HP). Setting the
+#     wrong format makes the browser silently drop the value, so we read the
+#     element's type first and format to match.
+#     """
+#     input_type = await _cdp_eval(
+#         session,
+#         "(function(s){var e=document.querySelector(s);"
+#         "return e?((e.getAttribute('type')||e.type||'')).toLowerCase():'';})("
+#         + json.dumps(selector)
+#         + ")",
+#     )
+#     if (input_type or "") == "datetime-local":
+#         value = f"{iso_date}T00:00"
+#     else:
+#         # type="date" (or text/unknown) → plain ISO date.
+#         value = iso_date
+#     await fill(session, selector, value, log=log, name=name)
+#     actual = await _cdp_eval(
+#         session,
+#         "(function(s){var e=document.querySelector(s);return e?(e.value||''):'';})("
+#         + json.dumps(selector)
+#         + ")",
+#     )
+#     return str(actual or "")
+#
 
 # ─── Public entrypoint ─────────────────────────────────────────────────
 
@@ -892,10 +933,16 @@ async def run_handover_flow(
     #     Verify it stuck (a value below the field's min is silently
     #     rejected). Re-filling here also re-asserts the value in case the
     #     tax-mode selection reset it.
+    # datetime-local Tax From/Upto need a time; stamp the current IST time
+    # ONCE and reuse it for both ends so the span stays an exact 24h multiple
+    # (date-type states ignore it inside _set_date_like). See _tax_time.py.
+    tax_hhmm = ist_hhmm()
+
     tf_actual = await _set_date_like(
         session,
         SEL_TAX_FROM,
         params.taxFrom,
+        hhmm=tax_hhmm,
         log=log,
         name="phase5.fill_tax_from",
     )
@@ -918,6 +965,7 @@ async def run_handover_flow(
             session,
             SEL_TAX_UPTO,
             params.taxUpto,
+            hhmm=tax_hhmm,
             log=log,
             name="phase5.fill_tax_upto",
         )

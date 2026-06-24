@@ -111,6 +111,7 @@ from ._pending_clear import (
     navigate_to_owner_info_page,
     wait_for_owner_info_outcome,
 )
+from ._tax_time import ist_hhmm, stamp_dtlocal
 
 # ─── Selectors ─────────────────────────────────────────────────────────
 
@@ -180,10 +181,10 @@ SEL_QR_IMG = "img#qrcodeImg"
 # ─── Tuning ────────────────────────────────────────────────────────────
 
 PHASE_GAP_SECS = 1.5
-PERMIT_SET_TIMEOUT_SECS = 15         # per-attempt timeout when setting permit type
-IFMS_BANK_PAGE_TIMEOUT = 45          # post-submit -> IFMS bank-selection page mount
-SBIEPAY_REDIRECT_TIMEOUT = 60        # IFMS Continue -> SBIePay redirect
-CHECKPOINT_POPULATE_TIMEOUT = 10     # district -> checkpost options populated
+PERMIT_SET_TIMEOUT_SECS = 15  # per-attempt timeout when setting permit type
+IFMS_BANK_PAGE_TIMEOUT = 45  # post-submit -> IFMS bank-selection page mount
+SBIEPAY_REDIRECT_TIMEOUT = 60  # IFMS Continue -> SBIePay redirect
+CHECKPOINT_POPULATE_TIMEOUT = 10  # district -> checkpost options populated
 
 _PB_PAYMENT_CONFIG = PaymentCaptureConfig(
     state_name="Punjab",
@@ -638,8 +639,7 @@ async def run(
         # de-dupe while preserving order
         seen: set[str] = set()
         permit_candidates = [
-            p for p in permit_candidates
-            if p and not (p in seen or seen.add(p))
+            p for p in permit_candidates if p and not (p in seen or seen.add(p))
         ]
 
         last_err = None
@@ -763,10 +763,13 @@ async def run(
         )
 
     # 5b/5c. Tax From / Tax Upto — datetime-local inputs.
-    # The DOM .value the input ACCEPTS is "YYYY-MM-DDTHH:MM" (literal T).
-    # Plain YYYY-MM-DD will SILENTLY FAIL on these fields. Same as HR.
-    tf_dtlocal = f"{params.taxFrom}T00:00"
-    tu_dtlocal = f"{params.taxUpto}T00:00"
+
+    # Plain YYYY-MM-DD will SILENTLY FAIL on these fields. Same as HR: stamp
+    # the current IST time once and reuse it for both ends so the span stays
+    # an exact 24h multiple. See _tax_time.py.
+    hhmm = ist_hhmm()
+    tf_dtlocal = stamp_dtlocal(params.taxFrom, hhmm)
+    tu_dtlocal = stamp_dtlocal(params.taxUpto, hhmm)
 
     await fill(
         session,
@@ -785,16 +788,22 @@ async def run(
 
     # Verify both fields actually accepted the value. If either is empty,
     # the form's "min" attribute likely rejected the date as out-of-range.
-    tf_actual = await _cdp_eval(
-        session,
-        "(function(){var e=document.querySelector("
-        "'input#floatingTaxfrom');return e?e.value:'';})()",
-    ) or ""
-    tu_actual = await _cdp_eval(
-        session,
-        "(function(){var e=document.querySelector("
-        "'input#uptpDate');return e?e.value:'';})()",
-    ) or ""
+    tf_actual = (
+        await _cdp_eval(
+            session,
+            "(function(){var e=document.querySelector("
+            "'input#floatingTaxfrom');return e?e.value:'';})()",
+        )
+        or ""
+    )
+    tu_actual = (
+        await _cdp_eval(
+            session,
+            "(function(){var e=document.querySelector("
+            "'input#uptpDate');return e?e.value:'';})()",
+        )
+        or ""
+    )
 
     if not tf_actual or not tf_actual.startswith(params.taxFrom):
         return RunOutcome(
@@ -848,7 +857,11 @@ async def run(
 
     if params.source == "web":
         return await web_handover_and_capture(
-            session, log, r, job_id, job_params,
+            session,
+            log,
+            r,
+            job_id,
+            job_params,
             vehicle_number=params.vehicleNumber,
             config=_PB_PAYMENT_CONFIG,
             extract_receipt_fields=_extract_receipt_fields,
@@ -1094,7 +1107,11 @@ async def run(
     )
 
     return await wait_for_payment_and_capture_receipt(
-        session, log, r, job_id, job_params,
+        session,
+        log,
+        r,
+        job_id,
+        job_params,
         vehicle_number=params.vehicleNumber,
         config=_PB_PAYMENT_CONFIG,
         extract_receipt_fields=_extract_receipt_fields,
