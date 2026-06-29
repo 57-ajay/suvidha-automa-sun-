@@ -91,6 +91,11 @@ from ._extract_amount import extract_and_save_border_tax_amount
 from ._payment_wait import PaymentCaptureConfig
 from ._web_handover import web_handover_and_capture
 from ._pending_clear import wait_for_owner_info_outcome
+from ._manual_entry import (
+    dismiss_no_data_popup,
+    fill_owner_info_manual,
+    fill_vehicle_info_manual,
+)
 from ._tax_time import ist_hhmm, stamp_dtlocal
 
 
@@ -155,6 +160,16 @@ class StateHandoverConfig:
     checkpost_strategy: Literal["match_district", "first_option"]
     payment_config: PaymentCaptureConfig
     extract_receipt_fields: Callable[..., Awaitable[dict | None]]
+
+    # ── Manual-entry fallback (VAHAN "No data found" → fill from DB) ──
+    # Forwarded to fill_vehicle_info_manual. Defaults match the CheckPost
+    # V4 norm UK/PB/MP share (Vehicle Category present, no Distance field,
+    # plain type="date" validity inputs). Override per state if the DOM
+    # differs — e.g. set manual_datetime_local_dates=True where the
+    # vehicle-info validity dates are <input type="datetime-local">.
+    manual_has_category: bool = True
+    manual_has_distance: bool = False
+    manual_datetime_local_dates: bool = False
 
 
 # ─── Small DOM helpers ─────────────────────────────────────────────────
@@ -624,7 +639,40 @@ async def run_handover_flow(
             abort_reason="get_details_timeout",
             run_log=log.dump(),
         )
-    # outcome == "district_ready" — proceed.
+    # outcome == "district_ready" or "manual_entry".
+    #
+    # manual_entry = VAHAN had no data ("No data found for this vehicle
+    # number…"). Dismiss the popup and fill Chassis / Owner / Mobile /
+    # From-State from the DB record before picking District + Checkpost
+    # (those are physical route attributes the manual fill deliberately
+    # leaves to the code below, exactly as on the VAHAN-success path).
+    is_manual = outcome == "manual_entry"
+    if is_manual:
+        if not params.vehicleDetails:
+            return RunOutcome(
+                status="failed",
+                summary=(
+                    f"VAHAN returned no data for {params.vehicleNumber} and "
+                    f"no vehicleDetails record was attached to the job, so "
+                    f"the owner/vehicle forms can't be auto-filled."
+                ),
+                abort_reason="manual_entry_no_db_record",
+                run_log=log.dump(),
+            )
+        await dismiss_no_data_popup(
+            session, log=log, name="phase3.dismiss_no_data"
+        )
+        await fill_owner_info_manual(
+            session,
+            params.vehicleDetails,
+            log=log,
+            name_prefix="phase3.manual",
+            mobile_number=(
+                params.mobileNumber
+                if params.mobileNumber is not None
+                else "0000000000"
+            ),
+        )
 
     # 3a. Entry District — try the configured/default district by text,
     #     fall back to the first available option for robustness.
@@ -723,6 +771,22 @@ async def run_handover_flow(
         name="phase4.wait_vehicle_info_page",
         timeout=30,
     )
+
+    if is_manual:
+        # VAHAN had no data — fill the entire vehicle-info step from the DB
+        # record now. The "leave if filled, else first option" blocks below
+        # then no-op because every field is already populated. Per-state
+        # field-set differences are absorbed by _fill_if_present inside.
+        await fill_vehicle_info_manual(
+            session,
+            params.vehicleDetails,
+            params,
+            log=log,
+            name_prefix="phase4.manual",
+            has_category=config.manual_has_category,
+            has_distance=config.manual_has_distance,
+            datetime_local_dates=config.manual_datetime_local_dates,
+        )
 
     # 4a. Vehicle Category — leave if pre-filled, else first option.
     try:
