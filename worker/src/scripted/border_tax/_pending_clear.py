@@ -201,6 +201,8 @@ def auto_clear_enabled() -> bool:
 #
 # Returns one of:
 #   {state: "pending_popup"}            initial popup from a stale pending tx
+#   {state: "manual_entry", text:""}    "No data found" popup — VAHAN has no
+#                                       RC data; we fill the form from our DB
 #   {state: "validity_popup", text:""}  insurance/fitness/pucc/expired/renew
 #   {state: "district_ready"}           district <select> visible
 #   {state: "pending"}                  nothing decisive yet (keep polling)
@@ -216,6 +218,9 @@ _OWNER_INFO_OUTCOME_JS = """
         || (lower.indexOf('check pending transaction') !== -1
             && lower.indexOf('pending') !== -1)) {
       return {state: 'pending_popup', text: text.substring(0, 240)};
+    }
+    if (lower.indexOf('no data found') !== -1) {
+      return {state: 'manual_entry', text: text.substring(0, 240)};
     }
     if (/(insurance|fitness|pucc|expired|renew|not\\s*valid)/i.test(text)) {
       return {state: 'validity_popup', text: text.substring(0, 240)};
@@ -1000,7 +1005,7 @@ async def wait_for_owner_info_outcome(
     name: str = "phase3.wait_owner_outcome",
     timeout: float = OWNER_OUTCOME_POLL_SECS,
     tick: float = OWNER_OUTCOME_POLL_TICK_SECS,
-) -> Literal["district_ready", "pending_popup", "validity_popup", "timeout"]:
+) -> Literal["district_ready", "pending_popup", "validity_popup", "manual_entry", "timeout"]:
     """Poll the owner-info page after Get Details was clicked.
 
     Replaces the old `wait_for_selector(SEL_DISTRICT, timeout=30)` in
@@ -1031,6 +1036,16 @@ async def wait_for_owner_info_outcome(
                 value="district_ready",
             ))
             return "district_ready"
+        if state == "manual_entry":
+            print(f"[pending_clear] owner-info outcome: manual_entry (no VAHAN data)")
+            log.record(StepLog(
+                index=log.next_index(),
+                name=name,
+                status=StepStatus.OK,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                value=f"manual_entry: {last_text[:120]}",
+            ))
+            return "manual_entry"
         if state == "pending_popup":
             print(f"[pending_clear] owner-info outcome: pending_popup detected")
             log.record(StepLog(

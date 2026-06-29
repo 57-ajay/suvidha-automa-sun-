@@ -27,6 +27,7 @@ Service Type dropdown.
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Literal
 
@@ -190,7 +191,15 @@ class BorderTaxParams(BaseModel):
 
     # plumbing
     driverId: str | None = None
+    mobileNumber: str | None = None
     source: Literal["app", "web"] = "web"
+
+    # Full Firestore `vehicleDetails/{REGNO}` record, attached by the API at
+    # queue time. Used ONLY when VAHAN's "Get Details" returns no data and we
+    # must fill the owner-info + vehicle-info forms manually. The API stores
+    # it as a JSON string inside the flat params map, so accept both a dict
+    # (direct) and a JSON string (from Redis).
+    vehicleDetails: dict | None = None
 
     # state-specific extras (passthrough; states ignore what they don't use)
     distance: str | None = None
@@ -219,6 +228,24 @@ class BorderTaxParams(BaseModel):
     @classmethod
     def _trim_upper(cls, v: str) -> str:
         return (v or "").strip().upper()
+
+    @field_validator("vehicleDetails", mode="before")
+    @classmethod
+    def _parse_vehicle_details(cls, v):
+        """Accept a dict, a JSON string (how the API ships it through Redis),
+        or empty → None. Never raise on bad JSON — a malformed record just
+        means no manual-fill fallback, not a hard validation failure."""
+        if v is None or v == "":
+            return None
+        if isinstance(v, dict):
+            return v
+        if isinstance(v, str):
+            try:
+                parsed = json.loads(v)
+                return parsed if isinstance(parsed, dict) else None
+            except Exception:
+                return None
+        return None
 
     # ── model validator: apply state-specific defaults ────────────────────
 

@@ -111,6 +111,11 @@ from ._pending_clear import (
     navigate_to_owner_info_page,
     wait_for_owner_info_outcome,
 )
+from ._manual_entry import (
+    dismiss_no_data_popup,
+    fill_owner_info_manual,
+    fill_vehicle_info_manual,
+)
 from ._tax_time import ist_hhmm, stamp_dtlocal
 
 # ─── Selectors ─────────────────────────────────────────────────────────
@@ -481,7 +486,7 @@ async def run(
         outcome = await wait_for_owner_info_outcome(
             session, log, name="phase3.wait_owner_outcome_retry"
         )
-        if outcome != "district_ready":
+        if outcome not in ("district_ready", "manual_entry"):
             return RunOutcome(
                 status="failed",
                 summary=(
@@ -516,7 +521,33 @@ async def run(
             run_log=log.dump(),
         )
 
-    # outcome == "district_ready" — continue with the existing flow.
+    # outcome is "district_ready" (VAHAN filled the owner/vehicle forms) or
+    # "manual_entry" (the "No data found" popup — we fill from the attached
+    # DB record). Anything else returned above.
+    is_manual = outcome == "manual_entry"
+
+    if is_manual:
+        if not params.vehicleDetails:
+            return RunOutcome(
+                status="failed",
+                summary=(
+                    f"VAHAN returned no data for {params.vehicleNumber} and no "
+                    f"vehicleDetails record was attached to the job, so the "
+                    f"owner/vehicle forms can't be auto-filled."
+                ),
+                abort_reason="manual_entry_no_db_record",
+                run_log=log.dump(),
+            )
+        await dismiss_no_data_popup(session, log=log, name="phase3.dismiss_no_data")
+        await fill_owner_info_manual(
+            session,
+            params.vehicleDetails,
+            log=log,
+            name_prefix="phase3.manual",
+            mobile_number=params.mobileNumber
+            if params.mobileNumber is not None
+            else "0000000000",
+        )
 
     if not params.entryDistrict:
         return RunOutcome(
@@ -605,6 +636,21 @@ async def run(
         name="phase4.wait_vehicle_info_page",
         timeout=30,
     )
+
+    if is_manual:
+        # VAHAN had no data — fill the whole vehicle-info step from the DB
+        # record now. The "fill if empty" blocks below then no-op because
+        # every field is already populated. PB has no Distance field.
+        await fill_vehicle_info_manual(
+            session,
+            params.vehicleDetails,
+            params,
+            log=log,
+            name_prefix="phase4.manual",
+            has_category=True,
+            has_distance=False,
+            datetime_local_dates=False,
+        )
 
     # 4a. Vehicle Category — usually pre-filled from RC ("LIGHT PASSENGER
     # VEHICLE"). If empty, log a warning and continue; the form's Next

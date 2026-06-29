@@ -14,6 +14,8 @@ import { handleSaveQR } from "./internal/borderTax/qr";
 import { handleSaveRunLog, type RunLogStep } from "./internal/borderTax/runLog";
 import { updateBorderTaxUsageOnCompletion } from "./internal/borderTax/driverUsage";
 import { handleCheckEligibility } from "./internal/borderTax/checkEligibility";
+import { fetchVehicleDetails } from "./internal/borderTax/vehicleDetails";
+import { resolveDriverMobile } from "./internal/borderTax/driverContact";
 
 const redis = new Redis(process.env.REDIS_URL || "redis://localhost:6379");
 
@@ -88,6 +90,48 @@ const server = Bun.serve({
                         { error: `Missing params: ${missing.join(", ")}` },
                         { status: 400 }
                     );
+                }
+
+                // For border-tax, when the app didn't supply mobileNumber
+                // (it's optional), fall back to the driver's phone from the
+                // drivers doc — we always have driverId. The worker uses
+                // params.mobileNumber for the owner-info Mobile field.
+                if (
+                    taskId === "border-tax" &&
+                    !params?.mobileNumber &&
+                    params?.driverId
+                ) {
+                    const driverPhone = await resolveDriverMobile(params.driverId);
+                    if (driverPhone) {
+                        params = { ...params, mobileNumber: driverPhone };
+                        console.log(
+                            `[API] /api/run filled mobileNumber from driver ${params.driverId}`
+                        );
+                    } else {
+                        console.log(
+                            `[API] /api/run no phone for driver ${params.driverId}; ` +
+                            `mobileNumber left empty`
+                        );
+                    }
+                }
+
+                // For border-tax, attach the vehicleDetails DB record so the
+                // worker can fill the parivahan owner/vehicle forms manually
+                // when VAHAN's "Get Details" returns no data. Shipped as a
+                // JSON string inside the flat params map.
+                if (taskId === "border-tax" && params?.vehicleNumber) {
+                    const vd = await fetchVehicleDetails(params.vehicleNumber);
+                    if (vd) {
+                        params = { ...params, vehicleDetails: JSON.stringify(vd) };
+                        console.log(
+                            `[API] /api/run attached vehicleDetails for ${params.vehicleNumber}`
+                        );
+                    } else {
+                        console.log(
+                            `[API] /api/run no vehicleDetails doc for ${params.vehicleNumber} ` +
+                            `(manual-entry fallback will have no data)`
+                        );
+                    }
                 }
 
                 const jobId = params?.requestId || crypto.randomUUID();

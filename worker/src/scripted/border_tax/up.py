@@ -64,6 +64,11 @@ from ._pending_clear import (
     navigate_to_owner_info_page,
     wait_for_owner_info_outcome,
 )
+from ._manual_entry import (
+    dismiss_no_data_popup,
+    fill_owner_info_manual,
+    fill_vehicle_info_manual,
+)
 
 # ─── Selectors ─────────────────────────────────────────────────────────
 
@@ -414,14 +419,14 @@ async def run(
         outcome = await wait_for_owner_info_outcome(
             session, log, name="phase3.wait_owner_outcome_retry"
         )
-        if outcome != "district_ready":
+        if outcome not in ("district_ready", "manual_entry"):
             return RunOutcome(
                 status="failed",
                 summary=(
                     f"After clearing pending transaction for vehicle "
                     f"{params.vehicleNumber}, phase-3 retry yielded "
-                    f"outcome={outcome!r} (expected 'district_ready'). "
-                    f"Cannot continue."
+                    f"outcome={outcome!r} (expected 'district_ready' or "
+                    f"'manual_entry'). Cannot continue."
                 ),
                 abort_reason=f"after_pending_clear:{outcome}",
                 run_log=log.dump(),
@@ -451,7 +456,33 @@ async def run(
             run_log=log.dump(),
         )
 
-    # outcome == "district_ready" — continue with the existing flow.
+    # outcome is now "district_ready" (VAHAN auto-filled the owner/vehicle
+    # forms) or "manual_entry" (the "No data found" popup — we fill the forms
+    # ourselves from the attached DB record). Anything else returned above.
+    is_manual = outcome == "manual_entry"
+
+    if is_manual:
+        if not params.vehicleDetails:
+            return RunOutcome(
+                status="failed",
+                summary=(
+                    f"VAHAN returned no data for {params.vehicleNumber} and no "
+                    f"vehicleDetails record was attached to the job, so the "
+                    f"owner/vehicle forms can't be auto-filled."
+                ),
+                abort_reason="manual_entry_no_db_record",
+                run_log=log.dump(),
+            )
+        await dismiss_no_data_popup(session, log=log, name="phase3.dismiss_no_data")
+        await fill_owner_info_manual(
+            session,
+            params.vehicleDetails,
+            log=log,
+            name_prefix="phase3.manual",
+            mobile_number=params.mobileNumber
+            if params.mobileNumber is not None
+            else "0000000000",
+        )
 
     if not params.entryDistrict:
         return RunOutcome(
@@ -530,96 +561,127 @@ async def run(
         timeout=30,
     )
 
-    # Some vehicles arrive with Permit Type pre-filled from RC data; others
-    # arrive empty. If empty, Service Type's options can't populate (they're
-    # conditional on Permit Type). Set it ourselves with a two-tier fallback.
-    current_permit = await get_select_value(session, SEL_PERMIT_TYPE)
-    if current_permit:
-        log.record(
-            StepLog(
-                index=log.next_index(),
-                name="phase4.permit_already_set",
-                status=StepStatus.SKIPPED,
-                selector=SEL_PERMIT_TYPE,
-                value=current_permit,
-                duration_ms=0,
-            )
+    if is_manual:
+        # VAHAN had no data — fill the ENTIRE vehicle-info step from the DB
+        # record: Type → Class → Category → Permit (dependent cascade),
+        # Seating, Sleeper, Service Type, all validity dates, Permit No.
+        # UP has a Vehicle Category select and plain <input type="date">.
+        await fill_vehicle_info_manual(
+            session,
+            params.vehicleDetails,
+            params,
+            log=log,
+            name_prefix="phase4.manual",
+            has_category=True,
+            has_distance=False,
+            datetime_local_dates=False,
+        )
+        await abort_if_popup_text(
+            session,
+            _validity_keywords,
+            _validity_abort,
+            log=log,
+            name="phase4.check_validity_after_manual_fill",
+            close_selector=(
+                "button.swal2-confirm, .modal-footer button, .swal-button--confirm"
+            ),
         )
     else:
-        permit_set = False
-        attempts: list[tuple[str, str]] = []  # (label, text)
-        if params.permitType:
-            attempts.append(("primary", params.permitType))
-        if params.permitTypeFallback and params.permitTypeFallback != params.permitType:
-            attempts.append(("fallback", params.permitTypeFallback))
-
-        last_err: Exception | None = None
-        for label, permit_text in attempts:
-            try:
-                await select_by_text(
-                    session,
-                    SEL_PERMIT_TYPE,
-                    permit_text,
-                    log=log,
-                    name=f"phase4.set_permit_type.{label}",
-                    timeout=PERMIT_SET_TIMEOUT_SECS,
+        # ── VAHAN-success path: RC pre-filled most fields. Some vehicles
+        # arrive with Permit Type pre-filled; others arrive empty. If empty,
+        # Service Type's options can't populate (they're conditional on
+        # Permit Type). Set it ourselves with a two-tier fallback. ──
+        current_permit = await get_select_value(session, SEL_PERMIT_TYPE)
+        if current_permit:
+            log.record(
+                StepLog(
+                    index=log.next_index(),
+                    name="phase4.permit_already_set",
+                    status=StepStatus.SKIPPED,
+                    selector=SEL_PERMIT_TYPE,
+                    value=current_permit,
+                    duration_ms=0,
                 )
-                permit_set = True
-                break
-            except Exception as e:
-                last_err = e
-                continue
-
-        if not permit_set:
-            tried = " / ".join(t for _, t in attempts) or "(none)"
-            return RunOutcome(
-                status="failed",
-                summary=(
-                    f"Permit Type was empty for vehicle "
-                    f"{params.vehicleNumber} and none of the configured "
-                    f"options [{tried}] were available in the dropdown. "
-                    f"Last error: "
-                    f"{type(last_err).__name__ if last_err else 'n/a'}: "
-                    f"{last_err if last_err else 'n/a'}"
-                ),
-                abort_reason="permit_type_not_settable",
-                run_log=log.dump(),
             )
+        else:
+            permit_set = False
+            attempts: list[tuple[str, str]] = []  # (label, text)
+            if params.permitType:
+                attempts.append(("primary", params.permitType))
+            if (
+                params.permitTypeFallback
+                and params.permitTypeFallback != params.permitType
+            ):
+                attempts.append(("fallback", params.permitTypeFallback))
 
-        # Give Angular a beat to react to the Permit Type change before
-        # Service Type's options are queried. select_by_text below also
-        # polls with wake-up events, so this sleep is belt-and-suspenders.
-        await asyncio.sleep(1.5)
+            last_err: Exception | None = None
+            for label, permit_text in attempts:
+                try:
+                    await select_by_text(
+                        session,
+                        SEL_PERMIT_TYPE,
+                        permit_text,
+                        log=log,
+                        name=f"phase4.set_permit_type.{label}",
+                        timeout=PERMIT_SET_TIMEOUT_SECS,
+                    )
+                    permit_set = True
+                    break
+                except Exception as e:
+                    last_err = e
+                    continue
 
-    await abort_if_popup_text(
-        session,
-        _validity_keywords,
-        _validity_abort,
-        log=log,
-        name="phase4.check_validity_after_permit",
-        close_selector=(
-            "button.swal2-confirm, .modal-footer button, .swal-button--confirm"
-        ),
-    )
+            if not permit_set:
+                tried = " / ".join(t for _, t in attempts) or "(none)"
+                return RunOutcome(
+                    status="failed",
+                    summary=(
+                        f"Permit Type was empty for vehicle "
+                        f"{params.vehicleNumber} and none of the configured "
+                        f"options [{tried}] were available in the dropdown. "
+                        f"Last error: "
+                        f"{type(last_err).__name__ if last_err else 'n/a'}: "
+                        f"{last_err if last_err else 'n/a'}"
+                    ),
+                    abort_reason="permit_type_not_settable",
+                    run_log=log.dump(),
+                )
 
-    await select_by_text(
-        session,
-        SEL_SERVICE_TYPE,
-        params.serviceType,
-        log=log,
-        name="phase4.select_service_type",
-    )
-    await asyncio.sleep(1.0)
-    await abort_if_popup_text(
-        session,
-        _validity_keywords,
-        _validity_abort,
-        log=log,
-        name="phase4.check_validity_after_service",
-        close_selector=(
-            "button.swal2-confirm, .modal-footer button, .swal-button--confirm"
-        ),
-    )
+            # Give Angular a beat to react to the Permit Type change before
+            # Service Type's options are queried. select_by_text below also
+            # polls with wake-up events, so this sleep is belt-and-suspenders.
+            await asyncio.sleep(1.5)
+
+        await abort_if_popup_text(
+            session,
+            _validity_keywords,
+            _validity_abort,
+            log=log,
+            name="phase4.check_validity_after_permit",
+            close_selector=(
+                "button.swal2-confirm, .modal-footer button, .swal-button--confirm"
+            ),
+        )
+
+        await select_by_text(
+            session,
+            SEL_SERVICE_TYPE,
+            params.serviceType,
+            log=log,
+            name="phase4.select_service_type",
+        )
+        await asyncio.sleep(1.0)
+        await abort_if_popup_text(
+            session,
+            _validity_keywords,
+            _validity_abort,
+            log=log,
+            name="phase4.check_validity_after_service",
+            close_selector=(
+                "button.swal2-confirm, .modal-footer button, .swal-button--confirm"
+            ),
+        )
+
     await click_by_text(
         session,
         "Next",
@@ -709,7 +771,11 @@ async def run(
     # assert params.source == 'app'
     if params.source == "web":
         return await web_handover_and_capture(
-            session, log, r, job_id, job_params,
+            session,
+            log,
+            r,
+            job_id,
+            job_params,
             vehicle_number=params.vehicleNumber,
             config=_UP_PAYMENT_CONFIG,
             extract_receipt_fields=_extract_receipt_fields,
@@ -892,7 +958,11 @@ async def run(
         )
     )
     return await wait_for_payment_and_capture_receipt(
-        session, log, r, job_id, job_params,
+        session,
+        log,
+        r,
+        job_id,
+        job_params,
         vehicle_number=params.vehicleNumber,
         config=_UP_PAYMENT_CONFIG,
         extract_receipt_fields=_extract_receipt_fields,
