@@ -21,7 +21,7 @@ from cost_calculator import fill_missing_cost
 
 
 # Centralized so captcha.py and runner.py share the same model/project.
-LLM_MODEL = "gemini-3-flash-preview"
+LLM_MODEL = "gemini-2.5-flash"
 VERTEX_PROJECT = "cabswale-ai"
 MAX_RESCUE_STEPS = 15
 
@@ -31,6 +31,7 @@ def build_llm():
     return ChatGoogle(
         model=LLM_MODEL,
         vertexai=True,
+        location="asia-south1",
         project=VERTEX_PROJECT,
     )
 

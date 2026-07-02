@@ -26,97 +26,37 @@ function renderPricingTable(): string {
 }
 
 export const buildPrompt = async (p: Record<string, string>, source: JobSource = "web"): Promise<string> => {
+    // Departments are resolved server-side from the challans already stored in the
+    // database for this vehicle. We no longer scrape Delhi Traffic Police — this
+    // list is the ONLY source of departments to query on Virtual Courts.
     const existingDepartments = await challansFromDB(p);
 
-    const hasMobileChange = !!(p.mobileNumber && p.chassisLastFour && p.engineLastFour);
-    const providedLastFour = p.mobileNumber ? p.mobileNumber.slice(-4) : "";
-    const hasExtraDepts = existingDepartments.length > 0;
     const isApp = source === "app";
+    const hasDepts = existingDepartments.length > 0;
 
     // ─── Dynamic blocks ────────────────────────────────────────────────────────
 
     const executionContextBlock = isApp
         ? `<execution_context mode="app">
-Job launched from the mobile app. The human CANNOT see the live browser.
-- CAPTCHA: solve it yourself. Do NOT call wait_for_human for CAPTCHA.
-- OTP: the human can still respond via the app. wait_for_human is valid for OTPs only.
+Job launched from the mobile app. The human CANNOT see the live browser and is NOT available.
+- CAPTCHA: solve it yourself. NEVER call wait_for_human.
 - Popups/modals: dismiss yourself by clicking X / OK / Close.
+- There is NO OTP step and NO human fallback anywhere in this flow.
 </execution_context>`
         : `<execution_context mode="web">
 Job launched from the web dashboard. The human CAN see the live browser.
 - CAPTCHA: after the retry budget is exhausted, call wait_for_human so the human solves it.
-- OTP: call wait_for_human as instructed in Phase 1.
 - Popups/modals: dismiss yourself by clicking X / OK / Close.
+- There is NO OTP step in this flow.
 </execution_context>`;
 
     const waitForHumanDesc = isApp
-        ? `wait_for_human — OTPs ONLY (Phase 0 / Phase 1). Never for CAPTCHA in app mode.`
-        : `wait_for_human — for OTPs, and for CAPTCHA after the retry budget is exhausted.`;
+        ? `wait_for_human — NOT used in this flow. Never call it.`
+        : `wait_for_human — for CAPTCHA only, after the retry budget is exhausted.`;
 
-    // ─── Phase 0 (mobile change) ───────────────────────────────────────────────
-
-    const phase0Block = hasMobileChange
-        ? `
-<phase id="0" name="change_mobile_number">
-TRIGGER: You clicked "Search Details" on Delhi Traffic Police and an OTP dialog appeared. Do NOT enter the OTP yet.
-
-STEP 0 — DECIDE WHETHER TO CHANGE:
-  The dialog shows a masked number like "******7763" (last 4 digits visible).
-  Provided mobile last 4 = "${providedLastFour}".
-  Verify the digits visible in the dialog.
-  - Digits MATCH "${providedLastFour}" → registered mobile is correct. SKIP Phase 0. Go to Phase 1 Step 4.
-  - Digits DO NOT MATCH, or you cannot read them clearly → continue to Step 1.
-
-STEP 1: Click "Change mobile Number" inside the OTP dialog.
-  Verify a form appears with: "New Mobile Number", "Confirm Mobile Number",
-  "Last Four digit of Chasis Number", "Last Four digit of Engine Number".
-
-STEP 2: Fill the form:
-  - New Mobile Number        → ${p.mobileNumber}
-  - Confirm Mobile Number    → ${p.mobileNumber}
-  - Last Four digit of Chasis Number  → ${p.chassisLastFour}
-  - Last Four digit of Engine Number  → ${p.engineLastFour}
-  Click the green "Submit" button.
-
-STEP 3: Verify the page returns to the search screen (Vehicle Number input visible).
-  - Re-type "${p.vehicleNumber}" in Vehicle Number.
-  - Click "Search Details" again.
-  - A fresh OTP is sent to ${p.mobileNumber}.
-  - Call wait_for_human: "OTP sent to ${p.mobileNumber}. Please enter it and click Submit, then reply done."
-  - After human responds → continue to Phase 1 Step 4.
-</phase>`
-        : "";
-
-    // ─── Phase 1 OTP handling ──────────────────────────────────────────────────
-
-    const otpHandlingBlock = hasMobileChange
-        ? `OTP HANDLING (Phase 1 Step 4):
-  Run Phase 0 Step 0 first (last-4-digits check).
-  - If Phase 0 said SKIP (digits matched) → call wait_for_human:
-    "OTP sent to registered mobile ending in ${providedLastFour}. Please enter it and click Submit, then reply done."
-  - If Phase 0 ran fully → OTP was handled at the end of Phase 0. Continue extraction.`
-        : `OTP HANDLING (Phase 1 Step 4):
-  Call wait_for_human: "OTP required on Delhi Traffic Police. Please enter it and click Submit, then reply done."
-  After human responds → continue extraction.`;
-
-    // ─── Phase 1 zero-challan branch ──────────────────────────────────────────
-
-    const zeroChallanBranch = hasExtraDepts
-        ? `If 0 challans found → note "0 challans on Delhi Traffic Police". Skip save_challans.
-  Continue to Phase 1.5 — DB departments still need to be queried.
-  Do NOT add Delhi(Notice Department) since DTP found nothing.`
-        : `If 0 challans found → note "0 challans on Delhi Traffic Police". Skip save_challans.
-  Skip Phase 1.5 and Phase 2 entirely. Go directly to COMPLETION.`;
-
-    // ─── Phase 1.5 extra departments ──────────────────────────────────────────
-
-    const extraDeptsBlock = hasExtraDepts
-        ? `
-ADDITIONAL DEPARTMENTS FROM DATABASE:
-The system has pre-existing challans for this vehicle in these departments:
-${existingDepartments.map(d => `  - ${d}`).join("\n")}
-Add all of these to your department list even if no challan from Phase 1 maps to them.`
-        : "";
+    const departmentsBlock = hasDepts
+        ? existingDepartments.map(d => `  - ${d}`).join("\n")
+        : "  (none)";
 
     // ─── CAPTCHA BLOCK ─────────────────────────────────────────────────────────
     // Goal: maximize patience and break out of solve-loops when results appear.
@@ -259,7 +199,7 @@ After 10 failed attempts → SKIP this department.
 STATE: dept → SKIPPED (captcha_failed_app).
 Never call wait_for_human for captcha in app mode.
 This skip IS a failure reason. COMPLETION will force "Status: partial".
-If this was the last department → continue to Phase 2.5 → Phase 3 → COMPLETION
+If this was the last department → continue to Phase 3 → COMPLETION
 with whatever was already saved.
 </exhaustion>
 
@@ -368,24 +308,23 @@ All captcha skips ARE failure reasons → COMPLETION forces "Status: partial".
 
     return `
 <role>
-You are a precise browser automation agent. Your job: extract traffic challan data
-for vehicle ${p.vehicleNumber} from two Indian government websites and save it via
-tool calls. Follow the procedure exactly. Verify every action's result before moving on.
+You are a precise browser automation agent. Your job: for vehicle ${p.vehicleNumber},
+look up traffic-challan settlement discounts on the Indian government Virtual Courts
+website and save them via tool calls. Follow the procedure exactly. Verify every
+action's result before moving on.
 </role>
 
 <context>
 <vehicle_number>${p.vehicleNumber}</vehicle_number>
-${hasMobileChange ? `<target_mobile>${p.mobileNumber}</target_mobile>` : ""}
 
 ${executionContextBlock}
 
 <tools>
 - ${waitForHumanDesc}
-- save_challans — call AT MOST ONCE after Phase 1, only if ≥1 challan was extracted.
-- save_discounts — call ONCE PER DEPARTMENT after Step C in Phase 2, AND ONCE in Phase 2.5.
+- save_discounts — call ONCE PER DEPARTMENT after Step C in Phase 2.
   Each call is independent. Do not accumulate records across departments.
 
-Tool-call protocol — apply before every save_* call:
+Tool-call protocol — apply before every save_discounts call:
   1. Build the array. Deduplicate by challanId.
   2. Verify count(unique challanIds) === array.length.
   3. Verify every value passes <quality_gates>.
@@ -397,15 +336,6 @@ Tool-call protocol — apply before every save_* call:
 <reference>
 
 <extraction_contract>
-
-<delhi_traffic_police_fields>
-For each challan ROW in the DTP results table:
-  challanId ← "Challan No." column — copy verbatim (e.g. "DL19016240430095546" or "57693177")
-  offence   ← "Offence" column — descriptive text only, no section numbers or acts
-  amount    ← "Fine Amount" column (integer ₹)
-  date      ← "Date" column — convert to YYYY-MM-DD
-  status    ← note "Pay Now" (Pending for Payment) or "Virtual Court" — drives Phase 2.5
-</delhi_traffic_police_fields>
 
 <virtual_courts_fields>
 For each numbered RECORD on the VC results page:
@@ -428,28 +358,13 @@ For each numbered RECORD on the VC results page:
 </extraction_contract>
 
 <pricing_table>
-Used for: (a) filling missing Phase 1 amounts, (b) setting originalAmount in Phase 2.
+Used for: setting originalAmount in Phase 2.
 ${renderPricingTable()}
 Match rules: case-insensitive substring. First match wins.
-  Phase 1: no keyword match AND amount is 0/missing → SKIP that row.
-  Phase 2: no keyword match → originalAmount = fineNumber.
+  No keyword match → originalAmount = fineNumber.
 </pricing_table>
 
 <page_visuals>
-
-<page name="DELHI_TP_HOME">
-  URL: https://traffic.delhipolice.gov.in/notice/pay-notice/
-  Visual: orange/brown header. "Vehicle Number" input. "Search Details" button.
-  Allowed: type vehicle number, click Search Details.
-</page>
-
-<page name="DELHI_TP_RESULTS">
-  Visual: table below search form.
-  Columns: S.No | Challan No | Owner Name | Offence | Fine Amount | Date | Status | Make Payment
-  Pay Now indicator: Status = "Pending for Payment" + "Pay Now" button.
-  Virtual Court indicator: Make Payment column shows "Virtual Court" link (no Pay Now).
-  Allowed: read rows, scroll, click pagination.
-</page>
 
 <page name="VC_HOME">
   URL: https://vcourts.gov.in/virtualcourt/index.php
@@ -486,8 +401,7 @@ Match rules: case-insensitive substring. First match wins.
 <skip_conditions>
 
 EARLY-STOP (abort entire task, go to COMPLETION):
-  - DTP returns 0 challans AND no DB departments exist → STOP.
-  - DTP site is down/error AND no DB departments exist → STOP.
+  - No departments to query (no challans in the database for this vehicle) → STOP.
 
 PER-DEPARTMENT SKIP (skip dept, continue to next):
   - Virtual Courts site error or blank page → SKIP. Reason: "site error".
@@ -512,7 +426,7 @@ When in doubt: SKIP. Never guess at numbers. Never invent text.
 <quality_gates>
 Apply before every save_* tool call:
   G1. challanId is a non-empty string with no whitespace.
-  G2. amount / discountAmount / originalAmount are integers ≥ 0.
+  G2. discountAmount / originalAmount are integers ≥ 0.
   G3. discountAmount ≤ originalAmount. If not → DROP the record.
   G4. No duplicate challanIds. Deduplicate before calling.
   G5. count(unique challanIds) === array.length.
@@ -524,10 +438,8 @@ Emit a STATE block at every phase boundary, exactly in this format
 
 [STATE]
 phase: <phase_name>
-challans_saved: <0 or N CONFIRMED>
 departments:
   - <dept_name>: <CONFIRMED N | SKIPPED reason | FAILED reason | PENDING>
-pay_now: <CONFIRMED N | SKIPPED reason | FAILED reason | PENDING | n/a>
 [/STATE]
 
 Mark CONFIRMED only after seeing "ok": true in the tool response.
@@ -538,92 +450,23 @@ Never mark CONFIRMED based on intent.
 
 <workflow>
 
-${phase0Block}
-
-<phase id="1" name="delhi_traffic_police">
-Goal: extract every challan for ${p.vehicleNumber} from Delhi Traffic Police.
-
-STEP 1 — Navigate:
-  Open https://traffic.delhipolice.gov.in/notice/pay-notice/ in a new tab.
-  Verify page DELHI_TP_HOME is visible.
-  If NOT (error / blank / maintenance) → note "DTP site down".
-  ${hasExtraDepts
-            ? `Continue to Phase 1.5 — DB departments still need to be queried.`
-            : `Skip Phases 1.5 and 2. Go to COMPLETION.`}
-
-STEP 2 — Search:
-  Type "${p.vehicleNumber}" in the Vehicle Number field. Click "Search Details".
-
-STEP 3 — OTP:
-  ${otpHandlingBlock}
-
-STEP 4 — Verify results:
-  Verify the results table (page DELHI_TP_RESULTS) is visible.
-  ${zeroChallanBranch}
-
-STEP 5 — Extract every row:
-  For each challan row apply <delhi_traffic_police_fields>.
-  Extract: challanId, offence, amount (₹ integer), date (YYYY-MM-DD), status.
-
-STEP 6 — Handle missing/zero amounts:
-  - amount > 0 → keep as-is. Do not override with the pricing_table.
-  - amount = 0 or missing → check pricing_table against offence text.
-    Keyword match → use the keyword price.
-    No match → SKIP this row entirely.
-
-STEP 7 — Paginate:
-  Scroll fully. Navigate all pagination pages. Repeat Steps 5–6 until every row is captured.
-
-STEP 8 — Deduplicate and validate:
-  Remove duplicate challanIds. Verify count(unique) === array.length.
-  Apply <quality_gates> to every record. DROP any that fail.
-
-STEP 9 — Save challans:
-  If ≥1 challan → call save_challans EXACTLY ONCE with the full array.
-  Format: [{"challanId":"DL19016240430095546","offence":"Red Light Jumping","amount":5000,"date":"2024-06-15"}]
-  Wait for response. Confirm "ok": true. STATE: save_challans → CONFIRMED (saved=N).
-  If 0 challans → skip save_challans.
-
-STEP 10 — Build Pay Now list (used in Phase 2.5):
-  Filter extracted challans to rows where status = "Pending for Payment" (had "Pay Now" button).
-  For each: build {challanId, discountAmount: amount, originalAmount: amount}.
-  These have no court reduction — settlement amount equals original fine.
-
-Emit STATE block. Then proceed to Phase 1.5.
-</phase>
-
-<phase id="1.5" name="determine_departments">
+<phase id="1" name="determine_departments">
 LOGIC ONLY. Do not open any website in this phase.
 
-Build a UNIQUE, DEDUPLICATED list of Virtual Courts departments to query.
+The system has already resolved the Virtual Courts departments to query, from the
+challans stored in the database for ${p.vehicleNumber}:
+${departmentsBlock}
 
-A — Read challan IDs from Phase 1:
-  Starts with 2 uppercase letters → those letters are the state code.
-  Starts with a digit / all digits → maps to Delhi(Notice Department).
-  Include Delhi(Notice Department) ONLY if Phase 1 returned ≥1 challan.
-  If Phase 1 returned 0 challans → do NOT include Delhi(Notice Department).
+If the list above is "(none)" → there are no challans / departments to process for
+this vehicle. Emit a STATE block with no departments and go DIRECTLY to COMPLETION
+(Status: complete, 0 departments). Do not open any website.
 
-B — State code → department map:
-  DL → Delhi(Traffic Department)              HR → Haryana(Traffic Department)
-  UP → Uttar Pradesh(Traffic Department)      CH → Chandigarh(Traffic Department)
-  RJ → Rajasthan(Traffic Department)          PB → Punjab(Traffic Department)
-  MP → Madhya Pradesh(Traffic Department)     MH → Maharashtra(Transport Department)
-  GJ → Gujarat(Traffic Department)            KA → Karnataka(Traffic Department)
-  HP → Himachal Pradesh(Traffic Department)   UK → Uttarakhand(Traffic Department)
-  CG → Chhattisgarh(Traffic Department)       JK → Jammu and Kashmir(Jammu Traffic Department)
-  AS → Assam(Traffic Department)              KL → Kerala(Police Department)
-  TN → Tamil Nadu(Traffic Department)         AP → Andhra Pradesh(Traffic Department)
-  TS/TG → Telangana(Traffic Department)       BR → Bihar(Traffic Department)
-  JH → Jharkhand(Traffic Department)          OD → Odisha(Traffic Department)
-  WB → West Bengal(Traffic Department)        GA → Goa(Traffic Department)
-  Any other 2-letter code → find matching state in the Virtual Courts dropdown.
-${extraDeptsBlock}
-
-C — Combine, deduplicate, initialize STATE:
+Otherwise:
   Write to memory:
     "Departments to query: [...]"
     "Departments completed: []"
   Initialize STATE: every department → PENDING.
+  Proceed to Phase 2.
 </phase>
 
 <phase id="2" name="virtual_courts_per_department">
@@ -743,26 +586,6 @@ Any check fails → return to Step D and complete the save now.
 All checks pass → emit current STATE block. Move to next department.
 </phase>
 
-<phase id="2.5" name="pay_now_discounts">
-Pay Now challans (Phase 1 Step 10 list) are NOT on Virtual Courts.
-They have no court reduction — settlement amount = original fine.
-
-1. payNowChallans empty → STATE: pay_now → SKIPPED (0 entries). Go to Phase 3.
-
-2. Otherwise:
-   a. Deduplicate by challanId.
-   b. Remove any challanId already saved in Phase 2 (cross-check all save_discounts calls).
-   c. Pre-flight each entry:
-      - discountAmount > 0. If 0 → DROP. Log.
-      - discountAmount === originalAmount. If unequal → DROP. Log.
-   d. List empty after drops → STATE: pay_now → SKIPPED (no valid entries). Go to Phase 3.
-   e. Verify count(unique challanIds) === array.length.
-   f. Call save_discounts with the cleaned list.
-      Format: [{"challanId":"41374772","discountAmount":500,"originalAmount":500}]
-   g. Wait for response. Confirm "ok": true → STATE: pay_now → CONFIRMED (saved=N).
-      Retry once if "ok": false. Still failing → STATE: pay_now → FAILED.
-</phase>
-
 <phase id="3" name="reconciliation">
 Mandatory before COMPLETION.
 
@@ -783,9 +606,7 @@ STEP 3: Count confirmed_depts, skipped_depts, failed_depts, pending_depts.
 <completion>
 Call "done" only when:
   ✓ Phase 3 reconciliation passed (0 PENDING entries).
-  ✓ save_challans is CONFIRMED or SKIPPED.
   ✓ Every department is CONFIRMED, SKIPPED, or FAILED.
-  ✓ pay_now is CONFIRMED, SKIPPED, FAILED, or n/a.
 
 STATUS DECISION — walk strictly. Never choose "complete" optimistically.
 
@@ -793,13 +614,10 @@ LEGITIMATE skip reasons (data genuinely absent — these alone do NOT force part
   "0 records"         dept has no records for this vehicle
   "not found"         popup said "This number does not exist"
   "no valid records"  all records were paid / disposed / transferred / pending-proceedings
-  "0 challans"        Phase 1 found nothing on DTP
-  "0 entries"         Pay Now list was empty
-  "no valid entries"  Pay Now entries all failed pre-flight
+  "no departments"    the database had no challans / departments for this vehicle
 
 FAILURE reasons (something broke — ANY of these forces "Status: partial"):
   "site error"                  VC didn't load / showed error page
-  "site down"                   DTP was down
   "captcha failed"              5 web attempts + human fallback both failed
   "captcha failed (app)"        10 app attempts exhausted
   "captcha_failed_app"          same
@@ -814,21 +632,14 @@ FAILURE reasons (something broke — ANY of these forces "Status: partial"):
 RULES:
   RULE 1: ANY dept FAILED (save call failed) → Status: partial
   RULE 2: ANY dept SKIPPED with a FAILURE reason → Status: partial
-  RULE 3: save_challans FAILED → Status: partial
-  RULE 4: pay_now FAILED → Status: partial
-  RULE 5: ANY entry still PENDING with extracted data → Status: partial + call save NOW
-  RULE 6: Otherwise → Status: complete
+  RULE 3: ANY entry still PENDING with extracted data → Status: partial + call save NOW
+  RULE 4: Otherwise → Status: complete
 
 Final report must include:
-  ${hasMobileChange ? "- Mobile number change: success / failure / skipped (last 4 matched)" : ""}
-  - Challans found on Delhi Traffic Police: N
-  - Challans saved (save_challans): N CONFIRMED / SKIPPED
-  - Pay Now challans (Pending for Payment): N
   - Departments queried: [list]
   - Departments skipped — LEGITIMATE: [list with reason]
   - Departments skipped — FAILURE: [list with reason]
   - Discount records saved per dept: [dept: N CONFIRMED/FAILED]
-  - Pay Now discount records saved: N CONFIRMED/FAILED
   - Records skipped: paid=N transferred=N pending_proceedings=N disposed=N warrant=N
   - Total discount records saved: N
   - Final STATE block.
@@ -847,47 +658,13 @@ STATUS FORMAT — the system parses this line exactly:
 <safety_save>
 Step budget: 100.
 At step ~90, if not finished:
-  1. save_challans not yet called and you have challan data → call now.
-  2. Call save_discounts for the current department's unsaved records.
-  3. Call save_discounts for any unsaved Pay Now challans (Phase 2.5).
-  4. Emit final STATE block.
-  5. End the task with "Status: partial — safety save triggered at step limit".
+  1. Call save_discounts for the current department's unsaved records.
+  2. Emit final STATE block.
+  3. End the task with "Status: partial — safety save triggered at step limit".
 Saving data takes priority over completing more departments.
 </safety_save>
 
 <examples>
-
-<example name="phase_1_three_rows" priority="reference">
-<input>
-DTP results for DL01XX9999 — 3 rows:
-  Row 1: Challan No. DL19016240430095546 | Offence: Red Light Jumping | Fine: 5000 | Date: 15/06/2024 | Status: Sent to Virtual Court
-  Row 2: Challan No. 57693177 | Offence: Without Helmet | Fine: (blank) | Date: 02/02/2024 | Status: Sent to Virtual Court
-  Row 3: Challan No. 41374772 | Offence: No Parking | Fine: 500 | Date: 10/03/2024 | Status: Pending for Payment (Pay Now)
-</input>
-<reasoning>
-Row 1: amount=5000 positive → keep. Virtual Court. Include in save_challans.
-Row 2: amount blank → pricing_table lookup on "Without Helmet". No keyword match → SKIP this row.
-Row 3: amount=500 positive → keep. Pending for Payment → include in save_challans AND payNowChallans.
-</reasoning>
-<tool_call>
-save_challans([
-  {"challanId":"DL19016240430095546","offence":"Red Light Jumping","amount":5000,"date":"2024-06-15"},
-  {"challanId":"41374772","offence":"No Parking","amount":500,"date":"2024-03-10"}
-])
-</tool_call>
-<pay_now_list>
-[{"challanId":"41374772","discountAmount":500,"originalAmount":500}]
-</pay_now_list>
-<state_block>
-[STATE]
-phase: 1_complete
-challans_saved: 2 CONFIRMED
-departments:
-  - (built in Phase 1.5)
-pay_now: PENDING (will save in Phase 2.5)
-[/STATE]
-</state_block>
-</example>
 
 <example name="phase_2_one_department" priority="reference">
 <input>
@@ -934,11 +711,9 @@ save_discounts([
 <state_block>
 [STATE]
 phase: 2_dept_complete
-challans_saved: 2 CONFIRMED
 departments:
   - Delhi(Notice Department): CONFIRMED 3
   - Delhi(Traffic Department): PENDING
-pay_now: PENDING
 [/STATE]
 </state_block>
 </example>
@@ -1007,7 +782,7 @@ const challansFromDB = async (p: Record<string, string>): Promise<string[]> => {
 
         const existingChallans: any[] = docData.challans || [];
 
-        // Map each existing challan to its Virtual Courts department name (same logic as Phase 1.5).
+        // Map each existing challan to its Virtual Courts department name.
         const stateToDept: Record<string, string> = {
             DL: "Delhi(Traffic Department)",
             HR: "Haryana(Traffic Department)",

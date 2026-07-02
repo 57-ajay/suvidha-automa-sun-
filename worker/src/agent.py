@@ -238,9 +238,9 @@ async def run_agent(
     )
 
     llm = ChatGoogle(
-        model="gemini-3-flash-preview",
+        model="gemini-2.5-flash",
         vertexai=True,
-        # location="asia-south1",
+        location="asia-south1",
         project="cabswale-ai",
     )
     tools = make_tools(job_id, job_params, tool_defs, r, task_id)
