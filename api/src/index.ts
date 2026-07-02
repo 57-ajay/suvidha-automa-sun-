@@ -3,6 +3,7 @@ import { getTask, listTasks } from "./tasks";
 import type { JobSource } from "./tasks/types";
 import { handleSaveChallans, type InternalRequest } from "./internal/challanSettlement/challans";
 import { handleSaveDiscounts } from "./internal/challanSettlement/discounts";
+import { challansFromDB } from "./internal/challanSettlement/departments";
 import { handleSaveReceipt } from "./internal/borderTax/receipt";
 import { handleSaveChallanReceipt } from "./internal/challanPayment/receipt";
 import { releaseAgentSlot, saveAgentCost } from "./internal/agentConfig";
@@ -330,6 +331,25 @@ const server = Bun.serve({
             }
 
             // Internal endpoints (called by worker tools)
+
+            // Department list for a challan-settlement request. The scripted
+            // runner calls this at start (it has no Firestore access) to learn
+            // which Virtual Courts departments to query. Departments are derived
+            // from the app-populated `challans` field on the request doc.
+            if (req.method === "GET" && url.pathname === "/api/internal/challans/departments") {
+                try {
+                    const requestId = url.searchParams.get("requestId") || "";
+                    if (!requestId) {
+                        return Response.json({ ok: false, error: "requestId query param is required" }, { status: 400 });
+                    }
+                    const departments = await challansFromDB({ requestId });
+                    console.log(`[API] GET /api/internal/challans/departments requestId=${requestId} -> ${departments.length} departments`);
+                    return Response.json({ ok: true, departments }, { headers: corsHeaders() });
+                } catch (e: any) {
+                    console.error("[API] ERROR departments:", e);
+                    return Response.json({ ok: false, error: e.message }, { status: 500 });
+                }
+            }
 
             if (req.method === "POST" && url.pathname === "/api/internal/challans/save") {
                 try {

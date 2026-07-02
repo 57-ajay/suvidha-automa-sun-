@@ -358,3 +358,201 @@ async def solve_canvas_captcha(
         )
     )
     raise ScriptedAbort("CAPTCHA rejected even after human input")
+
+
+# ─── image-captcha variant (securimage <img>, not a <canvas>) ────────────────
+#
+# Some portals (e.g. eCourts Virtual Courts securimage) render the captcha as an
+# <img> whose src is a server endpoint that REGENERATES a new captcha on every
+# GET — so we cannot re-fetch the URL to read it. Instead we screenshot the
+# rendered <img> element via CDP (same technique as actions.save_qr_code) and
+# OCR that PNG. Everything else (LLM OCR, refresh+retry, human/abort fallback)
+# matches solve_canvas_captcha.
+
+
+async def _read_img_png_b64(session, img_selector: str) -> str | None:
+    """Screenshot the captcha <img> element and return its base64 PNG (no
+    data-URI prefix), or None if the element is missing/zero-size."""
+    rect_expr = (
+        "(function(s){var e=document.querySelector(s);"
+        "if(!e) return null;"
+        "var r=e.getBoundingClientRect();"
+        "return {x:r.left,y:r.top,width:r.width,height:r.height};"
+        "})(" + json.dumps(img_selector) + ")"
+    )
+    info = await _cdp_eval(session, rect_expr)
+    if not info or info.get("width", 0) <= 0 or info.get("height", 0) <= 0:
+        return None
+    cdp = await session.get_or_create_cdp_session()
+    shot = await cdp.cdp_client.send.Page.captureScreenshot(
+        params={
+            "format": "png",
+            "clip": {
+                "x": float(info["x"]),
+                "y": float(info["y"]),
+                "width": float(info["width"]),
+                "height": float(info["height"]),
+                "scale": 1,
+            },
+            "captureBeyondViewport": True,
+        },
+        session_id=cdp.session_id,
+    )
+    return shot.get("data")  # base64 PNG, no prefix — what _ocr_via_llm expects
+
+
+async def solve_image_captcha(
+    session,
+    *,
+    image_selector: str,
+    input_selector: str,
+    refresh_selector: str | None,
+    submit_action: SubmitAction,
+    job_id: str,
+    r: redis.Redis,
+    source: str,
+    log: StepLogger,
+    name: str = "solve_captcha",
+    max_ai_attempts: int = 5,
+) -> None:
+    """Image-captcha counterpart of solve_canvas_captcha. Same contract, same
+    fallback semantics (web → wait_for_human; app → ScriptedAbort). Raises
+    ScriptedAbort if exhausted."""
+    total_cost = 0.0
+
+    for attempt in range(1, max_ai_attempts + 1):
+        started = time.monotonic()
+        try:
+            await _wait_visible(session, image_selector, timeout=10)
+            b64 = await _read_img_png_b64(session, image_selector)
+            if not b64:
+                raise RuntimeError("captcha image could not be screenshotted")
+
+            text, cost = await _ocr_via_llm(b64)
+            total_cost += cost
+            if not text or text.upper() == "UNREADABLE":
+                raise RuntimeError("LLM could not read captcha")
+
+            await fill(
+                session,
+                input_selector,
+                text,
+                log=log,
+                name=f"{name}.fill_attempt_{attempt}",
+            )
+
+            advanced = await submit_action()
+            if advanced:
+                log.record(
+                    StepLog(
+                        index=log.next_index(),
+                        name=name,
+                        status=StepStatus.OK,
+                        attempt=attempt,
+                        duration_ms=int((time.monotonic() - started) * 1000),
+                        value=text,
+                        handoff_reason="captcha_ocr",
+                        handoff_cost_usd=total_cost,
+                    )
+                )
+                return
+
+            if refresh_selector and attempt < max_ai_attempts:
+                try:
+                    await click(
+                        session,
+                        refresh_selector,
+                        log=log,
+                        name=f"{name}.refresh_attempt_{attempt}",
+                        timeout=5,
+                        retries=0,
+                    )
+                except Exception:
+                    pass
+
+            log.record(
+                StepLog(
+                    index=log.next_index(),
+                    name=name,
+                    status=StepStatus.RETRIED,
+                    attempt=attempt,
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                    value=text,
+                    error="captcha rejected by site",
+                )
+            )
+        except Exception as e:
+            log.record(
+                StepLog(
+                    index=log.next_index(),
+                    name=name,
+                    status=StepStatus.RETRIED,
+                    attempt=attempt,
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                    error=f"{type(e).__name__}: {e}",
+                )
+            )
+
+    # Exhausted AI attempts.
+    if source.lower() == "app":
+        raise ScriptedAbort(
+            f"CAPTCHA could not be solved after {max_ai_attempts} attempts"
+        )
+
+    started = time.monotonic()
+    reason = (
+        f"CAPTCHA could not be solved automatically after {max_ai_attempts} "
+        f"attempts. Please type the captcha visible on screen and reply with "
+        f"those characters."
+    )
+    human_text = await _wait_for_human_via_redis(job_id, r, reason)
+    if not human_text:
+        log.record(
+            StepLog(
+                index=log.next_index(),
+                name=name,
+                status=StepStatus.FAILED,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                error="human_handoff_timeout",
+                handoff_reason="captcha_human",
+                handoff_cost_usd=total_cost,
+            )
+        )
+        raise ScriptedAbort("CAPTCHA timed out waiting for human")
+
+    await fill(
+        session,
+        input_selector,
+        human_text.strip(),
+        log=log,
+        name=f"{name}.fill_human",
+    )
+    advanced = await submit_action()
+    if advanced:
+        log.record(
+            StepLog(
+                index=log.next_index(),
+                name=name,
+                status=StepStatus.HANDED_OFF,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                value=human_text.strip(),
+                handoff_reason="captcha_human",
+                handoff_summary="Human typed captcha; form advanced.",
+                handoff_cost_usd=total_cost,
+            )
+        )
+        return
+
+    log.record(
+        StepLog(
+            index=log.next_index(),
+            name=name,
+            status=StepStatus.FAILED,
+            duration_ms=int((time.monotonic() - started) * 1000),
+            value=human_text.strip(),
+            error="human captcha also rejected",
+            handoff_reason="captcha_human",
+            handoff_cost_usd=total_cost,
+        )
+    )
+    raise ScriptedAbort("CAPTCHA rejected even after human input")

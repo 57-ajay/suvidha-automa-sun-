@@ -33,6 +33,10 @@ from agent import run_agent
 from cost_calculator import fill_missing_cost
 from scripted.runner import run_border_tax, state_is_scripted_enabled, run_fetch_receipt, state_is_net_banking_scripted
 from scripted.challan.runner import run_challan_payment   # ← add
+from scripted.challan_settlement.runner import (
+    run_challan_settlement,
+    challan_settlement_scripted_enabled,
+)
 from scripted.types import RunOutcome
 
 
@@ -171,6 +175,9 @@ def _should_use_scripted(task_id: str, params: dict) -> bool:
         return True
     if task_id == "challan-payment":   # ← add, BEFORE the border-tax guard
         return True
+    if task_id == "challan-settlement":
+        # Env-gated so the AI path stays the default ("as it is now").
+        return challan_settlement_scripted_enabled()
     if task_id != "border-tax":
         return False
     state = params.get("state", "") or ""
@@ -224,6 +231,8 @@ async def _run_scripted(
         outcome = await run_fetch_receipt(job_params, source, job_id, r)
     elif task_id == "challan-payment":
         outcome = await run_challan_payment(job_params, job_id, r)
+    elif task_id == "challan-settlement":
+        outcome = await run_challan_settlement(job_params, job_id, r)
     else:
         state = job_params.get("state", "")
         outcome = await run_border_tax(state, job_params, job_id, r)

@@ -1,4 +1,4 @@
-import { challanRequestsRef } from "../../firebase";
+import { challansFromDB } from "../../internal/challanSettlement/departments";
 import type { JobSource } from "../types";
 
 export const OFFENCE_KEYWORD_PRICES: Array<{ keyword: string; price: number }> = [
@@ -993,65 +993,4 @@ Three things to remember above all:
    with fabricated data.
 </final_imperative>
 `.trim();
-};
-
-const challansFromDB = async (p: Record<string, string>): Promise<string[]> => {
-    try {
-        const requestId = p.requestId;
-        if (!requestId) return [];
-
-        const docSnap = await challanRequestsRef.doc(requestId).get();
-        if (!docSnap.exists) return [];
-
-        const docData = docSnap.data()!;
-
-        const existingChallans: any[] = docData.challans || [];
-
-        // Map each existing challan to its Virtual Courts department name (same logic as Phase 1.5).
-        const stateToDept: Record<string, string> = {
-            DL: "Delhi(Traffic Department)",
-            HR: "Haryana(Traffic Department)",
-            UP: "Uttar Pradesh(Traffic Department)",
-            CH: "Chandigarh(Traffic Department)",
-            RJ: "Rajasthan(Traffic Department)",
-            PB: "Punjab(Traffic Department)",
-            MP: "Madhya Pradesh(Traffic Department)",
-            MH: "Maharashtra(Transport Department)",
-            GJ: "Gujarat(Traffic Department)",
-            KA: "Karnataka(Traffic Department)",
-            HP: "Himachal Pradesh(Traffic Department)",
-            UK: "Uttarakhand(Traffic Department)",
-            CG: "Chhattisgarh(Traffic Department)",
-            JK: "Jammu and Kashmir(Jammu Traffic Department)",
-            AS: "Assam(Traffic Department)",
-            KL: "Kerala(Police Department)",
-            TN: "Tamil Nadu(Traffic Department)",
-            AP: "Andhra Pradesh(Traffic Department)",
-            TS: "Telangana(Traffic Department)",
-            TG: "Telangana(Traffic Department)",
-            BR: "Bihar(Traffic Department)",
-            JH: "Jharkhand(Traffic Department)",
-            OD: "Odisha(Traffic Department)",
-            WB: "West Bengal(Traffic Department)",
-            GA: "Goa(Traffic Department)",
-        };
-
-        const depts = new Set<string>();
-        for (const c of existingChallans) {
-            const id = (c.id || c.challanNo || "").toString();
-            if (!id) continue;
-            const prefix = id.substring(0, 2).toUpperCase();
-            if (/^[A-Z]{2}$/.test(prefix) && stateToDept[prefix]) {
-                depts.add(stateToDept[prefix]);
-            } else if (/^\d/.test(id)) {
-                depts.add("Delhi(Notice Department)");
-            }
-        }
-        const allDeps = Array.from(depts);
-        console.log("depsFromDB: ", allDeps.length);
-        return allDeps;
-    } catch (e) {
-        console.error("[challansFromDB] error:", e);
-        return [];
-    }
 };

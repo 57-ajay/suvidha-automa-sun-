@@ -464,3 +464,37 @@ async def save_receipt(
         msg = f"save_receipt HTTP error: {type(e).__name__}: {e}"
         print(f"[{job_id}]   ERROR: {msg}")
         return {"ok": False, "error": msg}
+
+
+# ─── save_discounts ──────────────────────────────────────────────────────────
+
+
+async def save_discounts(
+    job_id: str,
+    job_params: dict,
+    data: list[dict],
+) -> dict:
+    """POST extracted Virtual Courts settlement/discount records to
+    /api/internal/discounts/save. The scripted challan-settlement runner calls
+    this in place of the LLM `save_discounts` tool the AI path uses.
+
+    `data` is a list of {challanId, discountAmount, originalAmount}. The API
+    reads vehicleNumber + requestId from `params` (same contract as the tool).
+    Returns the parsed API response ({"ok": true/false, ...})."""
+    print(f"[{job_id}] save_discounts called ({len(data)} records)")
+    payload = {"jobId": job_id, "params": job_params, "data": data}
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{API_URL}/api/internal/discounts/save",
+                json=payload,
+            )
+        print(f"[{job_id}] save_discounts response: {resp.status_code}")
+        try:
+            return resp.json()
+        except Exception:
+            return {"ok": False, "error": f"non-JSON response: {resp.text[:300]}"}
+    except Exception as e:
+        msg = f"save_discounts HTTP error: {type(e).__name__}: {e}"
+        print(f"[{job_id}]   ERROR: {msg}")
+        return {"ok": False, "error": msg}
