@@ -57,65 +57,96 @@ async def _read_canvas_png_b64(session, canvas_selector: str) -> str | None:
     return await _cdp_eval(session, expr)
 
 
+_OCR_SYSTEM = (
+    "You are an OCR engine that transcribes the characters visible in an "
+    "image, returning them verbatim and nothing else."
+)
+_OCR_INSTRUCTION = (
+    "Transcribe the exact sequence of characters that appears in this image, "
+    "reading left to right. Examine each character carefully and individually. "
+    "Respond with only those characters as a single string — no spaces, no "
+    "quotation marks, no explanation. The string may mix uppercase letters, "
+    "lowercase letters, digits, and symbols; reproduce the exact case of every "
+    "letter."
+)
+
+
 async def _ocr_via_llm(image_b64: str) -> tuple[str, float]:
-    """Direct LLM call for OCR. Returns (text, cost_usd).
+    """Direct Vertex OCR — mirrors the border-tax ocr_image: one image + one
+    instruction at temperature 0 via google-genai (no agent loop, no
+    browser-use message shapes), reading the response's usage tokens so the
+    ACTUAL cost is reported instead of hardcoded 0.
 
-    NOTE: The exact ChatGoogle.ainvoke message schema can differ across
-    browser-use 0.12.x patch releases. We try the most common shapes and
-    fall through to a sentinel 'UNREADABLE' if all fail, letting the caller
-    refresh + retry. The fallback path in solve_canvas_captcha covers cases
-    where this entire helper returns UNREADABLE repeatedly.
+    Returns (text, cost_usd). ("UNREADABLE", cost) when the model can't read
+    it — the caller refreshes the captcha and retries. On any error (e.g.
+    google-genai unavailable) returns ("UNREADABLE", 0.0) so solve_*_captcha
+    falls back to the agent OCR.
     """
-    llm = build_llm()
-
-    # browser-use's ChatGoogle.ainvoke expects message OBJECTS (it calls
-    # .model_copy() on them), not raw dicts — passing dicts raises
-    # "'dict' object has no attribute 'model_copy'". Build the proper
-    # UserMessage with a text part + an inline image part.
-    prompt_text = (
-        "This is a captcha image from a government website. "
-        "Read the characters and reply with ONLY those characters, "
-        "no spaces, no quotes, no explanation. "
-        "If you cannot read it clearly, reply with the single word: UNREADABLE"
-    )
     try:
-        from browser_use.llm.messages import (
-            UserMessage,
-            ContentPartTextParam,
-            ContentPartImageParam,
-            ImageURL,
-        )
+        import base64
+        from google import genai
+        from google.genai import types as gt
 
-        msg = UserMessage(
-            content=[
-                ContentPartTextParam(text=prompt_text),
-                ContentPartImageParam(
-                    image_url=ImageURL(
-                        url=f"data:image/png;base64,{image_b64}",
-                        media_type="image/png",
-                        detail="auto",
-                    )
+        from .handoff import LLM_MODEL, VERTEX_PROJECT
+
+        client = genai.Client(vertexai=True, project=VERTEX_PROJECT)
+        cfg = gt.GenerateContentConfig(
+            temperature=0,
+            max_output_tokens=4096,
+            response_mime_type="text/plain",
+            system_instruction=_OCR_SYSTEM,
+            safety_settings=[
+                gt.SafetySetting(category=c, threshold=gt.HarmBlockThreshold.BLOCK_NONE)
+                for c in (
+                    gt.HarmCategory.HARM_CATEGORY_HARASSMENT,
+                    gt.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                    gt.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+                    gt.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                )
+            ],
+        )
+        # Turn OFF "thinking" so tokens go to the answer, not hidden reasoning.
+        try:
+            cfg.thinking_config = gt.ThinkingConfig(thinking_budget=0)
+        except Exception:
+            pass
+
+        resp = await client.aio.models.generate_content(
+            model=LLM_MODEL,
+            contents=[
+                gt.Part.from_bytes(
+                    data=base64.b64decode(image_b64), mime_type="image/png"
                 ),
-            ]
+                _OCR_INSTRUCTION,
+            ],
+            config=cfg,
         )
-        response = await llm.ainvoke([msg])
-        text = (
-            getattr(response, "completion", None)
-            or getattr(response, "content", None)
-            or ""
-        )
-        if isinstance(text, list):
-            # Some message-content shapes return a list of parts
-            text = " ".join(
-                str(p.get("text", "")) if isinstance(p, dict) else str(p) for p in text
-            )
-        text = (text or "").strip()
-        if text:
-            return text, 0.0
-    except Exception as e:
-        print(f"[captcha] llm.ainvoke failed: {e}")
 
-    return "UNREADABLE", 0.0
+        raw = ""
+        try:
+            raw = resp.text or ""
+        except Exception as e:
+            print(f"[captcha] ocr resp.text raised: {type(e).__name__}: {e}")
+
+        # Real cost from usage tokens, priced by GEMINI_PRICING for the model.
+        cost = 0.0
+        usage = getattr(resp, "usage_metadata", None)
+        if usage:
+            try:
+                from cost_calculator import _lookup_pricing
+
+                prices = _lookup_pricing(LLM_MODEL) or {"input": 0.10, "output": 0.40}
+                pt = int(getattr(usage, "prompt_token_count", 0) or 0)
+                ct = int(getattr(usage, "candidates_token_count", 0) or 0)
+                cost = (pt * prices["input"] + ct * prices["output"]) / 1_000_000
+            except Exception as e:
+                print(f"[captcha] ocr cost calc failed: {e}")
+
+        text = (raw or "").strip().strip("`'\"").replace(" ", "")
+        return (text or "UNREADABLE", cost)
+    except Exception as e:
+        print(f"[captcha] ocr_image failed: {type(e).__name__}: {e}")
+        return "UNREADABLE", 0.0
 
 
 async def _ocr_via_agent(session) -> tuple[str, float]:
