@@ -68,30 +68,37 @@ async def _ocr_via_llm(image_b64: str) -> tuple[str, float]:
     """
     llm = build_llm()
 
-    # Shape A: list-of-dict messages with mixed content parts.
+    # browser-use's ChatGoogle.ainvoke expects message OBJECTS (it calls
+    # .model_copy() on them), not raw dicts — passing dicts raises
+    # "'dict' object has no attribute 'model_copy'". Build the proper
+    # UserMessage with a text part + an inline image part.
+    prompt_text = (
+        "This is a captcha image from a government website. "
+        "Read the characters and reply with ONLY those characters, "
+        "no spaces, no quotes, no explanation. "
+        "If you cannot read it clearly, reply with the single word: UNREADABLE"
+    )
     try:
-        msgs = [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": (
-                            "This is a captcha image from a government website. "
-                            "Read the characters and reply with ONLY those characters, "
-                            "no spaces, no quotes, no explanation. "
-                            "If you cannot read it clearly, reply with the single "
-                            "word: UNREADABLE"
-                        ),
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{image_b64}"},
-                    },
-                ],
-            }
-        ]
-        response = await llm.ainvoke(msgs)
+        from browser_use.llm.messages import (
+            UserMessage,
+            ContentPartTextParam,
+            ContentPartImageParam,
+            ImageURL,
+        )
+
+        msg = UserMessage(
+            content=[
+                ContentPartTextParam(text=prompt_text),
+                ContentPartImageParam(
+                    image_url=ImageURL(
+                        url=f"data:image/png;base64,{image_b64}",
+                        media_type="image/png",
+                        detail="auto",
+                    )
+                ),
+            ]
+        )
+        response = await llm.ainvoke([msg])
         text = (
             getattr(response, "completion", None)
             or getattr(response, "content", None)
@@ -106,7 +113,7 @@ async def _ocr_via_llm(image_b64: str) -> tuple[str, float]:
         if text:
             return text, 0.0
     except Exception as e:
-        print(f"[captcha] llm.ainvoke shape-A failed: {e}")
+        print(f"[captcha] llm.ainvoke failed: {e}")
 
     return "UNREADABLE", 0.0
 
@@ -429,6 +436,11 @@ async def solve_image_captcha(
                 raise RuntimeError("captcha image could not be screenshotted")
 
             text, cost = await _ocr_via_llm(b64)
+            if not text or text.upper() == "UNREADABLE":
+                # Fallback to the 1-step Agent OCR (same as solve_canvas_captcha).
+                text2, cost2 = await _ocr_via_agent(session)
+                text = text2
+                cost += cost2
             total_cost += cost
             if not text or text.upper() == "UNREADABLE":
                 raise RuntimeError("LLM could not read captcha")
