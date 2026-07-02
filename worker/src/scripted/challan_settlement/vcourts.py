@@ -207,18 +207,30 @@ async def run_department(
 
     raws = await extract_raw_records(session)
     valid, dropped = build_discount_records(raws)
+    # Per-reason breakdown so "no valid records" is diagnosable: it tells us
+    # whether records were legitimately skipped (skip_paid / skip_transferred /
+    # ...) or lost to a parse/DOM miss (proposed_fine_unreadable / ...).
+    from collections import Counter
+
+    breakdown = Counter(d.get("reason", "?") for d in dropped)
+    breakdown_str = ", ".join(f"{k}:{v}" for k, v in breakdown.items())
     log.record(
         StepLog(
             index=log.next_index(),
             name=f"{prefix}.extract",
             status=StepStatus.OK,
-            value=f"raw={len(raws)} valid={len(valid)} dropped={len(dropped)}",
+            value=(
+                f"raw={len(raws)} valid={len(valid)} dropped={len(dropped)}"
+                + (f" [{breakdown_str}]" if breakdown_str else "")
+            ),
         )
     )
 
     if not valid:
         # No settleable records (all paid/disposed/unreadable, or 0 records).
         reason = "0 records" if not raws else "no valid records"
+        if breakdown_str:
+            reason = f"{reason} ({breakdown_str})"
         return _dept_result(department, "skipped", reason=reason, dropped=len(dropped))
 
     # ── STEP D: save_discounts (require ok:true, one retry) ────────────────
