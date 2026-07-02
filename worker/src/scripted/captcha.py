@@ -396,6 +396,25 @@ async def _read_img_png_b64(session, img_selector: str) -> str | None:
             break
         await asyncio.sleep(0.4)
 
+    # Preferred: draw the loaded <img> onto a canvas and read its exact rendered
+    # pixels at native resolution. Reliable regardless of scroll/viewport, and
+    # same-origin (securimage) so the canvas isn't tainted. This is what lets the
+    # cheap single-image OCR succeed instead of falling back to the agent.
+    canvas_expr = (
+        "(function(s){var e=document.querySelector(s);"
+        "if(!(e instanceof HTMLImageElement)||!e.complete||!e.naturalWidth) return null;"
+        "try{var c=document.createElement('canvas');"
+        "c.width=e.naturalWidth;c.height=e.naturalHeight;"
+        "var x=c.getContext('2d');x.drawImage(e,0,0);"
+        "return c.toDataURL('image/png').replace(/^data:image\\/png;base64,/,'');}"
+        "catch(err){return null;}"
+        "})(" + json.dumps(img_selector) + ")"
+    )
+    b64 = await _cdp_eval(session, canvas_expr)
+    if b64:
+        return b64
+
+    # Fallback: CDP element-clip screenshot (e.g. if drawImage was blocked).
     rect_expr = (
         "(function(s){var e=document.querySelector(s);"
         "if(!e) return null;"
