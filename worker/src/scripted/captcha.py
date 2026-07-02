@@ -379,7 +379,23 @@ async def solve_canvas_captcha(
 
 async def _read_img_png_b64(session, img_selector: str) -> str | None:
     """Screenshot the captcha <img> element and return its base64 PNG (no
-    data-URI prefix), or None if the element is missing/zero-size."""
+    data-URI prefix), or None if the element is missing/zero-size.
+
+    Waits for the <img> to fully load first (securimage paints after a beat);
+    screenshotting a half-loaded image is the usual cause of an UNREADABLE OCR.
+    """
+    loaded_expr = (
+        "(function(s){var e=document.querySelector(s);"
+        "if(!(e instanceof HTMLImageElement)) return false;"
+        "return !!(e.complete && e.naturalWidth > 0);"
+        "})(" + json.dumps(img_selector) + ")"
+    )
+    _deadline = time.monotonic() + 8.0
+    while time.monotonic() < _deadline:
+        if await _cdp_eval(session, loaded_expr):
+            break
+        await asyncio.sleep(0.4)
+
     rect_expr = (
         "(function(s){var e=document.querySelector(s);"
         "if(!e) return null;"

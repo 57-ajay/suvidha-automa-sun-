@@ -156,8 +156,19 @@ async def run_department(
         return _dept_result(department, "failed", reason=f"search_form_error: {type(e).__name__}")
 
     async def _submit_and_check() -> bool:
-        """Click Submit; return True once the results (or not-found) page
-        appears — i.e. the captcha was accepted and the form advanced."""
+        """Re-enter the vehicle number, click Submit, and return True once the
+        results (or not-found) page appears — i.e. the captcha was accepted and
+        the form advanced.
+
+        The vehicle field is re-filled EVERY attempt on purpose: a rejected
+        captcha resets the VC search form and clears the vehicle input, so
+        without this a correct captcha on a later attempt would still submit an
+        empty vehicle number. Re-filling when the value is already present is a
+        harmless no-op."""
+        try:
+            await fill(session, SEL_VEHICLE_INPUT, veh, log=log, name=f"{prefix}.refill_vehicle")
+        except Exception:
+            pass
         try:
             await click(session, SEL_SUBMIT, log=log, name=f"{prefix}.submit", retries=1)
         except Exception:
