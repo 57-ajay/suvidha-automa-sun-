@@ -93,6 +93,9 @@ def _extract_raw_via_text(text: str) -> list[dict]:
                 "offenceText": "",
                 "fineNumber": fine_val,
                 "proposedFineNum": _to_int(proposed.group(1)) if proposed else None,
+                # The block text carries any status badge, so the skip check
+                # still works on the fallback path.
+                "statusText": block,
             }
         )
     return records
@@ -117,8 +120,7 @@ _EXTRACT_JS = r"""
   for(var i=0;i<rows.length;i++){
     var row = rows[i];
     var viewBtn = row.querySelector('button[onclick^="view("]');
-    var detailTbl = row.querySelector('table.off_tbl');
-    if(viewBtn && !detailTbl){
+    if(viewBtn){
       var txt = row.innerText || '';
       var challan = '';
       var m = txt.match(/Challan\s*No\.?\s*:?\s*([A-Za-z0-9\/\-]+)/i);
@@ -128,21 +130,30 @@ _EXTRACT_JS = r"""
         var mm = oc.match(/view\('[^']*','[^']*','([^']*)'/);
         if(mm){ challan = mm[1]; }
       }
-      current = {challanId: challan, offenceText:'', fineNumber:null, proposedFineNum:null};
+      current = {challanId: challan, offenceText:'', fineNumber:null,
+                 proposedFineNum:null, statusText: txt};
       out.push(current);
-    } else if(detailTbl && current){
-      var body = detailTbl.querySelector('tbody') || detailTbl;
-      var drows = body.querySelectorAll(':scope > tr');
-      for(var j=0;j<drows.length;j++){
-        var cells = drows[j].querySelectorAll('td');
-        if(cells.length === 0) continue;
-        var first = (cells[0].innerText || '').trim();
-        var last = (cells[cells.length-1].innerText || '').trim();
-        if(/proposed\s*fine/i.test(first)){
-          current.proposedFineNum = last;
-        } else if(cells.length >= 4){
-          if(!current.offenceText){ current.offenceText = (cells[1].innerText || '').trim(); }
-          current.fineNumber = last;  // rightmost Fine column of the offence row
+    } else if(current){
+      // Detail-wrapper row for the current record. Append its text so a status
+      // badge anywhere in the record (e.g. a red "Proceedings of the Challan is
+      // yet to be completed" span, "Transferred to Regular Court", etc.) is
+      // captured for the skip check — even when there's no off_tbl to parse.
+      current.statusText += ' ' + (row.innerText || '');
+      var detailTbl = row.querySelector('table.off_tbl');
+      if(detailTbl){
+        var body = detailTbl.querySelector('tbody') || detailTbl;
+        var drows = body.querySelectorAll(':scope > tr');
+        for(var j=0;j<drows.length;j++){
+          var cells = drows[j].querySelectorAll('td');
+          if(cells.length === 0) continue;
+          var first = (cells[0].innerText || '').trim();
+          var last = (cells[cells.length-1].innerText || '').trim();
+          if(/proposed\s*fine/i.test(first)){
+            current.proposedFineNum = last;
+          } else if(cells.length >= 4){
+            if(!current.offenceText){ current.offenceText = (cells[1].innerText || '').trim(); }
+            current.fineNumber = last;  // rightmost Fine column of the offence row
+          }
         }
       }
     }
@@ -169,6 +180,7 @@ async def extract_raw_records(session) -> list[dict]:
                 "offenceText": (rec.get("offenceText") or "").strip(),
                 "fineNumber": _to_int(rec.get("fineNumber")),
                 "proposedFineNum": _to_int(rec.get("proposedFineNum")),
+                "statusText": (rec.get("statusText") or "").strip(),
             }
             for rec in raw
         ]
@@ -180,12 +192,49 @@ async def extract_raw_records(session) -> list[dict]:
 # ─── layer 2: rules + dedup (pure, testable) ────────────────────────────────
 
 
+# Per-record status badges that mean "not settleable" — ported verbatim from the
+# AI prompt's <skip_conditions> (prompt.ts). Matched against the record's full
+# status text (header bar + detail row) so a badge span placed anywhere in the
+# record is caught. These records are skipped BEFORE any amount is read, so we
+# never write a discount for an already-closed challan.
+_SKIP_STATUS_PHRASES: list[tuple[str, str]] = [
+    ("transferred to regular court", "skip_transferred_regular_court"),
+    ("regular court", "skip_transferred_regular_court"),
+    ("yet to be completed", "skip_proceedings_pending"),
+    ("proceedings of the challan", "skip_proceedings_pending"),
+    ("case disposed", "skip_disposed"),
+    ("disposed", "skip_disposed"),
+    ("warrant", "skip_warrant"),
+]
+_PAID_RE = re.compile(r"\bpaid\b", re.IGNORECASE)
+
+
+def _status_skip_reason(status_text: str | None) -> str | None:
+    """Return a skip reason if the record's status text marks it non-settleable,
+    else None. 'paid' uses a word boundary so 'unpaid'/'prepaid' don't match."""
+    if not status_text:
+        return None
+    s = status_text.lower()
+    for needle, reason in _SKIP_STATUS_PHRASES:
+        if needle in s:
+            return reason
+    if _PAID_RE.search(status_text):
+        return "skip_paid"
+    return None
+
+
 def _to_discount_record(raw: dict) -> tuple[dict | None, str | None]:
     """Apply the STEP C field rules to one raw record.
     Returns (record, None) on success or (None, drop_reason)."""
     challan_id = (raw.get("challanId") or "").strip()
     if not challan_id:
         return None, "empty_challanId"
+
+    # Skip already-closed challans (paid / transferred / disposed / warrant /
+    # proceedings pending) before reading any amount.
+    skip = _status_skip_reason(raw.get("statusText"))
+    if skip:
+        return None, skip
 
     proposed = raw.get("proposedFineNum")
     if proposed is None:
