@@ -36,8 +36,8 @@ _LEGIT_SKIP_PREFIXES = ("not found", "0 records", "no valid records")
 
 def challan_settlement_scripted_enabled() -> bool:
     """True iff env SCRIPTED_CHALLAN_SETTLEMENT is a truthy toggle."""
-    raw = os.environ.get("SCRIPTED_CHALLAN_SETTLEMENT", "").strip().lower()
-    return raw in ("1", "true", "yes", "on")
+    # raw = os.environ.get("SCRIPTED_CHALLAN_SETTLEMENT", "").strip().lower()
+    return True #raw in ("1", "true", "yes", "on")
 
 
 async def _fetch_departments(request_id: str) -> list[str]:
