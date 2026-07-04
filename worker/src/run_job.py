@@ -21,6 +21,7 @@ Whichever path runs, this file:
 """
 
 import asyncio
+import signal
 import json
 import os
 import re
@@ -31,7 +32,12 @@ import redis
 
 from agent import run_agent
 from cost_calculator import fill_missing_cost
-from scripted.runner import run_border_tax, state_is_scripted_enabled, run_fetch_receipt, state_is_net_banking_scripted
+from scripted.runner import (
+    run_border_tax,
+    state_is_scripted_enabled,
+    run_fetch_receipt,
+    state_is_net_banking_scripted,
+)
 from scripted.types import RunOutcome
 
 
@@ -333,5 +339,14 @@ async def main():
         sys.exit(1)
 
 
+async def _runner():
+    task = asyncio.ensure_future(main())  # current main() body
+    asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, task.cancel)
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(_runner())

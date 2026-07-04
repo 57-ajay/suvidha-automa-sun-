@@ -30,10 +30,11 @@ async def monitor_job(slot, r: redis.Redis):
             # Check for cancellation
             status_raw = r.hget(f"job:{job_id}", "status")
             if status_raw:
-                status = status_raw.decode() if isinstance(status_raw, bytes) else status_raw
+                status = (
+                    status_raw.decode() if isinstance(status_raw, bytes) else status_raw
+                )
                 if status == "cancelled":
-                    print(
-                        f"[{job_id}] Cancelled — killing agent (slot {slot.index})")
+                    print(f"[{job_id}] Cancelled — killing agent (slot {slot.index})")
                     try:
                         proc.terminate()
                         await asyncio.wait_for(proc.wait(), timeout=5)
@@ -99,27 +100,32 @@ async def worker_loop(r: redis.Redis):
 
         live_url = (
             f"https://{DOMAIN}/vnc.html"
-            f"?autoconnect=true&resize=scale&path=websockify%3Ftoken%3D{
-                job_id}"
+            f"?autoconnect=true&resize=scale&path=websockify%3Ftoken%3D{job_id}"
         )
 
-        r.hset(f"job:{job_id}", mapping={
-            "status": "running",
-            "liveUrl": live_url,
-            "slotIndex": str(slot.index),
-        })
+        r.hset(
+            f"job:{job_id}",
+            mapping={
+                "status": "running",
+                "liveUrl": live_url,
+                "slotIndex": str(slot.index),
+            },
+        )
         r.expire(f"job:{job_id}", JOB_TTL)
 
-        print(f"[{job_id}] → slot {
-              slot.index} (display :{slot.display}) | {live_url}")
+        print(f"[{job_id}] → slot {slot.index} (display :{slot.display}) | {live_url}")
 
         # Spawn agent as a subprocess with its own DISPLAY
         env = {**os.environ, "DISPLAY": f":{slot.display}"}
         proc = await asyncio.create_subprocess_exec(
-            sys.executable, "src/run_job.py", job_id,
+            sys.executable,
+            "src/run_job.py",
+            job_id,
             env=env,
             cwd="/app",
+            start_new_session=True,
         )
+        os.killpg(proc.pid, signal.SIGTERM)
         slot.agent_proc = proc
 
         # Monitor in background (releases slot when done)
@@ -139,8 +145,7 @@ async def main():
 
     queued = r.llen("job:queue")
     print(f"Orchestrator started: max_slots={MAX_SLOTS}, queued={queued}")
-    print(f"Slot displays: :{pool.slots[0].display} – :{
-          pool.slots[-1].display}")
+    print(f"Slot displays: :{pool.slots[0].display} – :{pool.slots[-1].display}")
 
     await worker_loop(r)
 

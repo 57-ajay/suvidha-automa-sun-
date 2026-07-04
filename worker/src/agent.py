@@ -253,14 +253,20 @@ async def run_agent(
         calculate_cost=True,
     )
 
-    result = await agent.run(max_steps=100)
-    print(f"Token usage: {result.usage}")
-    usage_summary = await agent.token_cost_service.get_usage_summary()
-    print(f"Usage summary: {usage_summary}")
     try:
-        cached = usage_summary.total_prompt_cached_tokens or 0
-        total = usage_summary.total_prompt_tokens or 1
-        print(f"Cache hit rate: {cached}/{total} = {100 * cached / total:.1f}%")
-    except Exception:
-        pass
-    return result
+        result = await agent.run(max_steps=100)
+        print(f"Token usage: {result.usage}")
+        usage_summary = await agent.token_cost_service.get_usage_summary()
+        print(f"Usage summary: {usage_summary}")
+        try:
+            cached = usage_summary.total_prompt_cached_tokens or 0
+            total = usage_summary.total_prompt_tokens or 1
+            print(f"Cache hit rate: {cached}/{total} = {100 * cached / total:.1f}%")
+        except Exception:
+            pass
+        return result
+    finally:
+        try:
+            await browser.stop()
+        except Exception as e:
+            print(f"[{job_id}] browser.stop error: {e}")

@@ -36,6 +36,8 @@ services:
       - redis
       - api
     shm_size: "4gb"
+    tmpfs:
+      - /tmp:size=3g
     logging:
       driver: "json-file"
       options:
