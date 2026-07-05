@@ -39,7 +39,12 @@ async def monitor_job(slot, r: redis.Redis):
                         proc.terminate()
                         await asyncio.wait_for(proc.wait(), timeout=5)
                     except (asyncio.TimeoutError, ProcessLookupError):
-                        proc.kill()
+                        try:
+                            os.killpg(
+                                proc.pid, signal.SIGKILL
+                            )  # backstop: nuke the whole group only if it didn't exit cleanly
+                        except ProcessLookupError:
+                            pass
                     return
 
             # Check if process exited
@@ -125,7 +130,6 @@ async def worker_loop(r: redis.Redis):
             cwd="/app",
             start_new_session=True,
         )
-        os.killpg(proc.pid, signal.SIGTERM)
         slot.agent_proc = proc
 
         # Monitor in background (releases slot when done)
