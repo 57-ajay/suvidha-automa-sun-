@@ -13,7 +13,9 @@ import os
 from browser_use import Browser
 
 
-def make_browser(*, keep_alive: bool = False) -> Browser:
+def make_browser(
+    *, keep_alive: bool = False, user_data_dir: str | None = None
+) -> Browser:
     """Build a Browser configured identically across the codebase.
 
     Honors EGRESS_PROXY (e.g. 'http://10.160.0.14:8888') by passing it to
@@ -35,4 +37,5 @@ def make_browser(*, keep_alive: bool = False) -> Browser:
         chromium_sandbox=False,
         args=args,
         keep_alive=keep_alive,
+        user_data_dir=user_data_dir,
     )

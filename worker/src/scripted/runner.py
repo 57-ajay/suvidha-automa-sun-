@@ -94,7 +94,8 @@ def state_is_net_banking_scripted(state_or_name: str) -> bool:
     """True iff state is a net-banking-only scripted state AND enabled via
     SCRIPTED_BORDER_TAX_STATES. These run scripted even when paymentMethod != 'upi'."""
     return (
-        state_is_scripted_enabled(state_or_name) and normalize_state_code(state_or_name) in _NET_BANKING_SCRIPTED_STATES
+        state_is_scripted_enabled(state_or_name)
+        and normalize_state_code(state_or_name) in _NET_BANKING_SCRIPTED_STATES
     )
 
 
@@ -229,7 +230,7 @@ async def run_border_tax(
 
     finally:
         try:
-            await browser.stop()
+            await browser.kill()
         except Exception as e:
             print(f"[{job_id}] browser.stop error: {e}")
 
@@ -317,6 +318,6 @@ async def run_fetch_receipt(
 
     finally:
         try:
-            await browser.stop()
+            await browser.kill()
         except Exception:
             pass
