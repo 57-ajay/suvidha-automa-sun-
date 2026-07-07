@@ -55,12 +55,14 @@ const server = Bun.serve({
                 if (source && source !== "web" && source !== "app") {
                     return Response.json({ error: "source can be either web or app" }, { status: 400 });
                 }
-
                 if (
                     params?.taxFrom === params?.taxUpto &&
                     params?.duration == null
                 ) {
                     params.duration = '1';
+                }
+                if (taskId === 'border-tax' && !params?.driverId) {
+                    params.driverId = randomId();
                 }
 
                 const task = getTask(taskId);
@@ -791,5 +793,12 @@ const server = Bun.serve({
         return res;
     },
 });
+
+function randomId(digits = 10): string {
+    const bytes = crypto.getRandomValues(new Uint8Array(digits));
+    let id = "ran";
+    for (const b of bytes) id += b % 10;
+    return id;
+}
 
 console.log(`API running on :${server.port}`);

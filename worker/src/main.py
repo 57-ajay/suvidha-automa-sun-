@@ -58,6 +58,22 @@ async def monitor_job(slot, r: redis.Redis):
             except asyncio.TimeoutError:
                 continue
     finally:
+        # ALWAYS nuke the job's whole process group, on every exit path —
+        # not just cancellation. run_job.py is spawned with
+        # start_new_session=True, so every Chromium it launched shares its
+        # pgid. browser-use 0.12.x leaks the Chromium subprocess when a
+        # BrowserLaunchEvent is cancelled at the 30s bubus timeout (the
+        # process is spawned, then the handler is cancelled while awaiting
+        # _wait_for_cdp_url — before self._subprocess is ever assigned, so
+        # BrowserKillEvent has nothing to kill). The orphan sits on RAM +
+        # its /tmp profile forever, making the NEXT launch slower, which
+        # times out too → death spiral until container restart. This killpg
+        # is the fix for that spiral.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        await asyncio.sleep(0.5)  # let killed procs actually die before sweep
         pool.release(slot)
 
 

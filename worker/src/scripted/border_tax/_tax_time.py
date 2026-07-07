@@ -12,7 +12,8 @@ Tax-Upto min the portal pins to "now". The SAME time is stamped on BOTH ends
 so the From->Upto span stays an exact 24h multiple (the portal bills a minute
 over a whole day as a full extra day). Date states send the bare ISO date.
 
-Callers compute ist_hhmm() ONCE and reuse it for both fields.
+Callers resolve the time ONCE via resolve_hhmm() (caller-requested
+taxTime when usable, else the current IST time) and reuse it for both fields.
 """
 
 from __future__ import annotations
@@ -37,3 +38,47 @@ def stamp_dtlocal(iso_date: str, hhmm: str | None) -> str:
     if not s or hhmm is None:
         return s
     return s if "T" in s else f"{s}T{hhmm}"
+
+
+def resolve_hhmm(
+    requested: str | None,
+    tax_from_iso: str,
+    now: datetime | None = None,
+) -> str:
+    """Pick the HH:MM to stamp on Tax From / Tax Upto.
+
+    The caller-requested taxTime wins when it is still usable; otherwise we
+    fall back to the current IST time (the pre-taxTime behavior). "Usable"
+    means not already in the past: the portal pins the field's min to "now",
+    so a past datetime silently fails to stick. Concretely:
+
+      - no/blank request                     -> current IST time
+      - taxFrom is a future date             -> requested time as-is
+      - taxFrom is today, time >= now (IST)  -> requested time as-is
+      - taxFrom is today, time <  now (IST)  -> clamped to current IST time
+        (queue delay can push a "start now-ish" request into the past; the
+        driver still gets a permit starting at fill time instead of a
+        failed job)
+      - taxFrom itself already past          -> requested as-is; the date is
+        below min regardless and the runner's existing before-min check
+        reports it properly
+
+    Prints a [tax_time] line to job stdout when it deviates from the request
+    so operators can see why a permit started later than asked. Zero-padded
+    "HH:MM" strings compare correctly as plain strings.
+    """
+    now = now or datetime.now(_IST)
+    req = (requested or "").strip()
+    if not req:
+        return ist_hhmm(now)
+
+    today_iso = now.strftime("%Y-%m-%d")
+    now_hhmm = ist_hhmm(now)
+    if tax_from_iso == today_iso and req < now_hhmm:
+        print(
+            f"[tax_time] requested taxTime {req} on {tax_from_iso} is already "
+            f"past (IST now {now_hhmm}) — clamping to now so the value stays "
+            f"above the portal's min"
+        )
+        return now_hhmm
+    return req

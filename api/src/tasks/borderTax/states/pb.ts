@@ -11,8 +11,21 @@ export const buildPrompt = async (p: Record<string, string>): Promise<string> =>
     const tf = dateParts(taxFromISO);
     const tu = dateParts(taxUptoISO);
 
-    const tfDtLocal = `${tf.iso}T00:00`;
-    const tuDtLocal = `${tu.iso}T00:00`;
+    // Time portion for the datetime-local fields: caller-requested taxTime
+    // (already normalized to "HH:MM" in preprocessParams) or the legacy
+    // midnight fallback. A past time cannot be filled — the portal pins the
+    // field min to "now" — so a same-day request whose time already passed is
+    // clamped to the current IST time. Same time on both ends: the From->Upto
+    // span must stay an exact 24h multiple.
+    const istNow = new Date(Date.now() + 330 * 60 * 1000);
+    const istToday = istNow.toISOString().slice(0, 10);
+    const istHHMM = istNow.toISOString().slice(11, 16);
+    let taxHHMM = /^\d{2}:\d{2}$/.test(p.taxTime || "") ? p.taxTime! : "00:00";
+    if (p.taxTime && tf.iso === istToday && taxHHMM < istHHMM) {
+        taxHHMM = istHHMM;
+    }
+    const tfDtLocal = `${tf.iso}T${taxHHMM}`;
+    const tuDtLocal = `${tu.iso}T${taxHHMM}`;
 
     const entryDistrict = p.entryDistrict || "MOHALI";
     // Punjab's checkpost names are often compound and don't match the

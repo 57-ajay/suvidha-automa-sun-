@@ -24,6 +24,8 @@ services:
 
   worker:
     build: ./worker
+    init: true
+    restart: unless-stopped
     environment:
       - REDIS_URL=redis://redis:6379
       - API_URL=http://api:3000
@@ -32,6 +34,8 @@ services:
       - SCRIPTED_BORDER_TAX_STATES=${SCRIPTED_BORDER_TAX_STATES:-}
       - WEB_HANDOVER_POLL_QR=${WEB_HANDOVER_POLL_QR}
       - SCRIPTED_BORDER_TAX_AUTO_CLEAR_PENDING=${SCRIPTED_BORDER_TAX_AUTO_CLEAR_PENDING:-false}
+      - TIMEOUT_BrowserLaunchEvent=${TIMEOUT_BrowserLaunchEvent:-60}
+      - TIMEOUT_BrowserStartEvent=${TIMEOUT_BrowserStartEvent:-90}
     depends_on:
       - redis
       - api

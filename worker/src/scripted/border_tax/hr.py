@@ -795,12 +795,15 @@ async def run(
 
     # 5b/5c. Tax From / Tax Upto — datetime-local inputs.
 
-    # Plain YYYY-MM-DD will SILENTLY FAIL on these fields. Stamp the current
-    # IST time (one read, reused for both ends) so the permit starts at
-    # submission and the From->Upto span stays an exact 24h multiple. HR is
-    # NO_SAME_DAY, so DAYS taxUpto is already taxFrom + duration >= tomorrow,
-    # staying above the field min. See _tax_time.py.
-    hhmm = ist_hhmm()
+    # Plain YYYY-MM-DD will SILENTLY FAIL on these fields. Use the caller-
+    # requested taxTime when provided and still usable (a past time can't be
+    # filled — the portal pins min to "now" — so a same-day past time is
+    # clamped to the current IST time), else the current IST time. One value
+    # reused for both ends keeps the From->Upto span an exact 24h multiple.
+    # HR is NO_SAME_DAY, so DAYS taxUpto is already taxFrom + duration >=
+    # tomorrow, staying above the field min. See _tax_time.py.
+    from ._tax_time import resolve_hhmm
+    hhmm = resolve_hhmm(params.taxTime, params.taxFrom)
     tf_dtlocal = stamp_dtlocal(params.taxFrom, hhmm)
     tu_dtlocal = stamp_dtlocal(params.taxUpto, hhmm)
 

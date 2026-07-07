@@ -997,10 +997,14 @@ async def run_handover_flow(
     #     Verify it stuck (a value below the field's min is silently
     #     rejected). Re-filling here also re-asserts the value in case the
     #     tax-mode selection reset it.
-    # datetime-local Tax From/Upto need a time; stamp the current IST time
-    # ONCE and reuse it for both ends so the span stays an exact 24h multiple
-    # (date-type states ignore it inside _set_date_like). See _tax_time.py.
-    tax_hhmm = ist_hhmm()
+    # datetime-local Tax From/Upto need a time; use the caller-requested
+    # taxTime when provided and still usable (a same-day past time is
+    # clamped to now — the portal pins min there), else the current IST
+    # time — resolved ONCE and reused for both ends so the span stays an
+    # exact 24h multiple (date-type states ignore it inside
+    # _set_date_like). See _tax_time.py.
+    from ._tax_time import resolve_hhmm
+    tax_hhmm = resolve_hhmm(params.taxTime, params.taxFrom)
 
     tf_actual = await _set_date_like(
         session,

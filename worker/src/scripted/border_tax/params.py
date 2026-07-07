@@ -148,6 +148,14 @@ class BorderTaxParams(BaseModel):
     taxFrom: str  # YYYY-MM-DD
     taxUpto: str  # YYYY-MM-DD
 
+    # Optional 24h "HH:MM" (IST) stamped on Tax From / Tax Upto in the
+    # datetime-local states (HR, PB, HP; UK/BR when their fields render as
+    # datetime-local). ONE time for BOTH ends so the From->Upto span stays
+    # an exact 24h multiple. Date-only states (UP, MP, RJ, TN) ignore it.
+    # None/blank -> the runner stamps the current IST time. A same-day past
+    # time is clamped to now at fill time (see _tax_time.resolve_hhmm).
+    taxTime: str | None = None
+
     # state + defaults
     state: Literal[
         "UP",
@@ -223,6 +231,25 @@ class BorderTaxParams(BaseModel):
                 f"normalize before queueing"
             )
         return v
+
+    @field_validator("taxTime")
+    @classmethod
+    def _validate_tax_time(cls, v: str | None) -> str | None:
+        """Blank -> None (runner falls back to current IST time). Otherwise
+        require 24h H:MM / HH:MM (seconds tolerated, dropped) and normalize
+        to zero-padded "HH:MM" so lexicographic compares work downstream."""
+        if v is None:
+            return None
+        s = v.strip()
+        if not s:
+            return None
+        m = re.match(r"^(\d{1,2}):(\d{2})(?::\d{2})?$", s)
+        if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+            raise ValueError(
+                f"taxTime must be 24h HH:MM (got {v!r}); the API should "
+                f"normalize before queueing"
+            )
+        return f"{int(m.group(1)):02d}:{m.group(2)}"
 
     @field_validator("entryDistrict", "entryCheckpoint")
     @classmethod

@@ -1,11 +1,57 @@
 import os
 import time
+import shutil
 import subprocess
 import asyncio
+
+import psutil  # already in the venv (browser-use dependency)
 
 TOKEN_DIR = "/tmp/vnc-tokens"
 TOKEN_FILE = f"{TOKEN_DIR}/tokens.cfg"
 LOG_DIR = "/tmp/slot-logs"
+
+# Prefixes of the temp Chromium profiles browser-use mkdtemp()s per launch.
+# When a launch is cancelled at the bubus timeout, the dir is never cleaned.
+# /tmp here is a 3G tmpfs, so leaked profiles literally eat container RAM
+# until every subsequent launch starts timing out.
+PROFILE_DIR_PREFIXES = ("browser-use-user-data-dir-", "browseruse-tmp-")
+
+
+def sweep_orphan_profile_dirs(min_age_secs: int = 60) -> int:
+    """Delete leaked Chromium temp profiles under /tmp.
+
+    Only removes dirs that (a) are not referenced in any live process's
+    cmdline and (b) are older than min_age_secs — so profiles belonging to
+    jobs still running on other slots are never touched.
+    """
+    in_use: set[str] = set()
+    for p in psutil.process_iter(["cmdline"]):
+        try:
+            for arg in p.info["cmdline"] or []:
+                if any(pfx in arg for pfx in PROFILE_DIR_PREFIXES):
+                    # e.g. --user-data-dir=/tmp/browser-use-user-data-dir-xyz
+                    in_use.add(arg.split("=", 1)[-1])
+        except (psutil.NoSuchProcess, psutil.ZombieProcess, psutil.AccessDenied):
+            continue
+
+    removed = 0
+    now = time.time()
+    for entry in os.listdir("/tmp"):
+        if not any(entry.startswith(pfx) for pfx in PROFILE_DIR_PREFIXES):
+            continue
+        path = f"/tmp/{entry}"
+        if any(path in used for used in in_use):
+            continue
+        try:
+            if now - os.path.getmtime(path) < min_age_secs:
+                continue
+        except OSError:
+            continue
+        shutil.rmtree(path, ignore_errors=True)
+        removed += 1
+    if removed:
+        print(f"[pool] Swept {removed} orphaned Chromium profile dir(s) from /tmp")
+    return removed
 
 
 class Slot:
@@ -62,6 +108,7 @@ class SlotPool:
         slot.agent_proc = None
         self.free.put_nowait(slot.index)
         self._write_tokens()
+        sweep_orphan_profile_dirs()
         print(f"[pool] Slot {slot.index} released (was job {job_id})")
 
     def get_by_job_id(self, job_id: str) -> Slot | None:
@@ -100,6 +147,9 @@ class SlotPool:
             stdout=xvfb_log,
             stderr=xvfb_log,
         )
+        # Child holds its own dup of the fd — close ours or we leak 2 fds
+        # per job and eventually hit the ulimit ("display stack failed").
+        xvfb_log.close()
 
         # Wait for Xvfb to create its socket
         socket_path = f"/tmp/.X11-unix/X{slot.display}"
@@ -131,13 +181,13 @@ class SlotPool:
             stdout=vnc_log,
             stderr=vnc_log,
         )
+        vnc_log.close()
 
         # Wait for x11vnc to bind the port
         for i in range(30):  # up to 3 seconds
             if slot.vnc_proc.poll() is not None:
                 print(f"[pool] Slot {slot.index}: x11vnc died (exit={
                       slot.vnc_proc.returncode})")
-                vnc_log.flush()
                 try:
                     with open(f"{LOG_DIR}/vnc-{slot.index}.log") as f:
                         print(f"[pool]   log: {f.read()[-500:]}")
@@ -175,6 +225,14 @@ class SlotPool:
         socket_path = f"/tmp/.X11-unix/X{slot.display}"
         try:
             os.unlink(socket_path)
+        except FileNotFoundError:
+            pass
+
+        # Clean up the X lock file too — left behind when Xvfb gets
+        # SIGKILLed, and a stale lock can block the next Xvfb on this
+        # display number.
+        try:
+            os.unlink(f"/tmp/.X{slot.display}-lock")
         except FileNotFoundError:
             pass
 

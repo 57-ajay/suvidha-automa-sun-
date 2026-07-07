@@ -810,10 +810,13 @@ async def run(
 
     # 5b/5c. Tax From / Tax Upto — datetime-local inputs.
 
-    # Plain YYYY-MM-DD will SILENTLY FAIL on these fields. Same as HR: stamp
-    # the current IST time once and reuse it for both ends so the span stays
-    # an exact 24h multiple. See _tax_time.py.
-    hhmm = ist_hhmm()
+    # Plain YYYY-MM-DD will SILENTLY FAIL on these fields. Same as HR: use
+    # the caller-requested taxTime when provided and still usable (a past
+    # time can't be filled, so a same-day past time is clamped to the
+    # current IST time), else the current IST time — once, reused for both
+    # ends so the span stays an exact 24h multiple. See _tax_time.py.
+    from ._tax_time import resolve_hhmm
+    hhmm = resolve_hhmm(params.taxTime, params.taxFrom)
     tf_dtlocal = stamp_dtlocal(params.taxFrom, hhmm)
     tu_dtlocal = stamp_dtlocal(params.taxUpto, hhmm)
 
