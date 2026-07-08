@@ -1,34 +1,39 @@
 services:
-  redis:
+  oredis:
     image: redis:7-alpine
+    restart: unless-stopped
     logging:
       driver: "json-file"
       options:
         max-size: "50m"
         max-file: "3"
 
-  api:
+  oapi:
     build: ./api
     environment:
-      - REDIS_URL=redis://redis:6379
+      - REDIS_URL=redis://oredis:6379
     depends_on:
-      - redis
+      - oredis
+    restart: unless-stopped
     logging:
       driver: "json-file"
       options:
         max-size: "50m"
         max-file: "3"
     networks:
-      - default
-      - proxy
+      default:
+      proxy:
+        aliases:
+          - oapi
+        
 
-  worker:
+  oworker:
     build: ./worker
     init: true
     restart: unless-stopped
     environment:
-      - REDIS_URL=redis://redis:6379
-      - API_URL=http://api:3000
+      - REDIS_URL=redis://oredis:6379
+      - API_URL=http://oapi:3000
       - DOMAIN=${DOMAIN}
       - MAX_SLOTS=${MAX_SLOTS:-10}
       - SCRIPTED_BORDER_TAX_STATES=${SCRIPTED_BORDER_TAX_STATES:-}
@@ -37,8 +42,8 @@ services:
       - TIMEOUT_BrowserLaunchEvent=${TIMEOUT_BrowserLaunchEvent:-60}
       - TIMEOUT_BrowserStartEvent=${TIMEOUT_BrowserStartEvent:-90}
     depends_on:
-      - redis
-      - api
+      - oredis
+      - oapi
     shm_size: "4gb"
     tmpfs:
       - /tmp:size=3g
@@ -48,32 +53,12 @@ services:
         max-size: "50m"
         max-file: "3"
     networks:
-      - default
-      - proxy
-
-#   caddy:
-#     image: caddy:2-alpine
-#     ports:
-#       - "80:80"
-#       - "443:443"
-#     volumes:
-#       - ./Caddyfile:/etc/caddy/Caddyfile
-#       - caddy_data:/data
-#     environment:
-#       - DOMAIN=${DOMAIN}
-#     depends_on:
-#       - api
-#       - worker
-#     logging:
-#       driver: "json-file"
-#       options:
-#         max-size: "50m"
-#         max-file: "3"
-#
-# volumes:
-#   caddy_data:
-
+      default:
+      proxy:
+        aliases:
+          - oworker
 
 networks:
   proxy:
     external: true
+    name: proxy-old
