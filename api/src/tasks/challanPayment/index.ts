@@ -22,7 +22,10 @@ export const challanPayment: Task = {
   id: "challan-payment",
   name: "Challan Payment (Virtual Courts)",
   requiredParams: ["requestId", "vehicleNumber", "challanNo"],
-  optionalParams: ["chassisNo", "engineNo", "phoneNo", "department", "driverId"],
+  // `isNewChallanFlow`: when true, routes receipt + aiAgentStatus writes to the
+  // top-level subChallanRequests/{requestId} doc (one-challan-per-doc) instead of
+  // the challanRequests/{requestId}.challans[] array. Omitted/false = old flow.
+  optionalParams: ["chassisNo", "engineNo", "phoneNo", "department", "driverId", "isNewChallanFlow"],
   tools: [],
   buildPrompt: async (_p, _source) => {
     return "[scripted-only] challan-payment — worker dispatches by taskId; this prompt is not executed.";

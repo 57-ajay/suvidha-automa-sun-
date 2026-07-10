@@ -18,6 +18,13 @@ export const challanRequestsRef = db
     .doc("data")
     .collection("challanRequests");
 
+// New challan flow (params.isNewChallanFlow === true): a TOP-LEVEL collection
+// where each doc is a single challan (no challans[] array). The doc id is the
+// subChallan id, which the API receives as params.requestId. receipt/aiAgentStatus
+// are written at the doc top level. NOTE: challanNo is NOT unique in this
+// collection, so never locate a doc by challanNo here — always use the doc id.
+export const subChallanRequestsRef = db.collection("subChallanRequests");
+
 export const borderTaxRequestsRef = db
     .collection("driverUtilitiesRequests")
     .doc("data")

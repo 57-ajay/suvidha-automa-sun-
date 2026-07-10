@@ -1,6 +1,6 @@
 import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import { getStorage } from "firebase-admin/storage";
-import { challanRequestsRef, db } from "../../firebase";
+import { challanRequestsRef, subChallanRequestsRef, db } from "../../firebase";
 
 interface ReceiptData {
     vehicleNumber: string;
@@ -147,14 +147,52 @@ export async function handleSaveChallanReceipt(input: SaveChallanReceiptInput) {
     }
 
     // ── Attach the receipt to the matching challan ─────────────────────────
-    // Challan receipts live PER-CHALLAN as `challans[].receipt = { url, at }`
-    // (see Cabswale-Customers data model + driverUtilitiesRequests.js writer),
-    // not at the doc level. We only save the receipt URL here — we do NOT mark
-    // the challan/request paid; the existing backend trigger handles paid status.
-    const docRef = challanRequestsRef.doc(requestId);
+    // v1 (challanRequests): receipts live PER-CHALLAN as `challans[].receipt =
+    // { url, at }` (see Cabswale-Customers data model + driverUtilitiesRequests.js
+    // writer). New flow (subChallanRequests): one challan per doc, so receipt is
+    // written at the doc top level (handled just below). Either way we only save
+    // the receipt URL — we do NOT mark it paid; the existing backend trigger does.
     const receiptObj = { url: pdfUrl, at: Timestamp.now() }; // serverTimestamp() is illegal inside array elements
-    let attachedTo: "challans" | "challansDraft" | null = null;
+    let attachedTo: "challans" | "challansDraft" | "subChallanRequests" | null = null;
 
+    // New challan flow: subChallanRequests is one-challan-per-doc, keyed by doc id
+    // (== requestId). Write receipt at the doc top level; challanNo is NOT unique
+    // in that collection so it can't be used to locate the doc.
+    const isNewChallanFlow = (params as Record<string, unknown>)?.isNewChallanFlow === true;
+    if (isNewChallanFlow) {
+        try {
+            await subChallanRequestsRef.doc(requestId).update({
+                receipt: receiptObj,
+                updatedAt: FieldValue.serverTimestamp(),
+            });
+            attachedTo = "subChallanRequests";
+            console.log(
+                `[save_challan_receipt] (new-flow) attached receipt.url to subChallanRequests/${requestId}`
+            );
+        } catch (e) {
+            console.error(
+                `[save_challan_receipt] (new-flow) failed to attach receipt to subChallanRequests/${requestId}:`, e
+            );
+            return { ok: false, error: `Failed to save receipt: ${(e as Error).message}`, receiptUrl: pdfUrl };
+        }
+
+        console.log(
+            `[save_challan_receipt] DONE job=${jobId} vehicle=${vehicleNumber} challanNo=${challanNo} ` +
+            `receipt=${receiptNumber ?? "n/a"} amount=${amount ?? "n/a"} attachedTo=${attachedTo}`
+        );
+        return {
+            ok: true,
+            vehicle: vehicleNumber,
+            challanNo,
+            receiptNumber,
+            amount,
+            receiptUrl: pdfUrl,
+            attachedTo,
+            pdfUploaded: true,
+        };
+    }
+
+    const docRef = challanRequestsRef.doc(requestId);
     // Match by challanNo or id; prefer the finalized `challans` array, fall
     // back to `challansDraft` if the doc hasn't been finalized yet.
     const matches = (c: any) =>

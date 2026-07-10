@@ -1,5 +1,5 @@
 import { FieldValue } from "firebase-admin/firestore";
-import { db, challanRequestsRef } from "../../firebase";
+import { db, challanRequestsRef, subChallanRequestsRef } from "../../firebase";
 
 export type ChallanAiStatus = "running" | "completed" | "failed";
 
@@ -20,14 +20,39 @@ export async function setChallanAiAgentStatus(
     challanNo: string | undefined,
     status: ChallanAiStatus,
     reason: string = "",
+    isNewChallanFlow?: boolean,
 ): Promise<{ ok: boolean; error?: string }> {
     if (!requestId) return { ok: false, error: "requestId required" };
+
+    const aiAgentStatus = { status, reason: reason ?? "" };
+
+    // New challan flow: subChallanRequests is one-challan-per-doc, keyed by doc id
+    // (== requestId here). Write aiAgentStatus at the doc top level. challanNo is
+    // NOT unique in that collection, so it must not be used to locate the doc.
+    if (isNewChallanFlow) {
+        try {
+            await subChallanRequestsRef.doc(requestId).update({
+                aiAgentStatus,
+                updatedAt: FieldValue.serverTimestamp(),
+            });
+            console.log(
+                `[challanAiStatus] (new-flow) set "${status}" on subChallanRequests/${requestId}`,
+            );
+            return { ok: true };
+        } catch (e) {
+            console.error(
+                `[challanAiStatus] (new-flow) failed subChallanRequests/${requestId} status=${status}:`,
+                e,
+            );
+            return { ok: false, error: (e as Error).message };
+        }
+    }
+
     if (!challanNo) return { ok: false, error: "challanNo required" };
 
     const docRef = challanRequestsRef.doc(requestId);
     const matches = (c: any) =>
         String(c?.challanNo) === String(challanNo) || String(c?.id) === String(challanNo);
-    const aiAgentStatus = { status, reason: reason ?? "" };
 
     try {
         const attachedTo = await db.runTransaction(async (tx) => {

@@ -32,6 +32,11 @@ class ChallanPaymentParams(BaseModel):
     # ── plumbing ──────────────────────────────────────────────────────────
     driverId: str | None = None
     source: Literal["app", "web"] = "web"
+    # When True, routes the API's receipt/aiAgentStatus writes to the top-level
+    # subChallanRequests/{requestId} doc instead of challanRequests[].challans.
+    # Declared here so it survives model_dump() and is forwarded to the
+    # save-receipt endpoint (Pydantic v2 default extra="ignore" drops unknowns).
+    isNewChallanFlow: bool = False
 
     # ── validators ────────────────────────────────────────────────────────
     @field_validator("vehicleNumber")

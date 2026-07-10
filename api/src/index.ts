@@ -161,7 +161,7 @@ const server = Bun.serve({
                 // Per-challan aiAgentStatus = running (challan-payment only) on the
                 // same challans[] entry the receipt URL is written to.
                 if (taskId === "challan-payment" && params?.requestId && params?.challanNo) {
-                    setChallanAiAgentStatus(params.requestId, params.challanNo, "running", "").catch((e) => {
+                    setChallanAiAgentStatus(params.requestId, params.challanNo, "running", "", (params as Record<string, unknown>)?.isNewChallanFlow === true).catch((e) => {
                         console.error(
                             `[API] background setChallanAiAgentStatus(running) failed for ` +
                             `requestId=${params.requestId} challanNo=${params.challanNo}:`,
@@ -772,7 +772,7 @@ const server = Bun.serve({
                                                 : "")
                                             || summary
                                             || "failed");
-                                setChallanAiAgentStatus(requestId, challanNo, cpStatus, cpReason).catch((e) => {
+                                setChallanAiAgentStatus(requestId, challanNo, cpStatus, cpReason, params?.isNewChallanFlow === true).catch((e) => {
                                     console.error(
                                         `[API] background setChallanAiAgentStatus(${cpStatus}) failed for ` +
                                         `requestId=${requestId} challanNo=${challanNo}:`,
@@ -888,7 +888,7 @@ const server = Bun.serve({
                 // otherwise a cancelled challan would stay "running" forever.
                 if (job.taskId === "challan-payment" && requestId) {
                     const challanNo = typeof params.challanNo === "string" ? params.challanNo : jobId;
-                    setChallanAiAgentStatus(requestId, challanNo, "failed", "cancelled by user").catch((e) => {
+                    setChallanAiAgentStatus(requestId, challanNo, "failed", "cancelled by user", params?.isNewChallanFlow === true).catch((e) => {
                         console.error(
                             `[API] background setChallanAiAgentStatus(failed/cancel) failed for ` +
                             `requestId=${requestId} challanNo=${challanNo}:`,
