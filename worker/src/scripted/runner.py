@@ -33,6 +33,7 @@ from .border_tax.params import BorderTaxParams
 from .handoff import run_ai_rescue
 from .fetch_receipt.params import FetchReceiptParams
 from .log import StepLogger
+from .steps import force_ist_timezone
 from .types import HandoffNeeded, RunOutcome, ScriptedAbort
 
 
@@ -176,6 +177,13 @@ async def run_border_tax(
             )
 
         try:
+            # Pin the page timezone to IST before ANY portal work. The
+            # parivahan Angular serializes datetime-local tax fields in the
+            # browser's timezone; on a UTC container that put +05:30 on
+            # every HR/PB/HP receipt. Raises ScriptedAbort (caught below)
+            # rather than paying for a shifted permit window.
+            await force_ist_timezone(browser, log=log)
+
             outcome = await state_runner(browser, params, log)
 
         except ScriptedAbort as abort:
@@ -292,6 +300,11 @@ async def run_fetch_receipt(
             )
 
         try:
+            # Same IST invariant as run_border_tax: keep every scripted
+            # session's JS clock in Asia/Kolkata (receipt pages render
+            # dates client-side too).
+            await force_ist_timezone(browser, log=log)
+
             outcome = await fetch_receipt_run(browser, params, log)
         except ScriptedAbort as abort:
             outcome = RunOutcome(

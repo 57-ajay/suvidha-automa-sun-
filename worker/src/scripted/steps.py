@@ -606,3 +606,74 @@ async def get_select_value(session, selector: str) -> str | None:
         "})(" + json.dumps(selector) + ")"
     )
     return await _cdp_eval(session, expr)
+
+
+async def force_ist_timezone(
+    session,
+    *,
+    log: StepLogger | None = None,
+    name: str = "browser.force_ist_timezone",
+) -> str:
+    """Pin the page's JS timezone to IST via CDP Emulation, then verify it.
+
+    parivahan's Angular serializes datetime-local values ("YYYY-MM-DDTHH:MM",
+    carrying NO timezone) through `new Date(...)` in the BROWSER's local
+    timezone before posting to the backend. On a UTC host (the Docker
+    default) a requested 15:44 IST becomes 15:44 UTC on the wire, which the
+    receipt then renders as 21:14 IST — a silent +05:30 shift on every
+    HR/PB/HP tax window. The worker Dockerfile now sets TZ=Asia/Kolkata;
+    this override is the in-code backstop so a mis-deployed environment can
+    never ship a shifted (i.e. wrongly PAID) receipt again.
+
+    Must run before the portal serializes any datetime-local value — call it
+    right after browser start, before navigation. Note the override is
+    per-target: a page the human opens in a NEW tab later won't inherit it,
+    but by then the tax dates are already posted, and the env TZ covers the
+    rest of the container anyway.
+
+    Raises ScriptedAbort if the page's UTC offset still isn't +330 minutes
+    (IST) after the override: a non-IST run pays for a permit with the wrong
+    validity window, which is strictly worse than a failed job. Do NOT
+    compare the IANA ID here — Chromium reports the legacy alias
+    "Asia/Calcutta" for this zone.
+    """
+    started = time.monotonic()
+    try:
+        cdp = await session.get_or_create_cdp_session()
+        await cdp.cdp_client.send.Emulation.setTimezoneOverride(
+            params={"timezoneId": "Asia/Kolkata"},
+            session_id=cdp.session_id,
+        )
+        tz_info = await _cdp_eval(
+            session,
+            "(function(){return {"
+            "id: Intl.DateTimeFormat().resolvedOptions().timeZone,"
+            "offsetMin: -new Date().getTimezoneOffset()"
+            "};})()",
+        )
+        tz_id = (tz_info or {}).get("id")
+        offset_min = (tz_info or {}).get("offsetMin")
+        # Verify the OFFSET, not the IANA ID string: Chromium's ICU
+        # canonicalizes "Asia/Kolkata" to the legacy alias "Asia/Calcutta"
+        # (same zone, different name), so an ID compare aborts every job
+        # even though the clock is correct — exactly what happened on the
+        # first deploy of this check. IST is UTC+05:30 with no DST, so a
+        # fixed +330-minute offset is the one invariant that matters for
+        # datetime-local serialization.
+        if offset_min != 330:
+            raise ScriptedAbort(
+                f"browser_timezone_not_ist: page reports tz={tz_id!r} with "
+                f"UTC offset {offset_min!r} min (need +330 = IST) even after "
+                f"the CDP Emulation.setTimezoneOverride — refusing to run, "
+                f"because a non-IST browser shifts every datetime-local tax "
+                f"window on the paid receipt."
+            )
+        if log is not None:
+            _log_ok(
+                log, name, started, value=f"{tz_id} (UTC+{offset_min}min)"
+            )
+        return str(tz_id)
+    except Exception as e:
+        if log is not None:
+            _log_fail(log, name, started, e)
+        raise

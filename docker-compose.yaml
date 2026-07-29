@@ -34,6 +34,10 @@ services:
     environment:
       - REDIS_URL=redis://oredis:6379
       - API_URL=http://oapi:3000
+      # Browser-side datetime-local serialization is timezone-sensitive on
+      # the parivahan portals — the worker MUST run in IST. Duplicated from
+      # the image ENV so it survives a base-image change and stays visible.
+      - TZ=Asia/Kolkata
       - DOMAIN=${DOMAIN}
       - MAX_SLOTS=${MAX_SLOTS:-10}
       - SCRIPTED_BORDER_TAX_STATES=${SCRIPTED_BORDER_TAX_STATES:-}

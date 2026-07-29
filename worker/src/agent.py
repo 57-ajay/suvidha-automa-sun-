@@ -237,6 +237,24 @@ async def run_agent(
         args=["--disable-dev-shm-usage", "--disable-gpu"],
     )
 
+    # Start the browser ourselves (instead of letting Agent lazy-start it)
+    # so we can pin the page timezone to IST before the portal loads —
+    # parivahan serializes datetime-local values in the browser's timezone.
+    # Passing an already-started browser to Agent is the same pattern as
+    # scripted/handoff.run_ai_rescue. Non-fatal on failure: the container's
+    # TZ=Asia/Kolkata (worker/Dockerfile) is the primary guarantee here.
+    try:
+        await browser.start()
+        from scripted.steps import force_ist_timezone
+
+        tz = await force_ist_timezone(browser)
+        print(f"[{job_id}] browser timezone pinned: {tz}")
+    except Exception as e:
+        print(
+            f"[{job_id}] WARN: IST timezone override failed ({e}); "
+            f"relying on container TZ=Asia/Kolkata"
+        )
+
     llm = ChatGoogle(
         model="gemini-3-flash-preview",
         vertexai=True,
